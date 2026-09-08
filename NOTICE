@@ -11,11 +11,12 @@ only comfy/model_management.py; the MiniMax-H3 block/modulation source and
 canonical source hashes are unchanged. ComfyUI copyright belongs to its
 respective contributors.
 
-The affine Triton kernel and native SOL bridge are authored for this project.
-They are informed by NVIDIA/Sana Sol-H3's published optimization and attention
-contracts. No NVIDIA/Sana/CuTe/FlashAttention implementation is redistributed.
-The external sol_attn dependency is pinned to xmarre/Sana
-2936c47637380842aaa4a4488fac5006cc542b70. It carries FlashAttention BSD-3-Clause
-notices and Apache-2.0 notices for cuDNN-derived SM120 components. Refer to its
-THIRD_PARTY_NOTICES.md and individual source headers. The parent sol-engine
-tree has no root LICENSE; this project does not grant rights over that tree.
+The affine Triton kernel and Sol-H3 integration/interop code are authored for
+this project. They are informed by the published NVIDIA/Sana Sol-H3 and
+Sol-Attn contracts.
+
+Sparse attention execution uses the `sol_attn` public API supplied by the
+ComfyUI installation's `comfy-kitchen` package. comfy-kitchen is Copyright
+(c) 2025 Comfy Org and is licensed under the Apache License 2.0. This project
+does not redistribute comfy-kitchen or the previous Sana/CuTe Sol-Attn source;
+it links to the already-installed ComfyUI runtime API.
