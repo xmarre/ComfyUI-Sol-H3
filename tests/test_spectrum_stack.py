@@ -11,7 +11,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("sol_outer", [False, True])
-@pytest.mark.parametrize("vdn_mode", [None, "full", "grouped", "flex"])
+@pytest.mark.parametrize("vdn_mode", [None, "full", "grouped", "grouped_untwist", "flex"])
 def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch, sol_outer, vdn_mode):
     sys.path.insert(0, os.environ["COMFYUI_PATH"])
     sys.path.insert(0, os.environ["SPECTRUM_PATH"])
@@ -79,6 +79,14 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
         for index, block in enumerate(model.blocks):
             monkeypatch.setattr(block.attn, "forward", make_vdn_forward(block.attn, vdn_state, index))
 
+    make_untwist_override = None
+    if vdn_mode == "grouped_untwist":
+        if not os.environ.get("UNTWIST_PATH"):
+            pytest.skip("set UNTWIST_PATH for the real Untwist preprocessing contract")
+        sys.path.insert(0, os.environ["UNTWIST_PATH"])
+        from flux_untwist.patches import make_minimax_h3_attention_override
+        make_untwist_override = make_minimax_h3_attention_override
+
     opts = {KEY: cfg.metadata(), HISTORY_KEY: {"sol_h3": HistoryPolicy(cfg)},
             "patches_replace": {"dit": {("double_block", i): BlockPatch(i, cfg) for i in range(3)}},
             "cond_or_uncond": [0], "uuids": ["positive"]}
@@ -93,6 +101,27 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
             for sigma in sigmas[:-1]:
                 decision = spectrum.begin_step(sigma.reshape(1))
                 to = {**opts, RUNTIME_KEY: spectrum, RUN_ID_KEY: run, STEP_ID_KEY: decision["step_id"]}
+                if make_untwist_override is not None:
+                    # The production Untwist H3 wrapper is rebuilt per denoiser call.
+                    # Its explicit attention_preprocess_v1 chain must therefore make
+                    # the numerical-history identity semantic rather than object-id
+                    # based, and let VDN consume the full-domain QKV transform once.
+                    to["optimized_attention_override"] = make_untwist_override(None)
+                    to["minimax_h3_untwist_rope"] = {
+                        "enabled": True,
+                        "progress": float(sigma),
+                        "start_percent": 0.0,
+                        "end_percent": 1.0,
+                        "high_scale_start": 1.0,
+                        "high_scale_end": 1.0,
+                        "low_scale_start": 1.0,
+                        "low_scale_end": 1.0,
+                        "beta": 2.0,
+                        "reference_ranges": ((0, 1),),
+                        "rope_axis_count": 1,
+                        "rope_freqs_per_axis": 1,
+                        "scale_temporal_axis": False,
+                    }
                 executor = WrapperExecutor.new_class_executor(model._forward, model, wrappers)
                 out = executor.execute([video, audio], (sigma * 1000).reshape(1), context, to,
                                        minimax_payload={"layout": packed, "seed": 37})
