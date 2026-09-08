@@ -130,16 +130,32 @@ Do not fix a Sage binary ABI failure by globally injecting another `libstdc++.so
 
 ## Verify the SageAttention installation
 
-First verify that the compiled extensions load:
+**Leave the SageAttention source checkout before importing the installed package.** If the current directory is `/tmp/SageAttention`, Python places that directory first on `sys.path` and imports `/tmp/SageAttention/sageattention` instead of the installed wheel. That source tree does not contain the wheel's compiled extensions in-place and can produce a misleading `cannot import name '_fused' from partially initialized module 'sageattention'` / circular-import error even though the wheel built and installed correctly.
 
 ```bash
 conda activate comfy312
+cd ~
+
+python - <<'PY'
+import sageattention
+print('sageattention:', sageattention.__file__)
+assert '/tmp/SageAttention/' not in sageattention.__file__
+assert 'site-packages' in sageattention.__file__
+print('installed SageAttention package selected: OK')
+PY
+```
+
+Now verify that the compiled extensions load:
+
+```bash
 python - <<'PY'
 import sageattention
 import sageattention._fused
 import sageattention._qattn_sm89
 print('sageattention:', sageattention.__file__)
-print('compiled extensions: OK')
+print('_fused:', sageattention._fused.__file__)
+print('_qattn_sm89:', sageattention._qattn_sm89.__file__)
+print('compiled Sage extensions: OK')
 PY
 ```
 
@@ -164,6 +180,8 @@ assert torch.isfinite(out).all()
 print('sageattn SM120 execution: OK')
 PY
 ```
+
+The documented RTX PRO 6000 Blackwell / PyTorch 2.10.0+cu130 / WSL path has now passed this exact test with output shape `(1, 8, 2048, 128)`, BF16 output, finite values, and capability `(12, 0)`.
 
 ## Optional SageAttention3
 
@@ -194,6 +212,20 @@ python tools/attention_probe.py --backend pytorch --tokens 4096 --prefix 512 --h
 python tools/attention_probe.py --backend sage --tokens 4096 --prefix 512 --heads 8
 ```
 
-The Sage probe must show real Sol-H3 sparse execution and prefix parity. If Sage itself still cannot load, current Sol-H3 records `dense_provider_failures` and demotes that optional dense provider to the original Comfy attention for the current request; this allows Sol-H3's own CuTe/Sana kernel to remain testable. That fallback is diagnostic resilience, not evidence that SageAttention itself is healthy.
+For a healthy Sage installation on SM120, the Sage probe must show real Sol-H3 sparse execution and prefix parity **without** demotion:
+
+```text
+requested_dense_backend: sage
+dense_provider_failures: {}
+dense_provider_fallback: false
+sol_source: sana-sol-engine
+sol_backend: cute_sm120
+sol_source_tree_verified: true
+sparse_calls: 2
+prefix_parity: true
+fallbacks: {}
+```
+
+The documented RTX PRO 6000 Blackwell environment has now passed both the PyTorch and Sage probes with those SOL results. If Sage itself cannot load, current Sol-H3 records `dense_provider_failures` and demotes that optional dense provider to the original Comfy attention for the current request; this allows Sol-H3's own CuTe/Sana kernel to remain testable. That fallback is diagnostic resilience, not evidence that SageAttention itself is healthy.
 
 For the full integration and production acceptance matrix, continue with [VALIDATION.md](VALIDATION.md).
