@@ -31,7 +31,7 @@ These companions are not automatically installed.
 Current reviewed pins for the primary stack are:
 
 ```text
-Spectrum #104  34f3c3d6c8ca738b76694a6321650e2db9bc892d
+Spectrum #104  9c682c07f4c5ea9de601cda234755a1561b59f59
 VDN #8         b6f0755c4172ec5c17386c56998f454e78b2a2d4
 VDN #11        5b63dc670229d419a6350b64f7ceda609dbc8194
 Sana           2936c47637380842aaa4a4488fac5006cc542b70
@@ -101,6 +101,8 @@ The 58 dense calls are expected from `dense_evaluations=1` plus two configured d
 ### Spectrum
 
 Spectrum consumes preflight policy plus actual backend receipts. Provider demotion or route changes alter the numerical identity and reset incompatible history instead of aborting execution. Opaque/unpredictable routing executes actual transformer calls rather than forecasting from an unqualified anchor.
+
+The final reviewed Spectrum #104 consumer also treats failures in third-party backend-history metadata callbacks as unprovable/actual-only rather than aborting sampling, while still propagating CUDA out-of-memory. Its first provider identity is established without invalidating an empty offline-capture archive; genuine later identity or receipt transitions still perform the conservative history reset.
 
 Production also composes MiniMax-H3 Diff-Aid. Sol-H3's history preflight therefore recognizes only the audited Diff-Aid H3 activation-only replacement chain when Diff-Aid's own Spectrum runtime declaration is present. Both valid wrapper orders are supported. Static Diff-Aid configuration participates in the history identity; changing normalized sigma does not because Spectrum's existing external-patch layer already owns patch-regime transitions. Cycles, duplicate/mismatched Sol patches, unknown replacement wrappers, or missing Diff-Aid declarations remain opaque/actual-only. Untwist is not generically declared history-transparent through this mechanism.
 
@@ -190,7 +192,7 @@ This is Exact-only evidence and does not establish SOL speed.
 
 ### Current CI
 
-The final one-commit Sol PR head is `9b3f96b7aa1360ad9ce196e402955414f86842ff` on neutral `main` `5db282ca836416a32cf114346b946fe75136e4f1`.
+The PR branch is maintained as exactly one implementation commit over neutral `main` `5db282ca836416a32cf114346b946fe75136e4f1`.
 
 Current validation covers:
 
@@ -206,7 +208,9 @@ Current validation covers:
 - both audited Diff-Aid/Sol wrapper orders;
 - Flow API-2 mixed-grid SOL routing and mixed -> native resumption.
 
-Spectrum #104 was rebased onto v0.2.25/current main at `34f3c3d6c8ca738b76694a6321650e2db9bc892d`; Spectrum final CI #596 passed all nine lanes. Sol's repin mirror CI #158 and final PR CI #160 both passed their full CPU-contract and native-interop lanes with that exact Spectrum pin.
+Spectrum #104 is finalized for this production gate at `9c682c07f4c5ea9de601cda234755a1561b59f59`; final Spectrum CI #597 (`34278002378`) passed all nine reviewed ComfyUI/Python lanes. CodeRabbit verified and resolved both substantive backend-history findings on that head.
+
+Sol-H3's final Spectrum-repin mirror `mirror/spectrum-104-final-repin-20260908` at `3929ec3cecc4ef12496aa7378022a730067148f5` passed CI #168 (`34278353336`) in both the full CPU-contract and native-interop lanes while pinning that exact Spectrum head, VDN #8 and VDN #11.
 
 GPU/media validation remains separate from CPU CI.
 
