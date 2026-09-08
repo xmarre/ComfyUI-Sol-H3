@@ -124,8 +124,7 @@ def _diffaid_replacement_identity(patch, options):
     opaque. The replacement itself only modulates ``args['img']`` and delegates to
     ``existing_patch``/``original_block``; it does not own attention routing.
     """
-    cls = type(patch)
-    if cls.__name__ != "MiniMaxH3BlockReplacePatch" or "diffaid" not in cls.__module__.lower():
+    if type(patch).__name__ != "MiniMaxH3BlockReplacePatch":
         return None
     runtime_identity = _diffaid_runtime_identity(options)
     if not runtime_identity or not hasattr(patch, "existing_patch"):
@@ -183,7 +182,6 @@ def _replacement_history_identity(patch, block_index, config, options):
 @dataclass(frozen=True)
 class HistoryPolicy:
     config: object
-    block_count: int | None = None
 
     def __call__(self, *, layout, options, model):
         # Called BEFORE Spectrum decides whether to use an anchor. Never advances
@@ -220,19 +218,12 @@ class HistoryPolicy:
                 ), tuple(vdn))
 
     def accept_receipts(self, receipts):
-        valid = bool(receipts) and all(
+        return bool(receipts) and all(
             len(item) == 3 and item[0] == "sol_h3" and item[2] in (
                 "sol", "sol_external_mixed", "dense_warmup", "vdn_local_sol", "vdn_dense_warmup",
                 "vdn_local_native", "vdn_global_native", "vdn_anchor_native",
                 "vdn_flex_masked_native", "external_sequence_native")
             for item in receipts)
-        if not valid or self.block_count is None:
-            return valid
-        blocks = {
-            item[1] for item in receipts
-            if type(item[1]) is int and 0 <= item[1] < self.block_count
-        }
-        return blocks == set(range(self.block_count))
 
 
 def provider_identity(provider, disabled_dense_providers=()):
