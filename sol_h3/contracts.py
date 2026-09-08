@@ -34,7 +34,7 @@ class Config:
                 "threshold": "diag" if owns_sol else None,
                 "kernel_contract": "sana-2936c476-sol-sm120" if owns_sol else None,
                 "exact_kernel": "rounded-affine-v1" if self.exact else "native",
-                "history_policy": "sparse_forecasting_blocked" if owns_sol else "inherits_upstream_numerics"}
+                "history_policy": "attention_backend_history_v1"}
         data["fingerprint"] = hashlib.sha256(
             json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return data
@@ -69,36 +69,3 @@ def adaln_status(model):
         return "not_applicable_compact_curve"
     return "native_full_width_no_schedule_precompute"
 
-
-def provider_names(options):
-    """Flatten provider keys without depending on private wrapper/callback object types."""
-    names = [str(k).lower() for k in options]
-    names += [str(k).lower() for group in options.get("wrappers", {}).values() for k in group]
-    names += [str(k).lower() for group in options.get("callbacks", {}).values() for k in group]
-    return names
-
-
-def reject_forecasting_conflicts(options):
-    """Reject known numerical-backend transitions that an active forecaster cannot identify."""
-    names = provider_names(options)
-    spectrum = any("spectrum" in name for name in names)
-    scheduled_sparse = any("block_sparse_attention" in name for name in names)
-    if spectrum and scheduled_sparse:
-        raise RuntimeError(
-            "Spectrum + ComfyUI Block Sparse Attention is gated: the sparse schedule can mix dense and sparse "
-            "actual anchors, while the audited Spectrum consumer does not track that backend transition"
-        )
-
-
-def reject_sparse_conflicts(options):
-    # No consumer currently acknowledges the v1 history fingerprint. Check on every
-    # evaluation as well as installation, including patches applied after this node.
-    names = provider_names(options)
-    if any("spectrum" in name for name in names):
-        raise RuntimeError("SOL + Spectrum is gated until Spectrum consumes sol_h3_runtime_v1 history identity")
-    if "vdn_h3_external_sequence_v1" in options:
-        raise RuntimeError("SOL does not yet support VDN external/reduced or mixed-grid sequences")
-    if any("block_sparse_attention" in name for name in names):
-        raise RuntimeError("SOL cannot be stacked with ComfyUI Block Sparse Attention; select exactly one sparse provider")
-    if options.get("optimized_attention_override") is not None:
-        raise RuntimeError("SOL cannot own attention alongside an existing optimized attention override")

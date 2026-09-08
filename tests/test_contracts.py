@@ -6,8 +6,6 @@ from sol_h3.contracts import (
     Config,
     adaln_status,
     prefix_length,
-    reject_forecasting_conflicts,
-    reject_sparse_conflicts,
 )
 from sol_h3.nodes import NODE_CLASS_MAPPINGS
 
@@ -57,29 +55,6 @@ def test_adaln_format():
     assert adaln_status(SimpleNamespace(use_adaln_curves=False)) == "native_full_width_no_schedule_precompute"
     with pytest.raises(RuntimeError):
         adaln_status(SimpleNamespace(use_adaln_curves=True))
-
-
-def test_late_sparse_conflicts():
-    for options in ({"spectrum_h3_runtime": object()},
-                    {"wrappers": {"diffusion_model": {"spectrum_h3": []}}},
-                    {"callbacks": {"on_prepare_state": {"block_sparse_attention": []}}},
-                    {"optimized_attention_override": object()},
-                    {"vdn_h3_external_sequence_v1": {}}):
-        with pytest.raises(RuntimeError):
-            reject_sparse_conflicts(options)
-
-
-def test_spectrum_plus_scheduled_sparse_is_rejected_but_each_alone_is_allowed():
-    spectrum = {"wrappers": {"diffusion_model": {"spectrum_h3": []}}}
-    sparse = {"callbacks": {"on_prepare_state": {"block_sparse_attention": []}}}
-    reject_forecasting_conflicts(spectrum)
-    reject_forecasting_conflicts(sparse)
-    combined = {
-        "wrappers": spectrum["wrappers"],
-        "callbacks": sparse["callbacks"],
-    }
-    with pytest.raises(RuntimeError, match="dense and sparse actual anchors"):
-        reject_forecasting_conflicts(combined)
 
 
 def test_node_schema():

@@ -3,21 +3,17 @@ from types import SimpleNamespace
 import torch
 
 from sol_h3.contracts import Config
-from sol_h3.runtime import BlockPatch, _FORWARD
+from sol_h3.runtime import BlockPatch, Request, _FORWARD
 
 
 def test_sparse_dense_reference_keeps_attention_recursion_guard(monkeypatch):
     """Raw dense providers may call wrapped fallbacks; they must stay inside wrap_attn."""
-    from sol_h3 import sparse
+    from sol_h3 import sparse, runtime
+    monkeypatch.setattr(runtime, "_shape_reason", lambda *a, **k: None)
 
     cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
     model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(forward=lambda: None))])
-    state = SimpleNamespace(
-        config=cfg,
-        sparse_calls=0,
-        dense_calls=0,
-        dense_attention_backends=set(),
-    )
+    state = Request(cfg)
     q = torch.zeros(1, 1, 7, 128, dtype=torch.bfloat16)
     layout = SimpleNamespace(
         seq_len=7,
@@ -38,7 +34,7 @@ def test_sparse_dense_reference_keeps_attention_recursion_guard(monkeypatch):
         return q
 
     monkeypatch.setattr(sparse, "attention", fake_sparse)
-    token = _FORWARD.set((model, state, 0, set()))
+    token = _FORWARD.set((model, state, 0, set(), []))
     try:
         def original_block(forwarded):
             override = forwarded["transformer_options"]["optimized_attention_override"]

@@ -12,6 +12,11 @@ import torch.nn.functional as F
 _VERIFIED_ROOTS = set()
 
 
+class KernelUnavailable(RuntimeError):
+    """The native provider can execute safely without importing this kernel."""
+
+
+
 def verify_sources(root, manifest):
     root = Path(root).resolve()
     git_blobs = manifest.get("git_blobs")
@@ -125,7 +130,14 @@ def attention(q, k, v, prefix, config, state, dense_attention=None):
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
     if state.kernel is None:
-        state.kernel = load_kernel(q.device)
+        failure = getattr(state, "kernel_failure", None)
+        if failure:
+            raise KernelUnavailable(failure)
+        try:
+            state.kernel = load_kernel(q.device)
+        except RuntimeError as exc:
+            state.kernel_failure = str(exc)
+            raise KernelUnavailable(str(exc)) from exc
         state.kernel_device = q.device
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
@@ -138,7 +150,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None):
         # extreme tau necessarily selects every block on arbitrary activations.
         got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                            sink_start=0, sink_tokens=qb.shape[1])
-        want = _dense_reference(q, k, v, dense_attention)
+        want = _dense_reference(q, k, v, None)
         metrics = error_metrics(got, want)
         limits = {"max_abs": 0.15 if qb.shape[1] >= 32768 else 0.08,
                   "mean_abs": 0.002, "rel_l2": 0.005}
@@ -151,6 +163,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None):
                        sink_start=0, sink_tokens=prefix)
     # Generated audio, references, conditioning and text query rows remain dense
     # through the same active Comfy dense provider used by the baseline path.
-    out[:, :prefix] = _dense_reference(q[:, :, :prefix], k, v, dense_attention)
+    if prefix:
+        out[:, :prefix] = _dense_reference(q[:, :, :prefix], k, v, dense_attention)
     state.sparse_calls += 1
     return out.reshape(1, q.shape[2], -1)

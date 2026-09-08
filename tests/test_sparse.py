@@ -91,11 +91,11 @@ def test_bridge_protects_prefix_and_uses_full_sink_gate(monkeypatch):
     assert (out[:, 5:] == 9).all()
     assert [c["sink_tokens"] for c in calls] == [11, 5]
     assert all(c["sink_start"] == 0 for c in calls)
-    assert dense_calls == [11, 5]
+    assert dense_calls == [5]
     assert state.sparse_calls == 1
     sparse.attention(q, k, v, 5, config, state, dense_attention=dense_attention)
     assert len(calls) == 3  # same-request shape gate reused
-    assert dense_calls == [11, 5, 5]
+    assert dense_calls == [5, 5]
 
 
 def test_failed_arithmetic_never_counts_sparse(monkeypatch):

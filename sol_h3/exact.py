@@ -49,6 +49,23 @@ def affine(h, shift, scale, segments, verified):
     return h
 
 
+def ineligible_reason(block, args):
+    from comfy.ldm.minimax.model import DiTBlock
+    from torch.nn.modules import module as hooks
+    if type(block) is not DiTBlock or getattr(block.forward, "__func__", None) is not DiTBlock.forward:
+        return "block_forward_owner"
+    if (block._forward_hooks or block._forward_pre_hooks
+            or hooks._global_forward_hooks or hooks._global_forward_pre_hooks
+            or getattr(block, "_compiled_call_impl", None) is not None):
+        return "block_hooks_or_compile"
+    x = args["img"]
+    if x.device.type != "cuda" or x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return "activation_dtype_device"
+    if torch.is_grad_enabled() or torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        return "autograd_or_graph_capture"
+    return None
+
+
 def execute_block(block, args, verified):
     # Keep native RMSNorm, AdaLN, attention, MLP and addcmul_ gate operations.
     from comfy.ldm.minimax.model import DiTBlock, _mod_gate
