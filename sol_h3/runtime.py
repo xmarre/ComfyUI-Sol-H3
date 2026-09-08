@@ -6,7 +6,7 @@ import logging
 
 from .contracts import KEY, Config, adaln_status, prefix_length
 from .interop import (
-    HISTORY_KEY, VDN_KEY, VDN_KEY_V2, VDN_PREPROCESS_KEY,
+    HISTORY_KEY, VDN_KEY, VDN_KEY_V2, VDN_KEY_V3, VDN_PREPROCESS_KEY,
     HistoryPolicy, provider_name, receipt,
 )
 
@@ -22,6 +22,9 @@ class Request:
     eligible_calls: int = 0
     sparse_calls: int = 0
     dense_calls: int = 0
+    external_mixed_sol_calls: int = 0
+    external_mixed_q_rows: int = 0
+    external_mixed_kernel_q_rows: int = 0
     vdn_local_sol_calls: int = 0
     vdn_rectangular_sol_calls: int = 0
     vdn_requested_q_rows: int = 0
@@ -64,6 +67,9 @@ class SamplingWrapper:
                      "sol_backend": getattr(state.kernel, "backend_name", None),
                      "sol_source_tree_verified": getattr(state.kernel, "source_tree_verified", False),
                      "sparse_calls": state.sparse_calls, "dense_warmup": state.dense_calls,
+                     "external_mixed_sol_calls": state.external_mixed_sol_calls,
+                     "external_mixed_q_rows": state.external_mixed_q_rows,
+                     "external_mixed_kernel_q_rows": state.external_mixed_kernel_q_rows,
                      "compatibility_fallbacks": dict(state.fallbacks),
                      "dense_provider_failures": dict(state.dense_provider_failures),
                      "vdn_local_sol_calls": state.vdn_local_sol_calls,
@@ -177,6 +183,36 @@ def _provider_unavailable_reason(exc):
     return "import_error" if isinstance(exc, ImportError) else "loader_error"
 
 
+def _external_sequence_prefix(contract, layout, rows):
+    """Validate Flow mixed-grid API 2 and return its exact global-prefix sink rows."""
+    if not isinstance(contract, dict) or contract.get("api") != 2:
+        return None, "external_sequence_native"
+    if (contract.get("mode") != "dense_gate_no_linear"
+            or contract.get("topology") != "mixed_grid_low_suffix"):
+        return None, "external_sequence_native"
+    names = (
+        "native_sequence_rows", "sequence_rows", "video_start", "temporal",
+        "prefix_t", "source_rows_per_frame", "prefix_rows_per_frame",
+    )
+    if any(type(contract.get(name)) is not int for name in names):
+        return None, "external_sequence_contract"
+    native, actual, start, temporal, prefix_t, source_rows, prefix_rows = (
+        contract[name] for name in names
+    )
+    if (actual != rows or not 0 < start < actual or not 0 < prefix_t < temporal
+            or not 0 < source_rows < prefix_rows
+            or native != start + temporal * source_rows
+            or actual != start + prefix_t * prefix_rows + (temporal - prefix_t) * source_rows):
+        return None, "external_sequence_contract"
+    try:
+        current_prefix = prefix_length(layout, rows)
+    except RuntimeError:
+        return None, "external_sequence_layout"
+    if current_prefix != start:
+        return None, "external_sequence_layout"
+    return start, None
+
+
 def _vdn_provider_api():
     """Return the installed VDN softmax-provider capability without owning hybrid.py."""
     try:
@@ -282,11 +318,16 @@ class BlockPatch:
                 consumer = current_options.get("spectrum_h3_runtime")
                 if consumer is not None and not callable(getattr(consumer, "prepare_backend_history", None)):
                     reason = "forecast_consumer_no_history_contract"
-                if current_options.get("vdn_h3_external_sequence_v1"):
-                    reason = "external_sequence_native"
                 layout = current_options.get("minimax_h3_layout", args.get("layout"))
+                external_contract = current_options.get("vdn_h3_external_sequence_v1")
+                external_mixed = False
                 prefix = 0
-                if reason is None:
+                if reason is None and external_contract is not None:
+                    prefix, reason = _external_sequence_prefix(
+                        external_contract, layout, q.shape[2]
+                    )
+                    external_mixed = reason is None
+                elif reason is None:
                     try:
                         prefix = prefix_length(layout, q.shape[2])
                     except RuntimeError:
@@ -316,7 +357,13 @@ class BlockPatch:
                     record("kernel_unavailable:" + str(exc), True)
                     dense_provider = previous
                     return dense()
-                record("sol")
+                if external_mixed:
+                    state.external_mixed_sol_calls += 1
+                    state.external_mixed_q_rows += q.shape[2]
+                    state.external_mixed_kernel_q_rows += q.shape[2]
+                    record("sol_external_mixed")
+                else:
+                    record("sol")
                 return result
 
             def vdn_provider_v1(native, q, k, v, *, kind, scale, square_aligned=False):
@@ -373,6 +420,13 @@ class BlockPatch:
                 record("vdn_local_sol")
                 return result
 
+            def vdn_provider_v3(native, q, k, v, *, kind, scale,
+                                square_aligned=False, sink_rows=0):
+                return vdn_provider_v2(
+                    native, q, k, v, kind=kind, scale=scale,
+                    square_aligned=square_aligned, sink_rows=sink_rows,
+                )
+
             def vdn_preprocess(q, k, v, *, heads, transformer_options):
                 # VDN exposes post-RoPE [T,H,D]. Comfy attention preprocessors use
                 # [B,H,T,D], so adapt only at this explicit full-domain boundary.
@@ -384,6 +438,7 @@ class BlockPatch:
             options["optimized_attention_override"] = override
             options[VDN_KEY] = vdn_provider_v1
             options[VDN_KEY_V2] = vdn_provider_v2
+            options[VDN_KEY_V3] = vdn_provider_v3
             if hasattr(previous, "attention_preprocess_v1"):
                 options[VDN_PREPROCESS_KEY] = vdn_preprocess
 
