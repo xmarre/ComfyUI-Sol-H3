@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xmarre/ComfyUI-Spectrum-MiniMax-H3
-          ref: 34f3c3d6c8ca738b76694a6321650e2db9bc892d
+          ref: 9c682c07f4c5ea9de601cda234755a1561b59f59
           path: _deps/Spectrum
           persist-credentials: false
       - uses: actions/checkout@v4
