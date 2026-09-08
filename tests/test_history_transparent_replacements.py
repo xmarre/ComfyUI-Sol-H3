@@ -48,25 +48,77 @@ def _fixture_options(cfg, *, marker=True):
     return options
 
 
-def _policy_identity(cfg, options):
+def _policy_identity(cfg, options, *, blocks=2, layout=None):
     model = SimpleNamespace(
         blocks=[
-            SimpleNamespace(attn=SimpleNamespace(forward=lambda *a, **k: None)),
-            SimpleNamespace(attn=SimpleNamespace(forward=lambda *a, **k: None)),
+            SimpleNamespace(attn=SimpleNamespace(forward=lambda *a, **k: None))
+            for _ in range(blocks)
         ],
         dtype=torch.bfloat16,
     )
-    layout = SimpleNamespace(
-        seq_len=7,
-        segments=[(0, 3, "text"), (3, 7, "video")],
-        signature=(3, 7),
-    )
+    if layout is None:
+        layout = SimpleNamespace(
+            seq_len=7,
+            segments=[(0, 3, "text"), (3, 7, "video")],
+            signature=(3, 7),
+        )
     request = Request(cfg)
     token = _REQUEST.set(request)
     try:
         return HistoryPolicy(cfg)(layout=layout, options=options, model=model)
     finally:
         _REQUEST.reset(token)
+
+
+def _flow_mixed_wrapper(previous, layer, *, source_rows=4, target_rows=16):
+    prefix_t = 2
+    temporal = 4
+    va = 3
+    old_prefix = prefix_t * source_rows
+    prefix_rows = prefix_t * target_rows
+    mixed_rows = prefix_rows + (temporal - prefix_t) * source_rows
+    vb = va + temporal * source_rows
+    plan = SimpleNamespace(
+        prefix_t=prefix_t,
+        temporal=temporal,
+        source_rows=source_rows,
+        target_rows=target_rows,
+        prefix_rows=prefix_rows,
+        mixed_rows=mixed_rows,
+        target_hw=(8, 8),
+    )
+    layout = SimpleNamespace(
+        seq_len=vb,
+        segments=[(0, va, "text"), (va, vb, "video")],
+        signature=(3, temporal, 4, 4, 0),
+    )
+    mixed_layout = SimpleNamespace(
+        seq_len=va + mixed_rows,
+        segments=[(0, va, "text"), (va, va + mixed_rows, "video")],
+        signature=("h3_flow_mixed_grid_v1", *layout.signature, prefix_t, 8, 8),
+    )
+    inner = SimpleNamespace(blocks=[object(), object()])
+
+    # Reference every audited free variable so the closure shape mirrors Flow's
+    # actual mixed_diffusion_wrapper.<locals>.wrap.<locals>.call function.
+    def call(args, extra):
+        return (
+            layer,
+            previous,
+            plan,
+            layout,
+            mixed_layout,
+            va,
+            vb,
+            old_prefix,
+            inner,
+            args,
+            extra,
+        )
+
+    call.__module__ = "h3_flow_regenerate.mixed_grid"
+    call.__qualname__ = "mixed_diffusion_wrapper.<locals>.wrap.<locals>.call"
+    return call, layout
 
 
 def test_spectrum_declared_diffaid_replacements_are_attention_history_transparent():
@@ -94,3 +146,64 @@ def test_unknown_replacement_wrapper_remains_opaque():
         existing_patch=BlockPatch(0, cfg)
     )
     assert _policy_identity(cfg, options) is None
+
+
+def test_audited_flow_mixed_grid_closures_keep_stable_history_across_rebuilds():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    replacements = {}
+    carrier = None
+    for layer in range(2):
+        wrapped, carrier = _flow_mixed_wrapper(BlockPatch(layer, cfg), layer)
+        replacements[("double_block", layer)] = wrapped
+    options = {"patches_replace": {"dit": replacements}}
+    first = _policy_identity(cfg, options, blocks=2, layout=carrier)
+    assert first is not None
+
+    # Flow reconstructs the wrapper closures for every mixed-grid transformer
+    # invocation. History identity must describe their semantics, not function ids.
+    rebuilt = {}
+    for layer in range(2):
+        wrapped, rebuilt_carrier = _flow_mixed_wrapper(BlockPatch(layer, cfg), layer)
+        rebuilt[("double_block", layer)] = wrapped
+    second = _policy_identity(
+        cfg,
+        {"patches_replace": {"dit": rebuilt}},
+        blocks=2,
+        layout=rebuilt_carrier,
+    )
+    assert second == first
+
+
+def test_flow_mixed_grid_geometry_change_changes_history_identity():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    base = {}
+    changed = {}
+    base_layout = changed_layout = None
+    for layer in range(2):
+        base_wrap, base_layout = _flow_mixed_wrapper(BlockPatch(layer, cfg), layer)
+        changed_wrap, changed_layout = _flow_mixed_wrapper(
+            BlockPatch(layer, cfg), layer, source_rows=8, target_rows=16
+        )
+        base[("double_block", layer)] = base_wrap
+        changed[("double_block", layer)] = changed_wrap
+    base_id = _policy_identity(
+        cfg, {"patches_replace": {"dit": base}}, blocks=2, layout=base_layout
+    )
+    changed_id = _policy_identity(
+        cfg, {"patches_replace": {"dit": changed}}, blocks=2, layout=changed_layout
+    )
+    assert base_id is not None and changed_id is not None and changed_id != base_id
+
+
+def test_malformed_flow_mixed_grid_closure_remains_opaque():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    wrapped, carrier = _flow_mixed_wrapper(BlockPatch(0, cfg), 1)
+    options = {
+        "patches_replace": {
+            "dit": {
+                ("double_block", 0): wrapped,
+                ("double_block", 1): BlockPatch(1, cfg),
+            }
+        }
+    }
+    assert _policy_identity(cfg, options, blocks=2, layout=carrier) is None
