@@ -102,6 +102,9 @@ Compare decoded audio/video too: sparse query grouping changed.
 
 ## Evidence
 
-Focused CPU contracts: 40 passed, 5 GPU cases skipped. No rectangular GPU execution,
+CPU suite and source reproduction pass; native CI exercises the pinned current
+VDN #8 -> #11 stack with ComfyUI, KJ and Spectrum. The GPU tests additionally
+cover exact sinks and approximate KV-tail masses with an independent compressed
+softmax oracle. No rectangular GPU execution,
 decoded-media comparison or warmed performance result is available in this environment.
 CI and final aggregate validation will be recorded in the PR description.

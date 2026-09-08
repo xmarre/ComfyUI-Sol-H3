@@ -1,19 +1,23 @@
-# Rectangular SM120 development checkpoint
+# Rectangular SM120 recovery record
 
-Parent PR #1 head: c543f4f017c0ddb276ff28148a7e9be291057b75; base main: 5db282ca836416a32cf114346b946fe75136e4f1.
-Mirror: mirror/rectangular-sm120-20260908. PR branch must remain one implementation commit.
+Original PR #1 head: c543f4f017c0ddb276ff28148a7e9be291057b75.
+Base main: 5db282ca836416a32cf114346b946fe75136e4f1.
+Mirror: mirror/rectangular-sm120-20260908.
 
-Implemented independent Q/KV interface, preprocessing, output and cache geometry;
-SM120 q_len derives from Q. VDN v2 uses requested Q and restricted KV directly.
-Aggregate arithmetic gate unchanged; calibration selects all KV, cache includes both shapes.
-Original Sana hashes retained; functional patch saved at tools/rectangular_sm120.patch.
+Remote checkpoints precede broad review/testing:
+- c9d2f677b79c1d576e49b08327e52ca7ba2256f1: kernel/bridge implementation.
+- c85cf9a0b694b9cc257874dd8199515d9cabbbba: focused contracts, provenance, GPU probe.
 
-NOT YET REVIEWED OR VALIDATED. Remaining: focused CPU/GPU tests, reproducible vendor
-patch application and provenance documentation, current VDN #8/#11 interoperability,
-GPU probe with matched warmed square-expanded baseline, review, CI, final consolidation.
-No GPU execution or performance claim exists for this change.
+Review traced Q loads/grid/tail/route-column divisor, threshold indexing, K/V
+centroids/statistics, KV route traversal/masses, sink bounds, exact-score masks,
+output descriptors and LSE stores. The concrete remaining empirical risk is GPU
+compilation/execution and changed sparse query grouping; see RECTANGULAR.md.
+The aggregate gate was preserved. No companion PR was modified.
 
-Source retrieved with GitHub connector; local baseline snapshot has identical Git blob
-hashes for all 95 files. Direct Git transport unavailable. Remote checkpoints use GitHub
-Git tree/commit/ref APIs preserving the real remote parent; local snapshot commit is
-only a diff baseline and must never become a remote PR parent.
+GitHub connector supplied the source and remote Git tree/commit/ref operations.
+The initial local snapshot matched all 95 remote Git blob hashes. Local snapshot
+commit IDs are diff baselines only; remote commits use real remote ancestry.
+Final PR branch consolidation must use neutral main as its sole parent and the
+validated mirror tree, preserving one implementation commit.
+
+No rectangular GPU execution, warmed timing, or media-quality result is claimed.

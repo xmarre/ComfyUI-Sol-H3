@@ -18,6 +18,8 @@ from tools.vendor_sol_attn import package_sources
 def test_provenance_and_node_local_imports():
     manifest = verify_source()
     assert manifest['revision'] == REVISION
+    patch = Path(__file__).resolve().parents[1] / 'tools/rectangular_sm120.patch'
+    assert hashlib.sha256(patch.read_bytes()).hexdigest() == manifest['packaged_patch_sha256']
     root = Path(interface.__file__).parent
     assert len(manifest['files']) == 51
     raw_files = {}

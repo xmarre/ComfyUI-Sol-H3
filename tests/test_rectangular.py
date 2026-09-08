@@ -176,3 +176,67 @@ def test_real_sm120_rectangular_all_selected_and_sparse_sinks(tq, tk):
         for sink in (0, 1, 65):
             out = kernel(q, k, v, tau=100., sink_tokens=min(sink, tk))
             assert out.shape == q.shape and torch.isfinite(out).all()
+
+
+def test_exact_threshold_moments_are_kv_based(monkeypatch):
+    from sol_h3._vendor.sol_attn import preprocess as p
+    class Launch:
+        def __init__(self):
+            self.calls = []
+        def __getitem__(self, grid):
+            def call(*args, **kw):
+                self.calls.append((grid, args))
+            return call
+    pool, threshold = Launch(), Launch()
+    monkeypatch.setattr(p, '_pool_query_kernel', pool)
+    monkeypatch.setattr(p, '_exact_fused_threshold_kernel', threshold)
+    monkeypatch.setattr(p, 'TensorDescriptor', SimpleNamespace(from_tensor=lambda t, _: t))
+    q = torch.zeros(1, 65, 2, 128, dtype=torch.bfloat16)
+    kc = torch.arange(8, dtype=q.dtype).reshape(1, 8, 1, 1).expand(1, 8, 2, 128).contiguous()
+    out = p._compute_exact_threshold(q, kc, tau=1., scale=128**-.5, valid_kv_tokens=449)
+    assert out.shape == (1, 2, 2)
+    assert pool.calls[0][0] == (2, 2)
+    assert torch.equal(threshold.calls[0][1][1], kc.float().mean(1))
+    assert torch.equal(threshold.calls[0][1][2].float(), torch.full((1, 2, 128, 128), 17.5))
+
+
+def forced_route_reference(q, k, v, sink):
+    """Independent compressed-softmax oracle with tau=inf and ordinal local blocks.
+
+    Approximate blocks use BF16 K centroids / V sums, as Sana does. Actual
+    block mass is its KV row count; exact blocks expand into individual rows.
+    """
+    parts = []
+    for qs in range(0, q.shape[1], 64):
+        keys, values, masses = [], [], []
+        for ks in range(0, k.shape[1], 64):
+            kb, vb = k[:, ks:ks+64], v[:, ks:ks+64]
+            if abs(qs//64 - ks//64) <= 1 or ks < sink:
+                keys.append(kb.float())
+                values.append(vb.float())
+                masses.extend([1.] * kb.shape[1])
+            else:
+                keys.append(kb.float().mean(1, keepdim=True).bfloat16().float())
+                values.append(vb.float().sum(1, keepdim=True).bfloat16().float() / kb.shape[1])
+                masses.append(float(kb.shape[1]))
+        logits = torch.einsum('bqhd,bkhd->bhqk', q[:, qs:qs+64].float(), torch.cat(keys, 1)) * 128**-.5
+        logits += torch.tensor(masses, device=q.device).log()
+        parts.append(torch.einsum('bhqk,bkhd->bqhd', logits.softmax(-1), torch.cat(values, 1)))
+    return torch.cat(parts, 1).bfloat16()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('sink', [0, 1, 65, 193])
+def test_real_sm120_sink_and_approximate_kv_tail_mass(sink):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip('requires real SM120')
+    kernel = sparse.load_kernel(torch.device('cuda'))
+    torch.manual_seed(71)
+    # Four Q blocks, eight KV blocks; both have tails. B=2 also audits LSE batch stride.
+    q = torch.randn(2, 193, 2, 128, device='cuda', dtype=torch.bfloat16)
+    k, v = (torch.randn(2, 449, 2, 128, device='cuda', dtype=q.dtype) for _ in range(2))
+    with torch.inference_mode():
+        got = kernel(q, k, v, tau=float('inf'), sink_tokens=sink)
+        want = forced_route_reference(q, k, v, sink)
+        metrics = sparse.error_metrics(got, want)
+        assert sparse.arithmetic_gate_passes(metrics), metrics
