@@ -1,8 +1,8 @@
 # ComfyUI-Sol-H3
 
-Native MiniMax-H3 affine fusion and experimental NVIDIA BF16 CuTe SOL attention for ComfyUI. **Draft: Exact Runtime has production RTX PRO 6000 evidence; sparse SOL and the new interoperability paths still require current-head GPU/performance/audiovisual validation.**
+Native MiniMax-H3 affine fusion and experimental Sol-Attn integration for ComfyUI. **Draft: Exact Runtime has production RTX PRO 6000 evidence; sparse SOL and the new interoperability paths still require current-head GPU/performance/audiovisual validation.**
 
-ComfyUI already provides a separate Block Sparse Attention implementation through `comfy-kitchen`. Its chunked/int8 H3 producer differs from this repository's pinned NVIDIA BF16 kernel and routing policy. Keep both as separate A/B baselines.
+Current ComfyUI already ships the maintained compiled Sol-Attn kernel through `comfy-kitchen`. This repository now uses that installed kernel directly. **There is no separate Sana checkout, PYTHONPATH mutation, runtime download, or duplicate Sol-Attn installation.** ComfyUI's separate **Block Sparse Attention** node remains a different integration policy: its MiniMax-H3 producer streams/chunks QKV into `comfy_kitchen.sol_attn_chunked`, while this node keeps native H3 QKV production and applies its own Exact/SOL/VDN/Spectrum composition policy around `comfy_kitchen.sol_attn`.
 
 ## Nodes and composition
 
@@ -36,7 +36,7 @@ These remain draft and require combined runtime validation. They are not automat
 | DiffAid / Flow / other block replacements | Delegate current arguments; unsupported layouts use inherited calls | Source/contract evidence; opaque replacement history remains actual-only |
 | Runtime adapters, ordinary LoRA, curve AdaLN, KJ preview | Native submodules/hooks remain active; unsupported Exact ownership uses native block | Source and projection-hook tests; full GPU/media stack outstanding |
 
-VDN remains the owner of its trained local/window geometry, anchors, learned softmax gate and linear complement. The v2 bridge does **not** broaden a local VDN operation to unrestricted model attention: it evaluates extra query rows only over the same already-restricted KV domain so the NVIDIA square-QKV kernel can run, then discards those extra query outputs. This adds query/gather overhead, so successful VDN-local SOL execution does not by itself establish a speedup.
+VDN remains the owner of its trained local/window geometry, anchors, learned softmax gate and linear complement. The v2 bridge does **not** broaden a local VDN operation to unrestricted model attention: it evaluates extra query rows only over the same already-restricted KV domain so the square-QKV Sol-Attn kernel can run, then discards those extra query outputs. This adds query/gather overhead, so successful VDN-local SOL execution does not by itself establish a speedup.
 
 Spectrum histories use `attention_backend_history_v1` preflight policies and `attention_backend_receipts_v1` actual receipts. Unpredictable routing executes actual calls rather than using unqualified anchors. Transitions clear stage histories/controllers and incompatible offline archives; offline replay may therefore be unavailable for a changing backend. With older Spectrum lacking the consumer contract, SOL delegates its affected attention calls to the inherited provider.
 
@@ -44,9 +44,11 @@ Spectrum histories use `attention_backend_history_v1` preflight policies and `at
 
 Eligible Q/K/V are BF16, matching `[1, heads, rows, 128]` tensors on SM120, with supported unmasked attention flags and a current contiguous packed prefix/video-tail layout. Unsupported calls delegate locally and do not permanently disable later eligible calls.
 
-For ordinary native H3 attention the full prefix is a KV sink and every prefix query is recomputed by the inherited dense backend. VDN v2 differs deliberately: its square-expanded prefix/global query rows are auxiliary outputs that VDN discards, so SOL keeps those rows as sink KV without paying a second dense query recomputation. The all-selected arithmetic gate uses **independent BF16 SDPA**, so approximate Sage arithmetic cannot falsely fail the SOL kernel gate. The gate tests arithmetic, not sparse output quality. Pure QKV preprocessing contracts run before SOL and its reference without repeating the transformation.
+The runtime calls ComfyUI's installed `comfy_kitchen.sol_attn` with tau routing, no top-k override, pooled tail enabled, and 64-row exact sink blocks. A prefix ending inside a 64-row block rounds the exact-KV sink outward to the end of that block; this only makes extra keys exact. Ordinary native H3 still recomputes every prefix query through the inherited dense provider. VDN v2 differs deliberately: its square-expanded prefix/global query rows are auxiliary outputs that VDN discards, so SOL keeps those rows as exact sink KV without paying a second dense query recomputation.
 
-Sources are SHA-256 verified before import. Missing or mismatched optional kernel dependencies cause recorded native fallback; their code is not accepted as the requested kernel. A kernel that actually runs and fails its arithmetic gate still raises. SOL-BSA, learned distillation, full-width AdaLN schedule-table eviction and distributed execution are not implemented.
+The all-selected arithmetic gate uses **independent BF16 SDPA**, so approximate Sage arithmetic cannot falsely fail the SOL kernel gate. The gate tests arithmetic, not sparse output quality. Pure QKV preprocessing contracts run before SOL and its reference without repeating the transformation. If the current ComfyUI/comfy-kitchen build has no compiled Sol-Attn kernel for the GPU, the affected call records a native fallback; no external package is sought or downloaded.
+
+SOL-BSA, learned distillation, full-width AdaLN schedule-table eviction and distributed execution are not implemented.
 
 ## Installation
 
@@ -59,20 +61,7 @@ cd ComfyUI-Sol-H3
 git switch feature/native-sol-h3
 ```
 
-Exact fusion uses ComfyUI's CUDA PyTorch/Triton environment. The optional SOL kernel requires a separately installed pinned Sana checkout:
-
-```bash
-SOL_ROOT=/home/toor/Sana-sol-h3
-git clone --branch sol-engine https://github.com/xmarre/Sana.git "$SOL_ROOT"
-git -C "$SOL_ROOT" checkout 2936c47637380842aaa4a4488fac5006cc542b70
-```
-
-The audited upstream recommends Python 3.12, CUDA 13.0, PyTorch 2.10, Triton 3.6, CuTe DSL >=4.5 and cuda-python. Check compatibility with your existing environment before changing these dependencies. Kernel source is not redistributed here.
-
-```bash
-cd /home/toor/ComfyUI
-PYTHONPATH="$SOL_ROOT/models/minimax_h3/Sol-H3/h3_runtime/third_party${PYTHONPATH:+:$PYTHONPATH}" python main.py
-```
+That is the complete Sol-H3 installation for current ComfyUI. The same ComfyUI environment that loads this node provides `comfy-kitchen`; on a supported GPU `comfy_kitchen.sol_attn_is_available(device)` must be true. Your normal ComfyUI launch command is sufficient — **do not set a Sol-H3-specific `PYTHONPATH`.**
 
 ## Validation and diagnostics
 
