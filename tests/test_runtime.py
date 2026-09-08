@@ -20,12 +20,14 @@ def patcher(monkeypatch):
             self.inner = Native()
             self.model_options = {"transformer_options": {}}
             self.wrappers = {}
+            self.object_patches = {}
         def get_model_object(self, name):
             return self.inner
         def clone(self):
             other = copy.copy(self)
             other.model_options = copy.deepcopy(self.model_options)
             other.wrappers = copy.deepcopy(self.wrappers)
+            other.object_patches = dict(self.object_patches)
             return other
         def add_wrapper_with_key(self, kind, key, wrapper):
             self.wrappers.setdefault(kind, {}).setdefault(key, []).append(wrapper)
