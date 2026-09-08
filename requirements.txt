@@ -1,0 +1,5 @@
+torch
+triton>=3.6.0,<4; sys_platform == "linux"
+nvidia-cutlass-dsl[cu13]>=4.5.0
+cuda-python
+apache-tvm-ffi>=0.1.11
