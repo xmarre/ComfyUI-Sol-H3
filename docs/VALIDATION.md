@@ -1,29 +1,60 @@
 # Validation status and RTX PRO 6000 commands
 
-**Production RTX PRO 6000 evidence exists for Exact Runtime, including a matched Exact-off/on timing A/B.** Two later sparse-SOL runs were diagnostically useful: the first exposed the pre-v2 VDN routing defect; the latest post-v2 run reached SOL eligibility but executed zero sparse calls only because the old loader unnecessarily required a separate Sana package. The current redesign packages the actual Sana source and selects its CuTe SM120 backend. No GPU execution of this redesign is yet established.
+**Production RTX PRO 6000 evidence exists for Exact Runtime, and direct synthetic GPU evidence now exists for the packaged Sana CuTe SM120 SOL kernel.** Full ComfyUI/VDN/Spectrum sparse execution, warmed performance and audiovisual acceptance remain outstanding.
 
 ## Current source-integration validation
 
-- Full local CPU suite with real Comfy/KJ/Spectrum/VDN integrations: **79 passed, 21 CUDA skips**.
-- Source contract + native interoperability lane: **22 passed** before the final two negative provenance/dependency tests were added; both are included in the full-suite count.
+- The node packages the actual `xmarre/Sana` `sol-engine` source at revision `2936c47637380842aaa4a4488fac5006cc542b70`, subtree `models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn`.
 - All 51 vendored files match the pinned upstream git objects after the documented import-only transformation.
 - Wheel inspection confirms all 51 files, manifest and license texts are packaged.
-- Declared dependencies installed successfully; `pip check` and Ruff pass.
-- Local environment: Python 3.12, PyTorch 2.14.0, Triton 3.8.0, CUTLASS DSL 4.7.1, CUDA Python 13.3.1, TVM FFI 0.1.13.post3. Real SM120 module import/kernel construction passed; no CUDA device is available here.
-- CI additionally retains PyTorch 2.10.0 CPU / Triton 3.6.0 baseline coverage.
-- Existing Exact GPU evidence below is carried forward from the handoff; Exact implementation was not changed. Sana SM120 GPU compilation, numerical output, speed and audiovisual quality remain unvalidated.
-
-## Completed evidence
-
-- Original SOL baseline: 45 passed, 19 skipped before Triton installation.
-- Previous broad local suite: 66 passed, 18 GPU skips.
-- Previous v2 Sol mirror: **57 passed, 30 expected GPU/optional-integration skips**; `pip check` and Ruff passed.
-- Previous native interoperability CI: **12 passed**, exercising current Comfy ModelPatcher/wrappers, current KJ Python wrapper code, Spectrum and the sequential VDN PR #8 -> PR #11 stack with CPU kernel substitutes.
-- VDN v2 companion CI: pinned-Comfy + official-oracle suite, legacy migration and current-Comfy smoke all pass.
-- Spectrum companion baseline: 911 passed, 13 skipped against the audited Comfy revision.
-- Untwist companion baseline: 40 passed.
+- Declared dependencies install normally; no Sana checkout, `SOL_ROOT`, custom `PYTHONPATH`, linker environment edit or runtime download is required.
+- CPU/native integration CI covers current Comfy ModelPatcher, KJ attention-provider chaining, Spectrum and the ordered VDN PR #8 -> PR #11 stack.
+- Optional inherited dense-provider **loader/import** failures are request-locally demoted to the original Comfy attention callable. This is intentionally limited to `ImportError`/`OSError` loader failures; CUDA/runtime compute failures still propagate. Explicit preprocessing contracts such as Untwist remain applied exactly once before the fallback dense owner.
+- Provider demotion is recorded in `dense_provider_failures`, increments the numerical backend transition, and changes Spectrum's provider-history identity so a forecast cannot cross the demotion as though the numerical backend were unchanged.
 
 CPU structural tests replace unavailable GPU kernels explicitly. They do not establish GPU kernel correctness, performance or media quality.
+
+### Completed RTX PRO 6000 Sana/CuTe SM120 kernel execution
+
+A direct local probe was run in the production WSL/conda environment before starting ComfyUI:
+
+```text
+PyTorch: 2.10.0+cu130
+CUDA: 13.0
+Triton: 3.6.0
+GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition
+compute capability: (12, 0)
+```
+
+The packaged source verified all 51 files and reported:
+
+```text
+sol_source: sana-sol-engine
+sana_revision: 2936c47637380842aaa4a4488fac5006cc542b70
+kernel_contract: sana-sol-engine-sol-attn-64-v1
+sol_backend: cute_sm120
+sol_source_tree_verified: true
+```
+
+`tools/attention_probe.py --backend pytorch --tokens 4096 --prefix 512 --heads 8` then compiled and executed the real packaged Sana SM120 CuTe path. It completed with:
+
+```text
+sparse_calls: 2
+prefix_parity: true
+fallbacks: {}
+```
+
+The independent all-selected arithmetic gate against BF16 SDPA reported:
+
+```text
+max_abs: 0.0009765625
+mean_abs: 4.484307282837108e-05
+rel_l2: 0.003004377940669656
+```
+
+This is real GPU compilation/execution evidence for the packaged SOL kernel and its prefix bridge. It is **not** yet evidence for production VDN square-expanded execution, Spectrum forecasting compatibility, end-to-end speed or media quality.
+
+A second probe requesting the installed SageAttention 2 Triton provider exposed an independent binary-loader problem in that Sage installation: its `_fused` extension resolved `/lib/x86_64-linux-gnu/libstdc++.so.6` and required `GLIBCXX_3.4.32`, while the active conda environment already contained a newer compatible `libstdc++`. Sol-H3 must not require users to repair that with `LD_LIBRARY_PATH`, preloading or a second C++ runtime. Current runtime/probe policy therefore treats an unavailable optional dense provider as a local provider demotion while keeping the verified Sana SOL path active. A successful demotion probe must still report `sparse_calls > 0`, `sol_backend=cute_sm120` and exact prefix parity, together with the explicit dense-provider failure.
 
 ### Completed production-GPU Exact Runtime A/B
 
@@ -50,7 +81,7 @@ with Sage enabled in the H3 loader. Native-grid Sol-H3 telemetry still reported 
 
 That run established the interoperability defect that provider API v2 addresses: normal VDN local query rows are rectangular against their restricted KV domain because prefix/global KV rows are included, while the SOL kernel requires square Q/K/V.
 
-The v2 bridge now supplies an expanded query tensor over exactly the same restricted KV row domain and a mapping back to VDN's originally requested rows. CPU oracle tests verify that selecting those outputs reproduces the original rectangular attention result, and a real ModelPatcher/object-patch integration test verifies that the VDN object patch actually reaches Sol-H3 after `patch_model()`.
+The v2 bridge supplies an expanded query tensor over exactly the same restricted KV row domain and a mapping back to VDN's originally requested rows. CPU oracle tests verify that selecting those outputs reproduces the original rectangular attention result, and a real ModelPatcher/object-patch integration test verifies that the VDN object patch actually reaches Sol-H3 after `patch_model()`.
 
 ### Production reproduction of the obsolete external-loader failure
 
@@ -67,7 +98,7 @@ sparse_calls: 0
 kernel_unavailable: Install the pinned Sol-Attn backend and expose its parent directory on PYTHONPATH
 ```
 
-The handoff also reports comfy-kitchen availability at startup. That is evidence about a different integration; it cannot establish Sana CuTe capability. Packaging removes the manual external-source requirement. The reported run is routing evidence only.
+That run is routing evidence only. The external loader is obsolete: current code packages and verifies the actual Sana source locally, and the direct SM120 probe above proves the packaged CuTe kernel can compile and execute on the target GPU.
 
 ## Reproduce CPU contracts
 
@@ -85,11 +116,11 @@ Use the linked companion PR branches/heads. For VDN, the integration lane intent
 
 ## Production machine: kernel checks
 
-Install declared dependencies in `comfy312`, then check the node-local source:
+In the active ComfyUI environment, without changing Git state or linker environment:
 
 ```bash
 conda activate comfy312
-cd /home/toor/ComfyUI/custom_nodes/ComfyUI-Sol-H3
+cd /home/toor/ComfyUI/custom_nodes/comfyui-sol-h3
 python -m pip install -r requirements.txt
 python - <<'PYCODE'
 import torch
@@ -100,22 +131,14 @@ kernel = load_kernel(torch.device('cuda:0'))
 print(kernel.backend_name)
 assert kernel.backend_name == 'cute_sm120'
 PYCODE
-python -m pytest -q tests/test_gpu.py
-python tools/attention_probe.py --backend pytorch --tokens 4096 --prefix 512
-python tools/attention_probe.py --backend sage --tokens 4096 --prefix 512
-python tools/attention_probe.py --backend sage3 --tokens 4096 --prefix 512
+python tools/attention_probe.py --backend pytorch --tokens 4096 --prefix 512 --heads 8
+python tools/attention_probe.py --backend sage --tokens 4096 --prefix 512 --heads 8
+python tools/attention_probe.py --backend sage3 --tokens 4096 --prefix 512 --heads 8
 ```
 
-Sage/Sage3 commands require their installed extensions. Expected: the backend assertion passes and GPU tests have zero skips, and each attention probe reports sparse execution plus a successful independent arithmetic gate. The first shape includes kernel setup/cache cost; record cold and warmed costs separately.
+The PyTorch probe is the minimum kernel acceptance check and must actually execute sparse calls. Sage/Sage3 are optional inherited dense providers. If their binary/package loader is unavailable, the probe must not fake Sage success: it should report `dense_provider_fallback=true`, the classified `dense_provider_failures`, the effective Comfy/PyTorch dense owner and continuing SOL sparse calls. Arbitrary provider compute failures remain fatal.
 
-Launch ComfyUI normally:
-
-```bash
-cd /home/toor/ComfyUI
-python main.py 2>&1 | tee /home/toor/sol_h3_full_stack.log
-```
-
-There must be **no** `SOL_ROOT`, Sana checkout, or Sol-H3-specific `PYTHONPATH` requirement. Before the full run, ensure the startup/install log reports VDN provider API 2 and the node-local backend check reports `cute_sm120`.
+Launch ComfyUI normally after these checks. There must be **no** `SOL_ROOT`, Sana checkout, Sol-H3-specific `PYTHONPATH`, `LD_LIBRARY_PATH` workaround or `ctypes` preload requirement.
 
 ## Full-stack acceptance matrix
 
@@ -124,9 +147,9 @@ Start with Exact off to isolate sparse interoperability, then enable it and comp
 | Run | Combination | Required observation |
 |---|---|---|
 | A | Native selected dense provider | Baseline latency and media |
-| B | Sage + SOL | Inherited dense backend recorded; sparse calls after warmup |
+| B | Sage + SOL | If Sage is usable, inherited Sage is recorded; if its loader is unavailable, explicit one-time demotion to original Comfy dense attention is recorded while SOL continues |
 | C | Sage3 + SOL | Same routing checks; independent gate passes |
-| D | Spectrum + SOL, then Sage + Spectrum + SOL | SOL actual count agrees with actual transformer calls; history resets at backend transitions |
+| D | Spectrum + SOL, then Sage + Spectrum + SOL | SOL actual count agrees with actual transformer calls; history resets at backend/provider demotions and transitions |
 | E | VDN grouped + SOL, with and without Sage | v2 local square expansion executes SOL on eligible restricted domains; `vdn_square_kernel_rows > vdn_square_requested_rows > 0`; global/anchor remain native |
 | F | VDN flex + SOL | Masked Flex remains native; if Flex falls back to grouped, grouped v2 routing is visible. With Spectrum, Flex remains actual-only because the fallback outcome is not preflight-predictable |
 | G | VDN full coverage + SOL | Eligible softmax can use SOL; learned gate remains active |
@@ -151,7 +174,17 @@ vdn_square_expanded_calls > 0
 vdn_square_kernel_rows > vdn_square_requested_rows > 0
 ```
 
-`vdn_global_native`, `vdn_anchor_native` and mixed-grid `external_sequence_native` may still appear and are expected. Their presence is not a failure. A `kernel_unavailable` reason means Sana initialization failed and the run cannot establish sparse-SOL success. Read the concrete dependency/provenance error; no external Sana checkout is needed.
+`vdn_global_native`, `vdn_anchor_native` and mixed-grid `external_sequence_native` may still appear and are expected. Their presence is not a failure. A `kernel_unavailable` reason means Sana initialization failed and the run cannot establish sparse-SOL success.
+
+When an optional inherited dense provider cannot load, expect explicit telemetry such as:
+
+```text
+dense_provider_failures: {"<provider>:binary_abi": 1}
+compatibility_fallbacks: {"dense_provider_unavailable:binary_abi": 1, ...}
+inherited_dense_backends: ["<effective original Comfy provider>", ...]
+```
+
+The provider is attempted once per sampling request, then bypassed. Preprocessing transforms remain active, the numerical-history identity changes, and Spectrum may not forecast across the transition as if nothing changed.
 
 Spectrum preflight does not require PR #11 to modify `vdn_h3/hybrid.py`. For the audited VDN closure shape, Sol-H3 derives the grouped routing identity from the captured VDN state/config and includes model layout plus inherited provider identity in the numerical-history key. If that closure shape changes, the backend is unknown, or Flex is selected, preflight returns opaque and Spectrum executes actual calls. That is a conservative performance fallback, not a runtime incompatibility.
 
@@ -163,6 +196,6 @@ Preserve exact model/adapter files and hashes, quantization, seed, sigma schedul
 
 For VDN v2 specifically record the ratio of `vdn_square_kernel_rows / vdn_square_requested_rows` together with kernel time. The square bridge intentionally computes additional Q rows to preserve VDN's restricted KV geometry while satisfying the square kernel, so its gather/query overhead can erase the sparse benefit even when execution is correct.
 
-Record cold/warm latency, end-to-end wall time, peak allocated/reserved VRAM, actual/forecast counts, sparse/eligible/warmup counts, fallback reasons, VDN-local SOL calls, VDN square row counts and history resets. Use warmed repetitions at identical shapes before making a speed claim. Compare Sol-H3's packaged Sana direct-QKV policy against ComfyUI core Block Sparse Attention's chunked producer as separate integration policies.
+Record cold/warm latency, end-to-end wall time, peak allocated/reserved VRAM, actual/forecast counts, sparse/eligible/warmup counts, fallback reasons, dense-provider failures, VDN-local SOL calls, VDN square row counts and history resets. Use warmed repetitions at identical shapes before making a speed claim. Compare Sol-H3's packaged Sana direct-QKV policy against ComfyUI core Block Sparse Attention's chunked producer as separate integration policies.
 
 Inspect video identity, reference fidelity, motion/grass artifacts, temporal stability and Continuum boundaries. Listen to the entire audio for wrong/missing words, unsolicited speech, whisper/volume fidelity, synchronization and discontinuities. Tensor metrics and unit tests cannot replace this assessment.
