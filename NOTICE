@@ -1,0 +1,21 @@
+ComfyUI-Sol-H3
+Copyright (C) 2026 ComfyUI-Sol-H3 contributors
+Licensed under GNU GPL version 3 or later.
+
+The native DiT block integration follows ComfyUI's GPL-3.0 code and preserves
+its mathematical ordering. The source contract was originally derived from
+ComfyUI 9ac7352f70b2206d4ef7a345b30106d0fa3807d1,
+comfy/ldm/minimax/model.py, and rechecked against current audited head
+41db8f4fa1587d139e412a57b9b69394e3b13f95. The intervening commit changes
+only comfy/model_management.py; the MiniMax-H3 block/modulation source and
+canonical source hashes are unchanged. ComfyUI copyright belongs to its
+respective contributors.
+
+The affine Triton kernel and native SOL bridge are authored for this project.
+They are informed by NVIDIA/Sana Sol-H3's published optimization and attention
+contracts. No NVIDIA/Sana/CuTe/FlashAttention implementation is redistributed.
+The external sol_attn dependency is pinned to xmarre/Sana
+2936c47637380842aaa4a4488fac5006cc542b70. It carries FlashAttention BSD-3-Clause
+notices and Apache-2.0 notices for cuDNN-derived SM120 components. Refer to its
+THIRD_PARTY_NOTICES.md and individual source headers. The parent sol-engine
+tree has no root LICENSE; this project does not grant rights over that tree.
