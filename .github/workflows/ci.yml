@@ -1,0 +1,74 @@
+name: CPU contracts
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/Sana
+          ref: 2936c47637380842aaa4a4488fac5006cc542b70
+          path: _deps/Sana
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e '.[test]'
+      - run: pip install triton==3.6.0
+      - run: python -m pip check
+      - run: python -m ruff check .
+      - run: python -m pytest -q
+        env:
+          SANA_PATH: ${{ github.workspace }}/_deps/Sana
+  native-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: efa6c8f804bff78b46a0fd458ebd2e47bba07a30
+          path: _deps/ComfyUI
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: kijai/ComfyUI-KJNodes
+          ref: c9869eade9920a1b949de07c4a197156006bcceb
+          path: _deps/KJNodes
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI-Spectrum-MiniMax-H3
+          ref: 9c682c07f4c5ea9de601cda234755a1561b59f59
+          path: _deps/Spectrum
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI-VDN-H3-Plus
+          ref: b6f0755c4172ec5c17386c56998f454e78b2a2d4
+          path: _deps/VDN
+          persist-credentials: false
+      - name: Apply VDN SOL-provider overlay after audio overlay
+        run: |
+          git -C _deps/VDN fetch origin 5b63dc670229d419a6350b64f7ceda609dbc8194
+          git -C _deps/VDN -c user.name=ci -c user.email=ci@example.invalid cherry-pick 5b63dc670229d419a6350b64f7ceda609dbc8194
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install torch==2.10.0+cpu torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r _deps/ComfyUI/requirements.txt
+      - run: pip install -e '.[test]'
+      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
+          KJNODES_PATH: ${{ github.workspace }}/_deps/KJNodes
+          SPECTRUM_PATH: ${{ github.workspace }}/_deps/Spectrum
+          VDN_PATH: ${{ github.workspace }}/_deps/VDN
