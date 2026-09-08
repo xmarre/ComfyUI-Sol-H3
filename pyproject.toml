@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Native ComfyUI MiniMax-H3 exact affine fusion and experimental SOL attention"
 requires-python = ">=3.10"
 license = {text = "GPL-3.0-or-later"}
-dependencies = ["torch", "triton==3.6.0; sys_platform == 'linux'", "nvidia-cutlass-dsl[cu13]>=4.5.0", "cuda-python", "apache-tvm-ffi>=0.1.11"]
+dependencies = ["torch", "triton>=3.6.0,<4; sys_platform == 'linux'", "nvidia-cutlass-dsl[cu13]>=4.5.0", "cuda-python", "apache-tvm-ffi>=0.1.11"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff"]

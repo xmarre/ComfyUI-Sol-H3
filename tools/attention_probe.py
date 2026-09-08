@@ -57,6 +57,8 @@ def main():
     torch.cuda.synchronize()
     assert state.sparse_calls == 2, dict(state.fallbacks)
     print(json.dumps({"backend": args.backend, "gpu": torch.cuda.get_device_name(),
+                      **config.metadata(), "sol_backend": state.kernel.backend_name,
+                      "sol_source_tree_verified": state.kernel.source_tree_verified,
                       "sparse_calls": state.sparse_calls, "arithmetic_gates": state.gates,
                       "prefix_parity": True, "fallbacks": dict(state.fallbacks)}, indent=2))
 

@@ -5,7 +5,7 @@ Existing PR #1 is continued on a mirror branch. This audit supersedes both the i
 | Source | Inspected/tested revision |
 |---|---|
 | ComfyUI | `efa6c8f804bff78b46a0fd458ebd2e47bba07a30` |
-| comfy-kitchen Sol-Attn API | source inspected at `21003fa97bf3b180393446d729ae630ceb6c2a52`; production environment reports comfy-kitchen `0.2.33` with CUDA `sol_attn` available |
+| Sana `sol-engine` | `2936c47637380842aaa4a4488fac5006cc542b70`, `models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn` |
 | KJNodes | `c9869eade9920a1b949de07c4a197156006bcceb` |
 | VDN-H3-Plus companion | sequential PR #8 -> PR #11 stack; PR #11 head `99ff31128d66efa508873f5072f8de88c677e55e` |
 | Spectrum companion | `31de0cb89b472c965794fdc340de857360a58107` |
@@ -22,9 +22,17 @@ That ruled out node ordering, dense warmup and tau. The deeper limitation was VD
 
 VDN PR #11 therefore exposes provider API v2. For each local operation VDN still constructs its original restricted KV domain, then supplies an expanded query tensor over that same ordered domain plus a mapping back to the originally requested query rows. SOL may evaluate that square restricted domain and VDN keeps only the original query outputs. The operation does not gain KV rows and therefore does not become unrestricted full-sequence attention. Global/anchor operations remain native, masked Flex remains native, and VDN retains its learned gate and linear complement.
 
-A later post-v2 production run then showed that the routing fix worked: native-grid telemetry reached **`sol_eligible_calls=2750`**. Sparse execution was still zero only because the Sol-H3 loader was looking for a separate Sana package on `PYTHONPATH`, even though the same ComfyUI process had already reported `comfy-kitchen` CUDA capability `sol_attn` as available. That external-loader requirement was unnecessary integration friction and is now removed.
+The post-v2 handoff reports `sol_eligible_calls=2750` but zero sparse execution because the source loader required an external package. This establishes routing only. The subsequent comfy-kitchen substitution is replaced here by the packaged Sana implementation. A ComfyUI startup capability report for comfy-kitchen does not prove Sana CuTe availability.
 
-Current Sol-H3 uses ComfyUI's installed `comfy_kitchen.sol_attn` public API directly. No Sana checkout, PYTHONPATH modification, runtime download, or duplicate kernel installation is part of the contract.
+## Source, licensing and dependencies
+
+The entire 51-file Sol-Attn subtree is retained to preserve its public architecture dispatch and internal support imports; no other engine code is imported. `interface.py`, `preprocess.py`, `common/`, SM120 mainloop and the upstream H3 sparse policy were inspected. `SOURCE_SNAPSHOT.json` identifies upstream validation on SM103 and explicitly lists SM120 as unvalidated; a copy is packaged for provenance.
+
+Sana's pinned root README licenses repository code under Apache-2.0. The subtree's third-party notice identifies FlashAttention BSD-3-Clause and NVIDIA Apache-2.0 adaptations. Copyright/SPDX headers and the original third-party notice/BSD license are retained; the Apache-2.0 text is included. Modified files identify the sole change: absolute `sol_attn.*` imports become relative imports. This avoids global module aliases, path mutations and collisions with other nodes, including when ComfyUI imports the node beneath a generated package name. The manifest records original and transformed hashes, verified before GPU runtime import.
+
+Imports require PyTorch, Triton (also used by CuTe preprocessing), CUDA Python, CUTLASS DSL and TVM FFI (`enable_tvm_ffi=True`). The pinned cuDNN frontend's `cutedsl` dependency metadata declares `nvidia-cutlass-dsl[cu13]>=4.5.0`, `cuda-python`, `apache-tvm-ffi>=0.1.11`; these dependencies are declared directly. No `cudnn` import exists in the packaged subtree. Upstream pins Triton 3.6.0; the node declares >=3.6,<4 so installation does not force a newer PyTorch environment to downgrade. CI retains the upstream 3.6.0 baseline; newer versions require GPU validation. No diffusers, transformers, model downloader or full cuDNN frontend dependency is added.
+
+Upstream maps SM120 to `cute_sm120` only when CuTe imports succeed; otherwise it selects Triton. This node explicitly requires `cute_sm120` on its existing SM120 integration path and records initialization failure as native fallback. It does not mislabel Triton execution as CuTe. Other architectures remain available in the packaged public source but retain the existing node-level per-call native fallback.
 
 ## Compatibility-gate disposition
 
@@ -46,7 +54,7 @@ Current Sol-H3 uses ComfyUI's installed `comfy_kitchen.sol_attn` public API dire
 | Mask / attention flags / precision / dtype / device unsupported | Per-call kernel topology | Inherited attention |
 | Whole-block forward hooks, compiled/custom block forward | Exact arithmetic ownership | Preserve native block invocation |
 | Native source hashes drift | Exact implementation unverified | Native block fallback |
-| `comfy_kitchen.sol_attn` unavailable for the current GPU | Optional optimization unavailable | Native fallback with explicit telemetry; no external package search/download |
+| Packaged Sana source/CuTe unavailable for the current GPU | Optional optimization unavailable | Native fallback with explicit telemetry; no external package search/download |
 | Arithmetic gate actually fails | Computed output violates tested invariant | Hard failure; never silently accept failed arithmetic |
 | Missing request scope / tampered metadata / cyclic transform | Broken internal lifecycle/contract | Hard failure |
 | Malformed affine indices/strides | Unsafe fused indexing | Existing hard invariant retained |
@@ -57,7 +65,7 @@ Comfy's `wrap_attn` sets `_inside_attn_wrapper` before invoking the override and
 
 Independent BF16 SDPA verifies the all-selected SOL kernel. Dense-prefix execution on ordinary native H3 attention uses the inherited provider and may therefore be approximate Sage. Pure `attention_preprocess_v1` transformations expose their inherited provider: SOL transforms QKV once and uses the dense leaf on transformed prefix queries.
 
-The direct kernel call uses `comfy_kitchen.sol_attn` on BTHD tensors, tau threshold routing, pooled tail enabled, no top-k override and 64-row exact sink blocks. Sol-H3's sink always begins at packed row zero. If the exact prefix ends inside a 64-row block, the sink interval is rounded outward to the end of that block; this only makes additional keys exact and does not remove any attention contribution.
+The direct kernel call uses the packaged upstream `sol_attn` API on BF16 BTHD tensors with explicit native scale, direct tau, `thresh_type="diag"` and `kv_splits=1`, matching H3's upstream default policy. Sol-H3 always passes `sink_start=0`: upstream's omitted-start default is a suffix. Upstream `_sink_block_range` rounds the prefix end outward to the next 64-row boundary. Prefix queries remain dense on normal H3; the all-selected gate uses a full-length exact sink.
 
 VDN v2 preprocessing happens on the full post-RoPE VDN domain before local gather, so transforms such as Untwist retain their original packed-row coordinates. For an expanded VDN local SOL call, prefix/global rows remain sink KV. Their expanded query outputs are auxiliary and discarded, so SOL does not perform the ordinary native-H3 dense prefix-query recomputation for those unused rows.
 
@@ -82,21 +90,19 @@ Projection/norm/MLP hooks remain invoked, preserving runtime adapters and ordina
 | AdaLN schedule tables | Compact curve format already removes the large full-width table cost; no fixed schedule cache is introduced |
 | Layout/copy elimination | Native packed target-video tail is already contiguous; direct SOL uses current contiguous BTHD Q/K/V |
 | Compilation/caches | Triton specializes the small affine kernel; no whole-model compile, CUDA graph capture or process-global activation cache |
-| Sol-Attn numerical kernel | Uses already-installed `comfy_kitchen.sol_attn`; approximate, opt-in, complete prefix KV sink |
+| Sol-Attn numerical kernel | Uses packaged Sana `sol_attn` / CuTe SM120; approximate, opt-in, complete prefix KV sink |
 | VDN v2 square bridge | Preserves VDN restricted KV geometry while adapting rectangular local calls to the square kernel; extra-Q overhead must be measured |
-| ComfyUI Block Sparse Attention node | Same maintained kernel family but a different H3 producer/policy (`sol_attn_chunked`, pooled state, Sol/SLA/VSA options); retained as a separate A/B path |
+| ComfyUI Block Sparse Attention node | Separate kernel integration and H3 producer/policy (`sol_attn_chunked`, pooled state, Sol/SLA/VSA options); retained as a separate A/B path |
 | SOL-BSA + residual | Approximate; not exposed without supported validation |
 | FastH3/DMD2/VSA adapter | Learned acceleration, separate concern; not installed or required |
 | Ulysses / distributed execution / parallel VAE | Runtime-specific, outside this native MODEL patch; omitted |
 
 ## ComfyUI built-in sparse attention
 
-Current ComfyUI's `BlockSparseAttention` checks `comfy_kitchen.sol_attn_is_available()` and uses the same maintained Sol-Attn family. Its MiniMax-H3-specific producer is nevertheless not equivalent to this node: it projects QKV in chunks into `comfy_kitchen.sol_attn_chunked`, maintains pooled K/V state, and supports Sol-Attn, SLA-style top-k and VSA policies.
-
-Sol-H3 instead preserves native H3 QKV production and uses `comfy_kitchen.sol_attn` at the explicit attention/provider boundary so Exact fusion, Sage inheritance, VDN restricted-domain routing, Untwist preprocessing and Spectrum backend receipts remain composable. The useful A/B is therefore **integration policy / producer path**, not "external NVIDIA kernel versus ComfyUI kernel".
+Core BSA uses comfy-kitchen, including its chunked H3 QKV producer. Sol-H3 uses the pinned Sana source at the native attention/provider boundary. These are separate integrations; neither one's availability or benchmark establishes correctness/performance of the other.
 
 ## Evidence limits
 
 CPU CI exercises real ModelPatcher object-patch application, current KJ wrapper behavior, native H3, Spectrum capture and the sequential VDN PR #8 -> PR #11 stack with explicit CPU SOL substitutes.
 
-Real RTX PRO 6000 evidence exists for Exact Runtime, for the pre-v2 routing failure, and for post-v2 eligibility reaching 2750 SOL-capable calls. That last run executed zero sparse calls because of the now-removed external loader requirement; it is not a sparse performance result. Fresh GPU execution is still required to confirm `comfy_kitchen.sol_attn` sparse calls, VDN-local execution, speed, Spectrum interaction and decoded-media quality.
+Real RTX PRO 6000 evidence exists for Exact Runtime, for the pre-v2 routing failure, and for post-v2 eligibility reaching 2750 SOL-capable calls. That last run executed zero sparse calls because of the now-removed external loader requirement; it is not a sparse performance result. Fresh GPU execution is still required to confirm packaged Sana CuTe sparse calls, VDN-local execution, speed, Spectrum interaction and decoded-media quality.

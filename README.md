@@ -2,7 +2,7 @@
 
 Native MiniMax-H3 affine fusion and experimental Sol-Attn integration for ComfyUI. **Draft: Exact Runtime has production RTX PRO 6000 evidence; sparse SOL and the new interoperability paths still require current-head GPU/performance/audiovisual validation.**
 
-Current ComfyUI already ships the maintained compiled Sol-Attn kernel through `comfy-kitchen`. This repository now uses that installed kernel directly. **There is no separate Sana checkout, PYTHONPATH mutation, runtime download, or duplicate Sol-Attn installation.** ComfyUI's separate **Block Sparse Attention** node remains a different integration policy: its MiniMax-H3 producer streams/chunks QKV into `comfy_kitchen.sol_attn_chunked`, while this node keeps native H3 QKV production and applies its own Exact/SOL/VDN/Spectrum composition policy around `comfy_kitchen.sol_attn`.
+This node packages the real Sol-Attn source from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at `2936c47637380842aaa4a4488fac5006cc542b70`. SM120 uses its **CuTe `cute_sm120` backend**. Normal installation installs the declared dependencies; no manual Sana checkout, `PYTHONPATH`, `SOL_ROOT`, runtime source download or special launch command is required. `comfy_kitchen.sol_attn` is not used by this node. ComfyUI's Block Sparse Attention node is a separate integration.
 
 ## Nodes and composition
 
@@ -44,9 +44,9 @@ Spectrum histories use `attention_backend_history_v1` preflight policies and `at
 
 Eligible Q/K/V are BF16, matching `[1, heads, rows, 128]` tensors on SM120, with supported unmasked attention flags and a current contiguous packed prefix/video-tail layout. Unsupported calls delegate locally and do not permanently disable later eligible calls.
 
-The runtime calls ComfyUI's installed `comfy_kitchen.sol_attn` with tau routing, no top-k override, pooled tail enabled, and 64-row exact sink blocks. A prefix ending inside a 64-row block rounds the exact-KV sink outward to the end of that block; this only makes extra keys exact. Ordinary native H3 still recomputes every prefix query through the inherited dense provider. VDN v2 differs deliberately: its square-expanded prefix/global query rows are auxiliary outputs that VDN discards, so SOL keeps those rows as exact sink KV without paying a second dense query recomputation.
+The bridge converts Comfy BHTD tensors to upstream BTHD, preserving BF16 and the native scale `128**-0.5`. It passes `tau` directly with the upstream H3 `diag` threshold policy and `kv_splits=1`. Explicit `sink_start=0` keeps prefix KV exact; upstream rounds partially overlapping 64-row blocks outward. Omitting this argument would incorrectly select a suffix sink. Ordinary H3 prefix queries are recomputed through the inherited dense provider. VDN v2 auxiliary query rows are discarded, so they do not incur that extra dense recomputation.
 
-The all-selected arithmetic gate uses **independent BF16 SDPA**, so approximate Sage arithmetic cannot falsely fail the SOL kernel gate. The gate tests arithmetic, not sparse output quality. Pure QKV preprocessing contracts run before SOL and its reference without repeating the transformation. If the current ComfyUI/comfy-kitchen build has no compiled Sol-Attn kernel for the GPU, the affected call records a native fallback; no external package is sought or downloaded.
+An all-selected sink call is checked against independent BF16 SDPA. This gate checks arithmetic, not sparse quality. Untwist preprocessing runs exactly once before SOL and the reference. Missing dependencies, failed source verification or CuTe initialization produce a local native fallback with the reason; SM120 never silently substitutes Triton or comfy-kitchen. Arithmetic-gate failures remain fatal.
 
 SOL-BSA, learned distillation, full-width AdaLN schedule-table eviction and distributed execution are not implemented.
 
@@ -59,9 +59,12 @@ cd /home/toor/ComfyUI/custom_nodes
 git clone https://github.com/xmarre/ComfyUI-Sol-H3.git
 cd ComfyUI-Sol-H3
 git switch feature/native-sol-h3
+python -m pip install -r requirements.txt
 ```
 
-That is the complete Sol-H3 installation for current ComfyUI. The same ComfyUI environment that loads this node provides `comfy-kitchen`; on a supported GPU `comfy_kitchen.sol_attn_is_available(device)` must be true. Your normal ComfyUI launch command is sufficient — **do not set a Sol-H3-specific `PYTHONPATH`.**
+Run the dependency command in the same environment as ComfyUI (for example `comfy312`), including when updating an existing checkout. Manager installations use `requirements.txt`. Dependencies are PyTorch, Triton >=3.6,<4 (Linux), NVIDIA CUTLASS DSL with its CUDA 13 extra, CUDA Python and Apache TVM FFI. The cuDNN frontend and full Sana engine are not required. The current production target is Linux/WSL SM120; native Windows dependency/kernel execution remains unvalidated.
+
+`sol_h3/sol_manifest.json` records upstream and packaged SHA-256 hashes. Only absolute package imports are converted to relative imports, with modified-file headers. Developers can reproduce the snapshot with `python tools/vendor_sol_attn.py /path/to/pinned/Sana`; this is not an installation step.
 
 ## Validation and diagnostics
 
@@ -73,6 +76,6 @@ python -m pytest -q
 
 Set `COMFYUI_PATH`, `KJNODES_PATH`, `SPECTRUM_PATH`, and `VDN_PATH` to their checkouts to enable the real-wrapper/stack tests. GPU skips and CPU oracle substitutions are not GPU validation. See [VALIDATION](docs/VALIDATION.md) for RTX PRO 6000 evidence, commands and the remaining media matrix.
 
-Sampling logs expose actual evaluations, SOL-eligible calls, sparse calls, dense warmup, fallback reasons, VDN-local SOL calls, VDN square-expansion requested/kernel row counts, backend transitions, inherited dense providers and arithmetic gates. Spectrum reports backend-history resets and opaque actual calls separately. A successful run with zero sparse calls is valid telemetry and cannot be used as a SOL performance sample.
+Sampling logs expose `sol_source`, `sana_revision`, `sol_backend`, `sol_source_tree_verified`, actual evaluations, SOL-eligible calls, sparse calls, dense warmup, fallback reasons, VDN-local SOL calls, VDN square-expansion requested/kernel row counts, backend transitions, inherited dense providers and arithmetic gates. Spectrum reports backend-history resets and opaque actual calls separately. A successful run with zero sparse calls is valid telemetry and cannot be used as a SOL performance sample.
 
 See [AUDIT](docs/AUDIT.md) for ownership decisions and remaining limitations. GPL-3.0-or-later; see LICENSE and NOTICE.

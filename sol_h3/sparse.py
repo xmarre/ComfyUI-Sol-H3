@@ -44,7 +44,7 @@ def load_kernel(device):
         # Import lazy dependencies before returning a usable kernel. No compilation here.
         from ._vendor.sol_attn import preprocess  # noqa: F401
         from ._vendor.sol_attn.sm120 import make_kernel  # noqa: F401
-    except (ImportError, OSError, RuntimeError) as exc:
+    except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
         raise RuntimeError(f"Sana Sol-Attn initialization failed: {exc}") from exc
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,

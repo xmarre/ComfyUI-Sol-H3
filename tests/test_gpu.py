@@ -22,3 +22,24 @@ def test_affine_native_bitwise(dtype, indexed, width):
         native_affine(want[a:b], shift, scale, idx)
     got = affine(h.clone(), shift, scale, segments, set())
     assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize('rows,prefix', [(65, 1), (130, 65), (4096, 512)])
+def test_sana_sm120_real_kernel(rows, prefix):
+    from sol_h3.contracts import Config
+    from sol_h3.runtime import Request
+    from sol_h3.sparse import attention
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip('SM120 required')
+    torch.manual_seed(173)
+    q, k, v = (torch.randn(1, 2, rows, 128, device='cuda', dtype=torch.bfloat16) for _ in range(3))
+    cfg = Config(exact=False, backend='sol')
+    state = Request(cfg)
+    result = attention(q, k, v, prefix, cfg, state).reshape(1, rows, 2, 128)
+    torch.cuda.synchronize()
+    assert state.kernel.backend_name == 'cute_sm120'
+    assert state.kernel.source_tree_verified
+    assert state.sparse_calls == 1
+    assert torch.isfinite(result).all()
+    want = torch.nn.functional.scaled_dot_product_attention(q[:, :, :prefix], k, v).transpose(1, 2)
+    torch.testing.assert_close(result[:, :prefix], want, rtol=0, atol=0)

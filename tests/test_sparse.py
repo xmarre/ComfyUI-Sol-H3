@@ -1,6 +1,3 @@
-from types import ModuleType
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -15,42 +12,12 @@ def test_real_loader_rejects_cpu():
         sparse.load_kernel(torch.device("cpu"))
 
 
-def test_comfy_kitchen_loader_requires_available_api(monkeypatch):
-    fake = ModuleType("comfy_kitchen")
-    fake.sol_attn_is_available = lambda device: False
-    fake.sol_attn = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "comfy_kitchen", fake)
+def test_sana_loader_requires_cute_on_sm120(monkeypatch):
+    from sol_h3._vendor.sol_attn import interface
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 0))
-    with pytest.raises(RuntimeError, match="no compiled sol_attn"):
+    monkeypatch.setattr(interface, "_cute_runtime_available", lambda: False)
+    with pytest.raises(RuntimeError, match="Sana selected triton; SM120 requires CuTe"):
         sparse.load_kernel(torch.device("cuda"))
-
-
-def test_comfy_kitchen_loader_maps_prefix_rows_to_exact_blocks(monkeypatch):
-    calls = []
-    fake = ModuleType("comfy_kitchen")
-    fake.sol_attn_is_available = lambda device: True
-
-    def sol_attn(q, k, v, **kw):
-        calls.append(kw)
-        return v
-
-    fake.sol_attn = sol_attn
-    monkeypatch.setitem(sys.modules, "comfy_kitchen", fake)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 0))
-    kernel = sparse.load_kernel(torch.device("cuda"))
-    q = torch.zeros(1, 130, 2, 128)
-    kernel(q, q, q, tau=1.0, sink_start=0, sink_tokens=65)
-    assert calls == [{
-        "tau": 1.0,
-        "scale": None,
-        "sink_blocks": [0, 2],
-        "sink_q": [0, 0],
-        "topk_ratio": 0.0,
-        "tail": True,
-        "token_aug": 0,
-    }]
-    assert kernel.backend_name == "comfy_kitchen.sol_attn"
-    assert kernel.block_size == 64
 
 
 def test_sink_geometry_rejects_nonprefix_and_out_of_range():
