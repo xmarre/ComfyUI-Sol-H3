@@ -32,49 +32,42 @@ def test_sink_geometry_rejects_nonprefix_and_out_of_range():
 
 def test_production_calibration_metrics_allow_isolated_sm120_peak():
     # Real RTX PRO 6000 full-stack calibration reached this aggregate error but
-    # the old max-only <=0.08 rule rejected one 0.125 peak. The aggregate error
-    # is far inside the BF16 SDPA calibration budget, so an isolated tail must
-    # not invalidate the provider.
+    # the old max-only <=0.08 rule rejected a 0.125 peak. Aggregate error is far
+    # inside the BF16 SDPA calibration budget, so that peak must not invalidate
+    # an otherwise coherent approximate provider.
     metrics = {
         "finite": True,
         "max_abs": 0.125,
         "mean_abs": 0.0002412556204944849,
         "rel_l2": 0.0010161730460822582,
-        "tail_abs_threshold": sparse.ARITH_TAIL_ABS,
-        "tail_fraction": 0.001,
-        "reference_rms": 0.25,
-        "catastrophic_max_abs_limit": 2.0,
+        "reference_peak_abs": 0.25,
+        "catastrophic_max_abs_limit": 1.0,
     }
     assert sparse.arithmetic_gate_passes(metrics)
 
 
-def test_arithmetic_gate_rejects_widespread_tail_error():
+def test_arithmetic_gate_rejects_broad_mean_error():
     metrics = {
         "finite": True,
         "max_abs": 0.10,
-        "mean_abs": 0.001,
+        "mean_abs": sparse.ARITH_MEAN_ABS_LIMIT + 1e-4,
         "rel_l2": 0.002,
-        "tail_abs_threshold": sparse.ARITH_TAIL_ABS,
-        "tail_fraction": sparse.ARITH_TAIL_FRACTION_LIMIT + 0.001,
-        "reference_rms": 0.25,
-        "catastrophic_max_abs_limit": 2.0,
+        "reference_peak_abs": 0.25,
+        "catastrophic_max_abs_limit": 1.0,
     }
     assert not sparse.arithmetic_gate_passes(metrics)
 
 
-def test_arithmetic_gate_rejects_bad_relative_or_mean_error():
-    base = {
+def test_arithmetic_gate_rejects_bad_relative_error():
+    metrics = {
         "finite": True,
         "max_abs": 0.10,
         "mean_abs": 0.001,
-        "rel_l2": 0.002,
-        "tail_abs_threshold": sparse.ARITH_TAIL_ABS,
-        "tail_fraction": 0.001,
-        "reference_rms": 0.25,
-        "catastrophic_max_abs_limit": 2.0,
+        "rel_l2": sparse.ARITH_REL_L2_LIMIT + 1e-4,
+        "reference_peak_abs": 0.25,
+        "catastrophic_max_abs_limit": 1.0,
     }
-    assert not sparse.arithmetic_gate_passes({**base, "mean_abs": sparse.ARITH_MEAN_ABS_LIMIT + 1e-4})
-    assert not sparse.arithmetic_gate_passes({**base, "rel_l2": sparse.ARITH_REL_L2_LIMIT + 1e-4})
+    assert not sparse.arithmetic_gate_passes(metrics)
 
 
 def test_arithmetic_gate_rejects_catastrophic_peak_and_nonfinite():
@@ -83,9 +76,7 @@ def test_arithmetic_gate_rejects_catastrophic_peak_and_nonfinite():
         "max_abs": 0.10,
         "mean_abs": 0.001,
         "rel_l2": 0.002,
-        "tail_abs_threshold": sparse.ARITH_TAIL_ABS,
-        "tail_fraction": 0.001,
-        "reference_rms": 0.01,
+        "reference_peak_abs": 0.01,
         "catastrophic_max_abs_limit": sparse.ARITH_CATASTROPHIC_MAX_FLOOR,
     }
     assert not sparse.arithmetic_gate_passes({
@@ -95,15 +86,15 @@ def test_arithmetic_gate_rejects_catastrophic_peak_and_nonfinite():
     assert not sparse.arithmetic_gate_passes({**base, "finite": False})
 
 
-def test_error_metrics_report_tail_fraction_and_scale_aware_cap():
+def test_error_metrics_report_scale_aware_peak_cap():
     want = torch.ones(1, 1, 1000, 1)
     got = want.clone()
     got.reshape(-1)[0] += 0.125
     metrics = sparse.error_metrics(got, want)
     assert metrics["finite"] is True
     assert metrics["max_abs"] == pytest.approx(0.125)
-    assert metrics["tail_fraction"] == pytest.approx(0.001)
-    assert metrics["catastrophic_max_abs_limit"] == pytest.approx(8.0)
+    assert metrics["reference_peak_abs"] == pytest.approx(1.0)
+    assert metrics["catastrophic_max_abs_limit"] == pytest.approx(4.0)
     assert sparse.arithmetic_gate_passes(metrics)
 
 
