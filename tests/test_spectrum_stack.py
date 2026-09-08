@@ -58,8 +58,15 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
         vdn_state = VDNState("stack-test", vdn_cfg,
                              [SimpleNamespace(w={}, enable_text_state=False) for _ in model.blocks], 1, 128)
         vdn_state.softmax_backend = "flex" if vdn_mode == "flex" else "grouped"
-        va, vb, _ = packed.segments[-1]
-        vdn_layout = VDNLayout(va, vb, frames, 4, (2, 2), 0, 2, packed.seq_len, 0, 1, "both")
+        va, vb, _ = next(segment for segment in packed.segments if segment[2] == "video")
+        aa, ab, _ = next(segment for segment in packed.segments if segment[2] == "audio")
+        ta, tb, _ = next(segment for segment in packed.segments if segment[2] == "text")
+        vdn_layout = VDNLayout(
+            video_start=va, video_end=vb,
+            audio_start=aa, audio_end=ab,
+            num_frames=frames, tokens_per_frame=4, frame_size=(2, 2),
+            text_start=ta, text_len=tb - ta, seq_len=packed.seq_len,
+            radius=0, chunk=1, anchor_frames="both")
         vdn_state._layout.set(vdn_layout)
         gate_weight = torch.randn(1, 128, dtype=torch.bfloat16) * .01
         gate_bias = torch.zeros(1, dtype=torch.bfloat16)
