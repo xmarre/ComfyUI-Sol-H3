@@ -1,102 +1,78 @@
-"""Native attention bridge to the separately installed, pinned Sol kernel."""
-import hashlib
-import importlib
-import json
-from pathlib import Path
-import sys
-
+"""Native attention bridge to ComfyUI's maintained comfy-kitchen Sol-Attn kernel."""
 import torch
 import torch.nn.functional as F
 
 
-_VERIFIED_ROOTS = set()
+BLOCK_SIZE = 64
 
 
 class KernelUnavailable(RuntimeError):
-    """The native provider can execute safely without importing this kernel."""
+    """The native provider can execute safely without this optional sparse kernel."""
 
 
-def verify_sources(root, manifest):
-    root = Path(root).resolve()
-    git_blobs = manifest.get("git_blobs")
-    sha256 = manifest.get("sha256")
-    if not isinstance(git_blobs, dict) or not isinstance(sha256, dict) or not git_blobs:
-        raise RuntimeError("Pinned sol_attn manifest is incomplete")
-    if set(git_blobs) != set(sha256):
-        raise RuntimeError("Pinned sol_attn manifest provenance/security file sets differ")
-    for name, expected in sha256.items():
-        if not isinstance(name, str) or not isinstance(expected, str) or len(expected) != 64:
-            raise RuntimeError("Pinned sol_attn manifest contains an invalid SHA-256 entry")
-        path = (root / name).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise RuntimeError(f"Pinned sol_attn path escapes package root: {name}") from exc
-        if not path.is_file():
-            raise RuntimeError(f"Pinned sol_attn file missing: {name}")
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest != expected:
-            raise RuntimeError(f"sol_attn source mismatch: {name}; install the documented pinned revision")
+def _sink_blocks(start, tokens, rows):
+    """Convert an exact row interval to comfy-kitchen's exact 64-row block interval.
 
-
-def _find_package_root():
-    roots = []
-    for entry in sys.path:
-        if not isinstance(entry, str):
-            continue
-        candidate = Path(entry or ".") / "sol_attn"
-        try:
-            if not (candidate / "__init__.py").is_file():
-                continue
-            resolved = candidate.resolve(strict=True)
-        except OSError:
-            continue
-        if resolved not in roots:
-            roots.append(resolved)
-    if not roots:
-        raise RuntimeError(
-            "Install the pinned Sol-Attn backend and expose its parent directory on PYTHONPATH; "
-            "see README.md. No dense fallback."
-        )
-    if len(roots) != 1:
-        raise RuntimeError(f"Multiple sol_attn package roots are visible on PYTHONPATH: {roots}")
-    return roots[0]
-
-
-def _load_verified_interface(root, manifest):
-    root = Path(root).resolve()
-    verify_sources(root, manifest)
-    loaded = any(name == "sol_attn" or name.startswith("sol_attn.") for name in sys.modules)
-    if loaded:
-        if root not in _VERIFIED_ROOTS or "sol_attn.interface" not in sys.modules:
-            raise RuntimeError(
-                "sol_attn was imported before Sol-H3 integrity verification; restart ComfyUI "
-                "with the pinned package exposed on PYTHONPATH"
-            )
-        module = sys.modules["sol_attn.interface"]
-    else:
-        try:
-            module = importlib.import_module("sol_attn.interface")
-        except ImportError as exc:
-            raise RuntimeError("Install the pinned Sol-Attn backend; see README.md. No dense fallback.") from exc
-        module_file = getattr(module, "__file__", None)
-        if module_file is None or Path(module_file).resolve().parent != root:
-            raise RuntimeError("Imported sol_attn.interface does not come from the verified package root")
-        verify_sources(root, manifest)
-        _VERIFIED_ROOTS.add(root)
-    return module
+    Sol-H3 only requests prefix sinks beginning at row zero. The final partial
+    block is intentionally rounded outward: this makes a few extra keys exact,
+    which is semantics-preserving and only slightly more expensive.
+    """
+    if type(start) is not int or type(tokens) is not int or type(rows) is not int:
+        raise RuntimeError("SOL sink geometry must use integer row counts")
+    if start != 0:
+        raise RuntimeError("Sol-H3 currently supports only a prefix sink beginning at row zero")
+    if tokens < 0 or tokens > rows:
+        raise RuntimeError("SOL sink row count is outside the current sequence")
+    if tokens == 0:
+        return [0, 0]
+    return [0, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
 
 
 def load_kernel(device):
+    """Return the ComfyUI-installed Sol-Attn kernel with the Sol-H3 call contract.
+
+    Current ComfyUI ships the compiled Sol-Attn implementation in
+    ``comfy-kitchen``. No external Sana checkout, PYTHONPATH mutation, runtime
+    download or duplicate kernel installation is required.
+    """
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("This experimental SOL integration currently targets single-GPU SM120 only")
-    root = _find_package_root()
-    manifest = json.loads(Path(__file__).with_name("sol_manifest.json").read_text())
-    module = _load_verified_interface(root, manifest)
-    backend = module.get_sol_attn_backend(device)
-    if backend != "cute_sm120":
-        raise RuntimeError(f"SOL requires cute_sm120, selected {backend}; install CuTe DSL/CUDA dependencies")
-    return module.sol_attn
+    try:
+        import comfy_kitchen as ck
+    except ImportError as exc:
+        raise RuntimeError(
+            "ComfyUI's comfy-kitchen package is unavailable; update the current ComfyUI environment"
+        ) from exc
+    available = getattr(ck, "sol_attn_is_available", None)
+    sol_attn = getattr(ck, "sol_attn", None)
+    if not callable(available) or not callable(sol_attn):
+        raise RuntimeError(
+            "The installed comfy-kitchen does not expose the required sol_attn API; update ComfyUI/comfy-kitchen"
+        )
+    if not available(device):
+        raise RuntimeError("The installed comfy-kitchen has no compiled sol_attn kernel for this GPU")
+
+    def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
+               sink_start=0, sink_tokens=0):
+        if thresh_type != "diag":
+            raise RuntimeError(f"Unsupported comfy-kitchen SOL threshold policy {thresh_type!r}")
+        if kv_splits != 1:
+            raise RuntimeError("Sol-H3 currently requires one logical KV partition")
+        sink_blocks = _sink_blocks(sink_start, sink_tokens, q.shape[1])
+        return sol_attn(
+            q, k, v,
+            tau=float(tau),
+            scale=None,
+            sink_blocks=sink_blocks,
+            sink_q=[0, 0],
+            topk_ratio=0.0,
+            tail=True,
+            token_aug=0,
+        )
+
+    kernel.backend_name = "comfy_kitchen.sol_attn"
+    kernel.block_size = BLOCK_SIZE
+    return kernel
 
 
 def error_metrics(got, want):
@@ -146,7 +122,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         if not all(metrics[n] <= limits[n] for n in limits):
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
         state.sparse_verified.add(key)
-        state.gates.append({"shape": list(q.shape), **metrics})
+        state.gates.append({"shape": list(q.shape), "backend": "comfy_kitchen.sol_attn", **metrics})
         del got, want
     out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                        sink_start=0, sink_tokens=prefix)
