@@ -1,6 +1,6 @@
 # Validation status and RTX PRO 6000 commands
 
-**No real GPU or media validation has occurred in this session.** Keep PR #1 and companions draft. CPU structural correctness, offline compilation and media quality are different evidence.
+**Production RTX PRO 6000 evidence already exists for Exact Runtime, including a matched Exact-off/on timing A/B.** The current interoperability head still needs fresh GPU acceptance for sparse SOL and the companion-provider combinations, so PR #1 and companions remain draft. CPU structural correctness, exact-runtime GPU evidence, sparse-kernel execution and decoded-media quality are different evidence.
 
 ## Completed evidence
 
@@ -11,7 +11,20 @@
 - VDN: 133 passed, 12 skipped. Restricted-domain provider tests preserve exact native results; absent official/GPU prerequisites remain skips.
 - Untwist: 40 passed.
 
-Environment: Python 3.12, torch 2.14.0+cpu, Triton 3.6.0, comfy-kitchen 0.2.33. The original CI also covers torch 2.10 CPU. No claims are made about empirically equivalent output or speedup.
+Environment for the CPU suites: Python 3.12, torch 2.14.0+cpu, Triton 3.6.0, comfy-kitchen 0.2.33. The original CI also covers torch 2.10 CPU.
+
+### Completed production-GPU Exact Runtime A/B
+
+A matched hot A/B was run on the RTX PRO 6000 production workflow with the exact/runtime tier only; approximate SOL attention was not enabled. The stack included the production INT8/ConvRot H3 path with VDN, DiffAid, Untwist RoPE, Spectrum, progressive handoff and Continuum.
+
+| Exact Runtime | Sampler | End-to-end | Peak VRAM |
+|---|---:|---:|---:|
+| off | 263.56 s | 312.57 s | 17.18 GB |
+| on | 247.30 s | 298.69 s | 17.18 GB |
+
+Observed improvement: **6.17% lower sampler time** (1.066x) and **4.44% lower end-to-end time** (1.046x), with unchanged measured peak VRAM.
+
+Exact-mode telemetry from the production runs reported `success=true`, `backend=inherit`, `approximate=false`, `sparse_calls=0`, and the expected fused-block accounting (for example 3 actual H3 evaluations -> 150 exact blocks on the 50-block model). This is real GPU/runtime evidence for Exact Runtime and its integration with that workflow stack. It is **not** GPU validation of external sparse SOL, Sage+SOL, VDN-local SOL, Spectrum backend-transition handling, or the final post-interoperability PR head; those still require the matrix below. No separate decoded-media acceptance result is claimed from this timing pair.
 
 To reproduce CPU contracts from the Sol-H3 checkout:
 
@@ -53,7 +66,7 @@ cd "$COMFYUI_ROOT"
 python main.py 2>&1 | tee /home/toor/sol_h3_full_stack.log
 ```
 
-The original workflow/runtime log was not actually attached to this session. No exact queue command or reconstructed workflow is provided because its graph, input paths and settings are not available. Use the original saved workflow and preserve its settings for the comparisons below; provide the workflow plus complete log with results.
+Archived production logs already establish Exact Runtime execution. For the remaining sparse/interoperability comparisons, use the original saved workflow and preserve its settings; save the complete current-head log with each result.
 
 ## Full-stack matrix
 
