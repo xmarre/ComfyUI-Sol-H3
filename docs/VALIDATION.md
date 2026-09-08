@@ -6,7 +6,7 @@ The current revision combines Exact Runtime, rectangular Sana/CuTe SM120 attenti
 
 ```text
 Sol-H3         feature/native-sol-h3
-Spectrum #104  34f3c3d6c8ca738b76694a6321650e2db9bc892d
+Spectrum #104  9c682c07f4c5ea9de601cda234755a1561b59f59
 VDN #8         b6f0755c4172ec5c17386c56998f454e78b2a2d4
 VDN #11        5b63dc670229d419a6350b64f7ceda609dbc8194
 Sana           2936c47637380842aaa4a4488fac5006cc542b70
@@ -93,6 +93,8 @@ This is Exact-only evidence, not a SOL speed claim.
 
 Spectrum #104 is the generic backend-history consumer. It preflights provider identities and observes actual receipts before retaining H3 anchors. Sol-H3 must therefore prove its own replacement/routing topology; Spectrum does not declare Sol, Diff-Aid or Untwist transparent by name.
 
+The final reviewed Spectrum consumer fails closed when a third-party backend-history metadata callback raises: that call becomes unprovable/actual-only instead of aborting the sampling run. CUDA out-of-memory remains a real resource failure and propagates. Spectrum also establishes the first provider identity without resetting an empty offline-capture archive; a provider appearing after backend-dependent evidence exists, provider removal, or a genuine identity/receipt transition still performs the full history reset.
+
 Production exposed one important provider-side gap. The prior Sol history policy accepted only a bare Sol `BlockPatch`, while the real workflow composes MiniMax-H3 Diff-Aid around the DIT replacement. Sol therefore reported the route as opaque and Spectrum correctly forced actual transformer execution.
 
 Current Sol-H3 recognizes only the audited Diff-Aid H3 activation-only chain when Diff-Aid publishes its existing Spectrum runtime declaration:
@@ -110,33 +112,24 @@ The native interoperability suite covers both valid wrapper orders, stable ident
 
 ## Current CI evidence
 
-Spectrum #104 was rebased directly onto v0.2.25/current `main` and reconsolidated to one commit:
+Spectrum #104 is one commit over v0.2.25/current `main`:
 
 ```text
-Spectrum head: 34f3c3d6c8ca738b76694a6321650e2db9bc892d
-Spectrum mirror CI #595: 34274660434 — 9/9 green
-Spectrum final CI  #596: 34274812445 — 9/9 green
+Spectrum head:       9c682c07f4c5ea9de601cda234755a1561b59f59
+Spectrum parent:     2482f52604da037c29e3f613e10057e8aaa83abb
+Spectrum final CI:   #597 / 34278002378 — 9/9 green
+CodeRabbit findings: both substantive backend-history findings verified/resolved
 ```
 
-Sol-H3 was then repinned to that exact Spectrum head and revalidated:
+Sol-H3's final reviewed Spectrum repin was validated on a mirror before reconsolidation:
 
 ```text
-Sol repin mirror: mirror/spectrum-104-repin-20260908
-mirror head:      5625b55cdd7bae8e05e2c733baf5dbec28c46dab
-mirror tree:      4c1ec90b0faabb0aafdb7e3eb9c256930e9783a6
-mirror CI #158:   34274917627 — CPU-contract + native-interop green
+Sol repin mirror: mirror/spectrum-104-final-repin-20260908
+mirror head:      3929ec3cecc4ef12496aa7378022a730067148f5
+mirror CI #168:   34278353336 — CPU-contract + native-interop green
 ```
 
-The final one-commit Sol branch before this documentation sync was:
-
-```text
-head:   9b3f96b7aa1360ad9ce196e402955414f86842ff
-parent: 5db282ca836416a32cf114346b946fe75136e4f1
-tree:   4c1ec90b0faabb0aafdb7e3eb9c256930e9783a6
-CI #160: 34275146796 — CPU-contract + native-interop green
-```
-
-The final documentation-sync head will supersede that SHA while preserving the same implementation behavior and one-commit PR topology.
+The PR branch remains constrained to exactly one implementation commit over neutral Sol `main` `5db282ca836416a32cf114346b946fe75136e4f1`. Documentation updates do not change the validated runtime implementation; the final consolidated PR-head CI is the last CPU/native gate before the production GPU rerun.
 
 CPU tests use explicit CPU substitutes where GPU kernels are unavailable. They establish contracts/composition, not GPU performance or decoded-media quality.
 
