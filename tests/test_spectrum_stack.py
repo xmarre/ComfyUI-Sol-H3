@@ -36,8 +36,6 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
         dtype=torch.bfloat16, device=torch.device("cpu"), operations=torch.nn).eval().requires_grad_(False)
     model.rope.inv_freq.fill_(1.)
     cfg = Config(exact=False, backend="sol", dense_evaluations=1, dense_layers=0)
-    # Actual CPU QKV and native Comfy attention wrappers; only SM120 eligibility
-    # and the unavailable external CuTe kernel are replaced for this test.
     monkeypatch.setattr(runtime, "_shape_reason", lambda *a, **k: None)
     def oracle(q, k, v, **kw):
         return torch.nn.functional.scaled_dot_product_attention(
@@ -57,8 +55,6 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
         from vdn_h3 import window
         vdn_cfg = {"radius": 0, "chunk": 1, "anchor_frames": "both",
                    "enable_softmax_gate": True, "linear_enabled": False}
-        # This test isolates real VDN softmax/gate dispatch. Learned linear math
-        # has separate VDN oracle tests and is explicitly disabled here.
         vdn_state = VDNState("stack-test", vdn_cfg,
                              [SimpleNamespace(w={}, enable_text_state=False) for _ in model.blocks], 1, 128)
         vdn_state.softmax_backend = "flex" if vdn_mode == "flex" else "grouped"
@@ -99,13 +95,16 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
             counts.append((state.evaluations, spectrum.stats.actual_transformer_calls,
                            spectrum.stats.forecast_model_calls, state.sparse_calls))
             assert state.evaluations == spectrum.stats.actual_transformer_calls
+            assert state.sparse_calls > 0
             if vdn_mode in (None, "full"):
                 assert state.dense_calls == 3
-                assert state.sparse_calls > 0
             else:
-                assert state.sparse_calls == 0
+                assert state.vdn_local_sol_calls > 0
+                assert state.vdn_square_expanded_calls > 0
+                assert state.vdn_square_kernel_rows > state.vdn_square_requested_rows > 0
                 assert state.fallbacks["vdn_global_native"] > 0
-                assert state.fallbacks["vdn_local_native"] > 0
+                if vdn_mode == "flex":
+                    assert state.fallbacks["vdn_flex_masked_native"] > 0
             assert spectrum.stats.forecast_model_calls > 0
         with torch.no_grad():
             SamplingWrapper(cfg)(sample)
