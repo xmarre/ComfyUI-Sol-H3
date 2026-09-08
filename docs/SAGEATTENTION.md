@@ -43,7 +43,7 @@ Install the normal build prerequisites if needed:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential git ninja-build
+sudo apt install -y build-essential git ninja-build libgomp1
 python -m pip install -U packaging ninja
 ```
 
@@ -58,7 +58,7 @@ git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
 git -C /tmp/SageAttention checkout d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
 
 cd /tmp/SageAttention
-export CUDA_HOME=/usr/local/cuda
+export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
 export TORCH_CUDA_ARCH_LIST=12.0
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
@@ -66,10 +66,12 @@ export CUDAHOSTCXX=/usr/bin/g++
 export EXT_PARALLEL=4
 export MAX_JOBS=16
 
+printf 'CUDA_HOME=%s\n' "$CUDA_HOME"
+"$CUDA_HOME/bin/nvcc" --version
 python -m pip install --no-build-isolation --no-cache-dir -v .
 ```
 
-If `/usr/local/cuda` is not the toolkit used by `nvcc`, set `CUDA_HOME` to the real CUDA toolkit root before building. Do not fix this by globally injecting another `libstdc++.so.6` through `LD_LIBRARY_PATH`, `LD_PRELOAD`, or `ctypes`; rebuild SageAttention against the environment/toolchain that will actually run ComfyUI.
+The derived `CUDA_HOME` must be the root of the CUDA toolkit that provides the `nvcc` you intend to use. If `nvcc` is not on `PATH`, set `CUDA_HOME` explicitly to that toolkit root before the build. Do not fix a Sage binary ABI failure by globally injecting another `libstdc++.so.6` through `LD_LIBRARY_PATH`, `LD_PRELOAD`, or `ctypes`; rebuild SageAttention against the environment/toolchain that will actually run ComfyUI.
 
 ### Why this repairs `GLIBCXX_3.4.32` failures
 
@@ -114,19 +116,7 @@ PY
 
 ## Optional SageAttention3
 
-SageAttention3 is a separate Blackwell package (`sageattn3`). It is not installed by the SageAttention 2.2.0 root package. If you want to test the KJNodes `sage3` mode as a separate A/B, build it from the same pinned checkout:
-
-```bash
-conda activate comfy312
-cd /tmp/SageAttention/sageattention3_blackwell
-python -m pip install --no-build-isolation --no-cache-dir -v .
-python - <<'PY'
-from sageattn3 import sageattn3_blackwell
-print('sageattn3 import: OK', sageattn3_blackwell)
-PY
-```
-
-Upstream currently documents SageAttention3 with stricter requirements (`python>=3.13`, `torch>=2.8`, CUDA >=12.8). Treat it as an optional separate experiment; SageAttention2/2++ via `sageattn` is the normal Blackwell path documented here.
+SageAttention3 is a separate Blackwell package (`sageattn3`) and is not installed by the SageAttention 2.2.0 root package. Upstream currently documents **Python >=3.13, PyTorch >=2.8 and CUDA >=12.8** for SageAttention3. The documented production `comfy312` environment therefore does not meet its Python requirement. Do not install SageAttention3 into that environment merely to satisfy Sol-H3 testing; it is not required. Test KJNodes `sage3` only in a separate environment that satisfies SageAttention3's upstream requirements.
 
 ## Sol-H3 validation after Sage repair
 
@@ -149,8 +139,8 @@ assert kernel.backend_name == 'cute_sm120'
 PY
 
 python -m pytest -q tests/test_gpu.py
-python tools/attention_probe.py --backend pytorch --tokens 4096 --prefix 512
-python tools/attention_probe.py --backend sage --tokens 4096 --prefix 512
+python tools/attention_probe.py --backend pytorch --tokens 4096 --prefix 512 --heads 8
+python tools/attention_probe.py --backend sage --tokens 4096 --prefix 512 --heads 8
 ```
 
 The Sage probe must show real Sol-H3 sparse execution and prefix parity. If Sage itself still cannot load, current Sol-H3 records `dense_provider_failures` and demotes that optional dense provider to the original Comfy attention for the current request; this allows Sol-H3's own CuTe/Sana kernel to remain testable. That fallback is diagnostic resilience, not evidence that SageAttention itself is healthy.
