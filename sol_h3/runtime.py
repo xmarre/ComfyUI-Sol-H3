@@ -216,13 +216,24 @@ class BlockPatch:
                     if output_heads is not None:
                         dense_kw["skip_reshape"] = True
                         dense_kw["skip_output_reshape"] = output_heads
+
                     provider = dense_provider
+                    q_call, k_call, v_call = qd, kd, vd
                     leaf = _provider_leaf(provider) if provider is not None else None
+                    if provider is not None and hasattr(provider, "attention_preprocess_v1"):
+                        q_call, k_call, v_call, leaf = _preprocess_chain(
+                            provider, q_call, k_call, v_call, heads, dense_kw
+                        )
+                        provider = leaf
                     if leaf is not None and id(leaf) in state.disabled_dense_providers:
                         provider = None
+
                     if provider is not None:
                         try:
-                            out = provider(original, qd, kd, vd, heads, mask=mask, **dense_kw)
+                            out = provider(
+                                original, q_call, k_call, v_call, heads,
+                                mask=mask, **dense_kw
+                            )
                         except (ImportError, OSError) as exc:
                             reason = _provider_unavailable_reason(exc)
                             if reason is None:
@@ -230,8 +241,7 @@ class BlockPatch:
                             name = provider_name(leaf)
                             first_failure = id(leaf) not in state.disabled_dense_providers
                             state.disabled_dense_providers.add(id(leaf))
-                            key = f"{name}:{reason}"
-                            state.dense_provider_failures[key] += 1
+                            state.dense_provider_failures[f"{name}:{reason}"] += 1
                             state.fallbacks[f"dense_provider_unavailable:{reason}"] += 1
                             if first_failure:
                                 state.backend_transitions += 1
@@ -243,11 +253,14 @@ class BlockPatch:
                         else:
                             state.dense_attention_backends.add(provider_name(leaf))
                             return out
+
                     if original is None:
                         raise RuntimeError(
                             "Inherited dense provider is unavailable and no original attention fallback was supplied"
                         )
-                    out = original(qd, kd, vd, heads, mask=mask, **dense_kw)
+                    out = original(
+                        q_call, k_call, v_call, heads, mask=mask, **dense_kw
+                    )
                     state.dense_attention_backends.add(provider_name(original))
                     return out
 
@@ -310,11 +323,6 @@ class BlockPatch:
 
                 expanded = square_q is not None
                 if expanded:
-                    if (query_positions is None or query_positions.ndim != 1
-                            or query_positions.shape[0] != q.shape[0]
-                            or query_positions.dtype.name if False else False):
-                        # dtype/device are checked below without relying on dtype string APIs.
-                        pass
                     import torch
                     if (not torch.is_tensor(query_positions) or query_positions.ndim != 1
                             or query_positions.shape[0] != q.shape[0]
