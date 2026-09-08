@@ -1,5 +1,6 @@
 """Small duck-typed contracts shared with optional attention/forecast providers."""
 from dataclasses import dataclass
+import struct
 
 HISTORY_KEY = "attention_backend_history_v1"
 RECEIPTS_KEY = "attention_backend_receipts_v1"
@@ -8,6 +9,8 @@ VDN_KEY_V2 = "vdn_softmax_provider_v2"
 VDN_KEY_V3 = "vdn_softmax_provider_v3"
 VDN_PREPROCESS_KEY = "vdn_attention_preprocess_v1"
 SPECTRUM_EXTERNAL_RUNTIME_KEY = "spectrum_h3_external_patch_runtime"
+SPECTRUM_RUNTIME_KEY = "spectrum_h3_runtime"
+_SPECTRUM_EXTERNAL_STATE_ATTR = "_spectrum_h3_external_patch_compat"
 
 
 def provider_name(provider):
@@ -91,14 +94,7 @@ def _vdn_history_identity(forward, options, layout):
 
 
 def _diffaid_runtime_identity(options):
-    """Return stable Diff-Aid instance identities published to transformer options.
-
-    Diff-Aid's Spectrum compatibility layer publishes one runtime entry per active
-    MiniMax-H3 patch instance before Spectrum preflights attention history. The
-    normalized sigma in that payload is intentionally excluded: Spectrum already
-    owns patch-regime transitions, while Sol-H3 only needs proof that a known
-    activation-only replacement is the wrapper around its block patch.
-    """
+    """Return stable Diff-Aid instance identities published to transformer options."""
     raw = options.get(SPECTRUM_EXTERNAL_RUNTIME_KEY)
     if raw is None:
         return ()
@@ -116,29 +112,96 @@ def _diffaid_runtime_identity(options):
     return tuple(sorted(set(identities)))
 
 
-def _diffaid_replacement_identity(patch, options):
-    """Recognize the audited MiniMax-H3 Diff-Aid activation-only block wrapper.
+def _float32_scalar(value):
+    """Match Diff-Aid's hard-window descriptor rounding without a tensor sync."""
+    return struct.unpack("=f", struct.pack("=f", float(value)))[0]
 
-    This deliberately requires Diff-Aid's per-call Spectrum runtime declaration.
-    A same-named or structurally similar wrapper without that declaration remains
-    opaque. The replacement itself only modulates ``args['img']`` and delegates to
-    ``existing_patch``/``original_block``; it does not own attention routing.
-    """
-    if type(patch).__name__ != "MiniMaxH3BlockReplacePatch":
-        return None
-    runtime_identity = _diffaid_runtime_identity(options)
-    if not runtime_identity or not hasattr(patch, "existing_patch"):
-        return None
-    config = getattr(patch, "config", None)
+
+def _diffaid_config_identity(config):
     fields = (
         "strength", "sigma_start", "sigma_end", "sigma_ramp",
         "token_weight_mode", "token_tail", "cond_only",
     )
     if config is None or any(not hasattr(config, name) for name in fields):
         return None
-    config_identity = tuple((name, _freeze_history_value(getattr(config, name))) for name in fields)
+    ramp = float(getattr(config, "sigma_ramp"))
+    start = float(getattr(config, "sigma_start"))
+    end = float(getattr(config, "sigma_end"))
+    if ramp == 0.0:
+        start = _float32_scalar(start)
+        end = _float32_scalar(end)
     return (
-        ("spectrum_declared_diffaid_h3_v1", runtime_identity, config_identity),
+        ("strength", _freeze_history_value(float(getattr(config, "strength")))),
+        ("sigma_start", _freeze_history_value(start)),
+        ("sigma_end", _freeze_history_value(end)),
+        ("sigma_ramp", _freeze_history_value(ramp)),
+        ("token_weight_mode", _freeze_history_value(str(getattr(config, "token_weight_mode")))),
+        ("token_tail", _freeze_history_value(float(getattr(config, "token_tail")))),
+        ("cond_only", _freeze_history_value(bool(getattr(config, "cond_only")))),
+    )
+
+
+def _diffaid_spectrum_contract_identity(options, block_index, config_identity):
+    """Resolve the already-validated Spectrum Diff-Aid declaration at preflight time.
+
+    Spectrum configures external-patch descriptors on its runtime before model calls.
+    Diff-Aid's per-call runtime entry can be injected later by the legacy model
+    wrapper, so requiring only that entry makes backend-history preflight depend on
+    wrapper ordering. The configured Spectrum descriptor is the same contract owner
+    and is available before the DIFFUSION_MODEL wrapper asks for history identity.
+    """
+    runtime = options.get(SPECTRUM_RUNTIME_KEY)
+    compat = getattr(runtime, _SPECTRUM_EXTERNAL_STATE_ATTR, None)
+    parsed = getattr(compat, "parsed", None)
+    descriptors = getattr(parsed, "descriptors", ())
+    matches = []
+    for descriptor in descriptors if isinstance(descriptors, (tuple, list)) else ():
+        if (
+            getattr(descriptor, "provider", None) != "comfyui-diffaid-patches"
+            or getattr(descriptor, "schema_version", None) != 1
+        ):
+            continue
+        instance = getattr(descriptor, "instance_id", None)
+        indices = getattr(descriptor, "block_indices_0based", ())
+        if not isinstance(instance, str) or not instance or block_index not in indices:
+            continue
+        if _diffaid_config_identity(descriptor) != config_identity:
+            continue
+        matches.append(("comfyui-diffaid-patches", 1, instance))
+    identities = tuple(sorted(set(matches)))
+    return identities if len(identities) == 1 else ()
+
+
+def _diffaid_replacement_identity(patch, options, block_index):
+    """Recognize the audited MiniMax-H3 Diff-Aid activation-only block wrapper.
+
+    The preferred proof is Spectrum's parsed static external-patch declaration,
+    which exists before per-call legacy wrappers inject runtime coordinates. A
+    dynamic Diff-Aid declaration is still accepted for older compatible stacks.
+    If both are present they must agree on the instance identity. This preserves
+    fail-closed behavior without making history safety depend on wrapper order.
+    """
+    if type(patch).__name__ != "MiniMaxH3BlockReplacePatch" or not hasattr(patch, "existing_patch"):
+        return None
+    config_identity = _diffaid_config_identity(getattr(patch, "config", None))
+    if config_identity is None:
+        return None
+    contract_identity = _diffaid_spectrum_contract_identity(
+        options,
+        int(block_index),
+        config_identity,
+    )
+    runtime_identity = _diffaid_runtime_identity(options)
+    if contract_identity:
+        if runtime_identity and not all(item in runtime_identity for item in contract_identity):
+            return None
+        declaration_identity = contract_identity
+    else:
+        declaration_identity = runtime_identity
+    if not declaration_identity:
+        return None
+    return (
+        ("spectrum_declared_diffaid_h3_v1", declaration_identity, config_identity),
         patch.existing_patch,
     )
 
@@ -261,7 +324,7 @@ def _replacement_history_identity(patch, block_index, config, options):
             continue
         declared = _flow_mixed_grid_replacement_identity(current, block_index)
         if declared is None:
-            declared = _diffaid_replacement_identity(current, options)
+            declared = _diffaid_replacement_identity(current, options, block_index)
         if declared is None:
             return None
         identity, current = declared
