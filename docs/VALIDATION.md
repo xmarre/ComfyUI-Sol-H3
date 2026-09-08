@@ -56,6 +56,8 @@ This is real GPU compilation/execution evidence for the packaged SOL kernel and 
 
 A second probe requesting the installed SageAttention 2 Triton provider exposed an independent binary-loader problem in that Sage installation: its `_fused` extension resolved `/lib/x86_64-linux-gnu/libstdc++.so.6` and required `GLIBCXX_3.4.32`, while the active conda environment already contained a newer compatible `libstdc++`. Sol-H3 must not require users to repair that with `LD_LIBRARY_PATH`, preloading or a second C++ runtime. Current runtime/probe policy therefore treats an unavailable optional dense provider as a local provider demotion while keeping the verified Sana SOL path active. A successful demotion probe must still report `sparse_calls > 0`, `sol_backend=cute_sm120` and exact prefix parity, together with the explicit dense-provider failure.
 
+For a permanent SageAttention repair, rebuild the official package against the same ComfyUI environment/toolchain instead of overriding the process linker. See **[SageAttention installation and repair](SAGEATTENTION.md)**. On SM120, use KJNodes `auto`: upstream SageAttention 2.2.0 dispatches `sageattn` to its CUDA FP8/SageAttention2++ path and explicitly marks its Triton path unusable on SM120.
+
 ### Completed production-GPU Exact Runtime A/B
 
 A matched hot A/B was run on the RTX PRO 6000 production workflow with the exact/runtime tier only; approximate SOL attention was not enabled. The stack included the production INT8/ConvRot H3 path with VDN, DiffAid, Untwist RoPE, Spectrum, progressive handoff and Continuum.
@@ -133,10 +135,11 @@ assert kernel.backend_name == 'cute_sm120'
 PYCODE
 python tools/attention_probe.py --backend pytorch --tokens 4096 --prefix 512 --heads 8
 python tools/attention_probe.py --backend sage --tokens 4096 --prefix 512 --heads 8
-python tools/attention_probe.py --backend sage3 --tokens 4096 --prefix 512 --heads 8
 ```
 
-The PyTorch probe is the minimum kernel acceptance check and must actually execute sparse calls. Sage/Sage3 are optional inherited dense providers. If their binary/package loader is unavailable, the probe must not fake Sage success: it should report `dense_provider_fallback=true`, the classified `dense_provider_failures`, the effective Comfy/PyTorch dense owner and continuing SOL sparse calls. Arbitrary provider compute failures remain fatal.
+The PyTorch probe is the minimum kernel acceptance check and must actually execute sparse calls. Sage is an optional inherited dense provider. If its binary/package loader is unavailable, the probe must not fake Sage success: it should report `dense_provider_fallback=true`, the classified `dense_provider_failures`, the effective Comfy/PyTorch dense owner and continuing SOL sparse calls. Arbitrary provider compute failures remain fatal.
+
+SageAttention3 is deliberately not part of the production Python 3.12 acceptance commands: upstream currently documents SageAttention3 with Python >=3.13, PyTorch >=2.8 and CUDA >=12.8. Test it only in a separate environment satisfying those requirements.
 
 Launch ComfyUI normally after these checks. There must be **no** `SOL_ROOT`, Sana checkout, Sol-H3-specific `PYTHONPATH`, `LD_LIBRARY_PATH` workaround or `ctypes` preload requirement.
 
@@ -148,16 +151,15 @@ Start with Exact off to isolate sparse interoperability, then enable it and comp
 |---|---|---|
 | A | Native selected dense provider | Baseline latency and media |
 | B | Sage + SOL | If Sage is usable, inherited Sage is recorded; if its loader is unavailable, explicit one-time demotion to original Comfy dense attention is recorded while SOL continues |
-| C | Sage3 + SOL | Same routing checks; independent gate passes |
-| D | Spectrum + SOL, then Sage + Spectrum + SOL | SOL actual count agrees with actual transformer calls; history resets at backend/provider demotions and transitions |
-| E | VDN grouped + SOL, with and without Sage | v2 local square expansion executes SOL on eligible restricted domains; `vdn_square_kernel_rows > vdn_square_requested_rows > 0`; global/anchor remain native |
-| F | VDN flex + SOL | Masked Flex remains native; if Flex falls back to grouped, grouped v2 routing is visible. With Spectrum, Flex remains actual-only because the fallback outcome is not preflight-predictable |
-| G | VDN full coverage + SOL | Eligible softmax can use SOL; learned gate remains active |
-| H | VDN + Spectrum + SOL | Grouped/full VDN publishes a stable audited history identity and can forecast after qualified actuals; opaque/Flex routing stays actual-only without aborting |
-| I | Flow API-1 reduced / API-2 mixed, then normal target grid | `external_sequence_native` on unsupported calls; later native-grid v2 SOL eligibility resumes |
-| J | Repeated Continuum chunks | Fresh sampling scopes, correct warmup, no stale VDN/SOL/Spectrum state |
-| K | Core Block Sparse Attention + Spectrum, with/without Sol-H3 | Current core provider is actual-only under the companion history consumer; explicit ownership recorded |
-| L | DiffAid + Untwist + runtime DoRA/LoRA + KJ preview + production stack | Projection/key transforms preserved; VDN preprocessing occurs before local gather; any remaining fallback is explicitly identified |
+| C | Spectrum + SOL, then Sage + Spectrum + SOL | SOL actual count agrees with actual transformer calls; history resets at backend/provider demotions and transitions |
+| D | VDN grouped + SOL, with and without Sage | v2 local square expansion executes SOL on eligible restricted domains; `vdn_square_kernel_rows > vdn_square_requested_rows > 0`; global/anchor remain native |
+| E | VDN flex + SOL | Masked Flex remains native; if Flex falls back to grouped, grouped v2 routing is visible. With Spectrum, Flex remains actual-only because the fallback outcome is not preflight-predictable |
+| F | VDN full coverage + SOL | Eligible softmax can use SOL; learned gate remains active |
+| G | VDN + Spectrum + SOL | Grouped/full VDN publishes a stable audited history identity and can forecast after qualified actuals; opaque/Flex routing stays actual-only without aborting |
+| H | Flow API-1 reduced / API-2 mixed, then normal target grid | `external_sequence_native` on unsupported calls; later native-grid v2 SOL eligibility resumes |
+| I | Repeated Continuum chunks | Fresh sampling scopes, correct warmup, no stale VDN/SOL/Spectrum state |
+| J | Core Block Sparse Attention + Spectrum, with/without Sol-H3 | Current core provider is actual-only under the companion history consumer; explicit ownership recorded |
+| K | DiffAid + Untwist + runtime DoRA/LoRA + KJ preview + production stack | Projection/key transforms preserved; VDN preprocessing occurs before local gather; any remaining fallback is explicitly identified |
 
 For the first current-head production run, the decisive native-grid telemetry is:
 
