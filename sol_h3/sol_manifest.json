@@ -4,7 +4,7 @@
   "branch": "sol-engine",
   "revision": "2936c47637380842aaa4a4488fac5006cc542b70",
   "subtree": "models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn",
-  "transformation": "relative-imports-v1; modified-file header",
+  "transformation": "relative-imports-v1; rectangular-sm120-v2 (tools/rectangular_sm120.patch)",
   "files": {
     "THIRD_PARTY_NOTICES.md": {
       "upstream_sha256": "103d86cce2d458005c83713765880b0d48205faa4b7b20a774d36fc3df56da00",
@@ -100,11 +100,17 @@
     },
     "interface.py": {
       "upstream_sha256": "1801195ca718a7d1d1af5b0fc5e2c779a8a142f6f541afebc38433784243351e",
-      "packaged_sha256": "1801195ca718a7d1d1af5b0fc5e2c779a8a142f6f541afebc38433784243351e"
+      "packaged_sha256": "5189941d7534c8c139ed24838a7e519752f159a04bf2c6bcc0df2df373d4f29e",
+      "modifications": [
+        "rectangular-sm120-v2"
+      ]
     },
     "preprocess.py": {
       "upstream_sha256": "d38c924280e00c34072652cfedf6fd65c85db6a4fe93e7858dd919e28d89d958",
-      "packaged_sha256": "d38c924280e00c34072652cfedf6fd65c85db6a4fe93e7858dd919e28d89d958"
+      "packaged_sha256": "97c9f5f3a9c491442b3298819153f090221305398379b55825db54e5b3aa28ec",
+      "modifications": [
+        "rectangular-sm120-v2"
+      ]
     },
     "sm100/LICENSE.flash-attention": {
       "upstream_sha256": "8c9ccb96c065e706135b6cbad279b721da6156e51f3a5f27c6b3329af9416d73",
@@ -144,7 +150,10 @@
     },
     "sm120/mainloop.py": {
       "upstream_sha256": "8b6b87be7fe21cb0ebfbab34cd0ae819faa96b829c57c7b27c1c14c29e771570",
-      "packaged_sha256": "5ec70231374fec4c172350ca0f470db2c83918b94845f88f6e1958936d8af7ca"
+      "packaged_sha256": "6602a1c3467ef07a8cd8ee213eb7d9ef33b3a8cd258ad53bff401393e5196c89",
+      "modifications": [
+        "rectangular-sm120-v2"
+      ]
     },
     "sm90/__init__.py": {
       "upstream_sha256": "dbb468f6dda2c220593e36cb8e1e753f4586e1ab47b7a6ba1e8f98e47dc3802e",
@@ -210,5 +219,6 @@
       "upstream_sha256": "c1aaa53b26ac9293f504f1d107814ed6c1924a9b671ebebfffc54ec83f743264",
       "packaged_sha256": "c1aaa53b26ac9293f504f1d107814ed6c1924a9b671ebebfffc54ec83f743264"
     }
-  }
+  },
+  "packaged_patch_sha256": "cde382135ed205f6bacb88096b822c4ba19e63922d8418f8352a216d05432ee6"
 }

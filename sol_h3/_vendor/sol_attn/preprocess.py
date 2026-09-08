@@ -1,3 +1,4 @@
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
 """Block summaries and routing thresholds shared by both CuTe kernels."""
 
 from __future__ import annotations
@@ -391,12 +392,14 @@ def _compute_diag_threshold(
     tau: float,
     scale: float,
     valid_tokens: int | None = None,
+    valid_kv_tokens: int | None = None,
     return_q_bar: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     batch, capacity_tokens, heads, head_dim = q.shape
     tokens = capacity_tokens if valid_tokens is None else int(valid_tokens)
     capacity_blocks = triton.cdiv(capacity_tokens, BLOCK_SIZE)
     valid_blocks = triton.cdiv(tokens, BLOCK_SIZE)
+    kv_blocks = kc.shape[1] if valid_kv_tokens is None else triton.cdiv(valid_kv_tokens, BLOCK_SIZE)
     tile_d = min(128, triton.next_power_of_2(head_dim))
     kc_mean = torch.empty(
         (batch, heads, head_dim),
@@ -432,9 +435,9 @@ def _compute_diag_threshold(
         kc_desc,
         kc_mean,
         kc_var_diag,
-        valid_blocks,
+        kv_blocks,
         heads,
-        capacity_blocks,
+        kc.shape[1],
         head_dim,
         tile_d,
         THRESHOLD_GROUP_SIZE,
@@ -467,20 +470,22 @@ def _compute_exact_threshold(
     tau: float,
     scale: float,
     valid_tokens: int | None = None,
+    valid_kv_tokens: int | None = None,
 ) -> torch.Tensor:
     batch, capacity_tokens, heads, head_dim = q.shape
     tokens = capacity_tokens if valid_tokens is None else int(valid_tokens)
     capacity_blocks = triton.cdiv(capacity_tokens, BLOCK_SIZE)
     valid_blocks = triton.cdiv(tokens, BLOCK_SIZE)
+    kv_blocks = kc.shape[1] if valid_kv_tokens is None else triton.cdiv(valid_kv_tokens, BLOCK_SIZE)
     tile_d = min(128, triton.next_power_of_2(head_dim))
     batch_heads = batch * heads
-    kc_bh = kc[:, :valid_blocks].permute(0, 2, 1, 3)
+    kc_bh = kc[:, :kv_blocks].permute(0, 2, 1, 3)
     kc_mean = kc_bh.mean(dim=2, dtype=torch.float32)
     kc_second_moment = torch.matmul(
         kc_bh.transpose(-1, -2),
         kc_bh,
     )
-    kc_second_moment.div_(valid_blocks)
+    kc_second_moment.div_(kv_blocks)
     q_bar = torch.empty(
         (batch_heads, capacity_blocks, head_dim),
         device=q.device,
@@ -535,6 +540,7 @@ def prepare(
     scale: float,
     thresh_type: str = "diag",
     valid_tokens: int | None = None,
+    valid_kv_tokens: int | None = None,
     return_q_bar: bool = False,
 ) -> (
     tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -544,10 +550,13 @@ def prepare(
     tokens = capacity_tokens if valid_tokens is None else int(valid_tokens)
     if not 0 < tokens <= capacity_tokens:
         raise ValueError(f"valid_tokens must be in [1, {capacity_tokens}], got {tokens}")
-    kc, vc = _reduce_kv(k, v, valid_tokens=tokens)
+    # Legacy bucket callers use one logical length; rectangular SM120 supplies
+    # independent Q/KV lengths. Unbucketed calls infer each from its tensor.
+    kv_tokens = (k.shape[1] if valid_tokens is None else tokens) if valid_kv_tokens is None else int(valid_kv_tokens)
+    kc, vc = _reduce_kv(k, v, valid_tokens=kv_tokens)
     if thresh_type == "exact":
         threshold = _compute_exact_threshold(
-            q, kc, tau=tau, scale=scale, valid_tokens=tokens
+            q, kc, tau=tau, scale=scale, valid_tokens=tokens, valid_kv_tokens=kv_tokens
         )
         q_bar = None
     else:
@@ -557,6 +566,7 @@ def prepare(
             tau=tau,
             scale=scale,
             valid_tokens=tokens,
+            valid_kv_tokens=kv_tokens,
             return_q_bar=return_q_bar,
         )
         if return_q_bar:

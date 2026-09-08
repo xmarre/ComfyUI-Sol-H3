@@ -23,6 +23,9 @@ class Request:
     sparse_calls: int = 0
     dense_calls: int = 0
     vdn_local_sol_calls: int = 0
+    vdn_rectangular_sol_calls: int = 0
+    vdn_requested_q_rows: int = 0
+    vdn_kernel_q_rows: int = 0
     vdn_square_expanded_calls: int = 0
     vdn_square_requested_rows: int = 0
     vdn_square_kernel_rows: int = 0
@@ -64,6 +67,9 @@ class SamplingWrapper:
                      "compatibility_fallbacks": dict(state.fallbacks),
                      "dense_provider_failures": dict(state.dense_provider_failures),
                      "vdn_local_sol_calls": state.vdn_local_sol_calls,
+                     "vdn_rectangular_sol_calls": state.vdn_rectangular_sol_calls,
+                     "vdn_requested_q_rows": state.vdn_requested_q_rows,
+                     "vdn_kernel_q_rows": state.vdn_kernel_q_rows,
                      "vdn_square_expanded_calls": state.vdn_square_expanded_calls,
                      "vdn_square_requested_rows": state.vdn_square_requested_rows,
                      "vdn_square_kernel_rows": state.vdn_square_kernel_rows,
@@ -100,7 +106,7 @@ class DiffusionWrapper:
             _FORWARD.reset(token)
 
 
-def _shape_reason(q, k, v, heads, mask, kw):
+def _shape_reason(q, k, v, heads, mask, kw, *, rectangular=False):
     import torch
     if mask is not None:
         return "attention_mask"
@@ -110,7 +116,11 @@ def _shape_reason(q, k, v, heads, mask, kw):
                "_inside_attn_wrapper", "attn_precision"}
     if set(kw) - allowed or kw.get("attn_precision") is not None:
         return "attention_arguments"
-    if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape or q.shape[0] != 1:
+    if (any(t.ndim != 4 for t in (q, k, v)) or k.shape != v.shape
+            or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
+            or q.shape[0] != 1 or min(q.shape[2], k.shape[2]) == 0):
+        return "qkv_geometry"
+    if not rectangular and q.shape != k.shape:
         return "non_square_qkv"
     if q.shape[1] != heads or q.shape[-1] != 128:
         return "head_geometry"
@@ -310,6 +320,9 @@ class BlockPatch:
                 return result
 
             def vdn_provider_v1(native, q, k, v, *, kind, scale, square_aligned=False):
+                if not square_aligned or q.shape != k.shape or q.shape != v.shape:
+                    record("vdn_" + kind + "_native", True)
+                    return native()
                 return vdn_provider_v2(
                     native, q, k, v, kind=kind, scale=scale,
                     square_aligned=square_aligned)
@@ -321,32 +334,19 @@ class BlockPatch:
                     record("vdn_" + kind + "_native", True)
                     return native()
 
-                expanded = square_q is not None
-                if expanded:
-                    import torch
-                    if (not torch.is_tensor(query_positions) or query_positions.ndim != 1
-                            or query_positions.shape[0] != q.shape[0]
-                            or query_positions.dtype != torch.long
-                            or query_positions.device != q.device):
-                        record("vdn_square_mapping", True)
-                        return native()
-                    if (square_q.ndim != 3 or square_q.shape != k.shape
-                            or k.shape != v.shape or square_q.shape[1:] != q.shape[1:]):
-                        record("vdn_square_domain", True)
-                        return native()
-                    q_kernel = square_q
-                elif square_aligned and q.shape == k.shape == v.shape:
-                    q_kernel = q
-                    query_positions = None
-                else:
-                    record("vdn_local_native", True)
+                # API v2 owns gathering and supplies the exact restricted KV domain.
+                # square_q/query_positions remain accepted for existing VDN #11 callers;
+                # neither is needed to evaluate the requested Q rows directly.
+                if (any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape
+                        or q.shape[1:] != k.shape[1:]):
+                    record("vdn_local_domain", True)
                     return native()
-
-                qc, kc, vc = (t.transpose(0, 1).unsqueeze(0) for t in (q_kernel, k, v))
-                reason = _shape_reason(qc, kc, vc, q.shape[1], None, {"skip_reshape": True})
+                qc, kc, vc = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+                reason = _shape_reason(qc, kc, vc, q.shape[1], None,
+                                       {"skip_reshape": True}, rectangular=True)
                 if scale != q.shape[-1] ** -0.5:
                     reason = "vdn_scale"
-                if not isinstance(sink_rows, int) or not 0 <= sink_rows <= q_kernel.shape[0]:
+                if not isinstance(sink_rows, int) or not 0 <= sink_rows <= k.shape[0]:
                     reason = "vdn_sink_rows"
                 if reason:
                     record(reason, True)
@@ -364,12 +364,11 @@ class BlockPatch:
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
-                result = result.reshape(q_kernel.shape[0], q.shape[1], q.shape[2])
-                if expanded:
-                    state.vdn_square_expanded_calls += 1
-                    state.vdn_square_requested_rows += q.shape[0]
-                    state.vdn_square_kernel_rows += q_kernel.shape[0]
-                    result = result.index_select(0, query_positions)
+                result = result.reshape(q.shape[0], q.shape[1], q.shape[2])
+                state.vdn_requested_q_rows += q.shape[0]
+                state.vdn_kernel_q_rows += qc.shape[2]
+                if q.shape[0] != k.shape[0]:
+                    state.vdn_rectangular_sol_calls += 1
                 state.vdn_local_sol_calls += 1
                 record("vdn_local_sol")
                 return result

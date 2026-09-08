@@ -5,7 +5,7 @@ from pathlib import Path
 
 SOURCE = 'sana-sol-engine'
 REVISION = '2936c47637380842aaa4a4488fac5006cc542b70'
-CONTRACT = 'sana-sol-engine-sol-attn-64-v1'
+CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-v2'
 
 
 def verify_source():

@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: node-local relative imports only.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
@@ -96,7 +96,7 @@ class SolAttnForwardSm120:
         num_blocks = mKC.shape[0]
         num_route_groups = cute.ceil_div(num_blocks, N)
         q_start = q_tile_idx * M
-        q_len = token_count - q_start
+        q_len = mQ.shape[0] - q_start
         if q_len > M:
             q_len = cutlass.Int32(M)
         threshold = cutlass.Float32(

@@ -1,3 +1,4 @@
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
 """Public Sol-Attn interface."""
 
 from __future__ import annotations
@@ -28,9 +29,10 @@ def _validate_inputs(
     sink_tokens=0,
     sink_start=None,
 ):
-    if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape:
-        raise ValueError("q, k, and v must share shape [B, T, H, 128]")
-    if q.shape[1] == 0 or q.shape[3] != 128:
+    if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
+            or q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]):
+        raise ValueError("q must be [B, Tq, H, 128]; k/v must share [B, Tkv, H, 128]")
+    if q.shape[1] == 0 or k.shape[1] == 0 or q.shape[3] != 128:
         raise ValueError("Sol-Attn requires T > 0 and head dimension 128")
     if any(x.dtype != torch.bfloat16 for x in (q, k, v)):
         raise TypeError("q, k, and v must use torch.bfloat16")
@@ -47,15 +49,15 @@ def _validate_inputs(
         raise ValueError("thresh_type must be 'diag' or 'exact'")
     if not isinstance(sink_tokens, int):
         raise TypeError("sink_tokens must be an integer")
-    if not 0 <= sink_tokens <= q.shape[1]:
-        raise ValueError("sink_tokens must be in [0, T]")
+    if not 0 <= sink_tokens <= k.shape[1]:
+        raise ValueError("sink_tokens must be in [0, Tkv]")
     if sink_start is not None:
         if not isinstance(sink_start, int):
             raise TypeError("sink_start must be an integer or None")
-        if not 0 <= sink_start <= q.shape[1]:
-            raise ValueError("sink_start must be in [0, T]")
-        if sink_start + sink_tokens > q.shape[1]:
-            raise ValueError("sink_start + sink_tokens must be <= T")
+        if not 0 <= sink_start <= k.shape[1]:
+            raise ValueError("sink_start must be in [0, Tkv]")
+        if sink_start + sink_tokens > k.shape[1]:
+            raise ValueError("sink_start + sink_tokens must be <= Tkv")
     return tuple(torch.cuda.get_device_capability(q.device))
 
 
@@ -236,7 +238,8 @@ def _sol_attn_cute(
 
     batch, capacity_tokens, heads, _ = q.shape
     tokens = capacity_tokens if valid_tokens is None else int(valid_tokens)
-    valid_blocks = (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+    kv_tokens = k.shape[1] if arch == (12, 0) else tokens
+    valid_blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     with torch.cuda.device(q.device):
         kc, vc, threshold = prepare(
@@ -247,8 +250,9 @@ def _sol_attn_cute(
             tau=tau,
             thresh_type=thresh_type,
             valid_tokens=tokens,
+            valid_kv_tokens=kv_tokens,
         )
-        output = torch.empty_like(v)
+        output = torch.empty_like(q)
         lse = torch.empty(
             (batch, capacity_tokens, heads),
             device=q.device,
@@ -259,12 +263,12 @@ def _sol_attn_cute(
         # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
         # descriptor for a strided view (or vice versa).
         layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v))
-        key = (q.device.index, arch, batch, capacity_tokens, heads, kv_splits, layout_key)
+        key = (q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits, layout_key)
 
         if arch == (9, 0):
             if sink_tokens:
                 sink_start_block, sink_end_block = _sink_block_range(
-                    tokens,
+                    kv_tokens,
                     sink_start,
                     sink_tokens,
                 )
@@ -308,7 +312,7 @@ def _sol_attn_cute(
             )
         elif arch in ((10, 0), (10, 3)):
             sink_start_block, sink_end_block = _sink_block_range(
-                tokens,
+                kv_tokens,
                 sink_start,
                 sink_tokens,
             )
@@ -338,7 +342,7 @@ def _sol_attn_cute(
             )
         else:
             sink_start_block, sink_end_block = _sink_block_range(
-                tokens,
+                kv_tokens,
                 sink_start,
                 sink_tokens,
             )
@@ -449,6 +453,8 @@ def sol_attn(
     if kv_splits not in (1, 2, 4):
         raise ValueError("kv_splits must be 1, 2, or 4")
     backend = _backend_for_arch(arch)
+    if q.shape[1] != k.shape[1] and backend != "cute_sm120":
+        raise ValueError("Rectangular attention currently requires cute_sm120")
     valid_tokens = q.shape[1]
     if compile_bucket_size is not None:
         if backend != "cute_sm100":
@@ -476,7 +482,7 @@ def sol_attn(
             sink_start=sink_start,
         )
 
-    _validate_cute(arch, q.shape[1], kv_splits)
+    _validate_cute(arch, k.shape[1], kv_splits)
     return _sol_attn_cute(
         q,
         k,
