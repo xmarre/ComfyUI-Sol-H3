@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from sol_h3 import runtime
 from sol_h3.contracts import KEY, Config
 from sol_h3.runtime import BlockPatch, DiffusionWrapper, Request, SamplingWrapper, _FORWARD, _REQUEST, install
 
@@ -123,3 +124,90 @@ def test_block_replacement_may_bypass_or_delegate_multiple_times():
         assert state.evaluations == 1
     finally:
         _FORWARD.reset(token)
+
+
+def test_unavailable_inherited_dense_provider_demotes_once(monkeypatch):
+    cfg = Config(exact=False, backend="sol", dense_evaluations=99, dense_layers=0)
+    state = Request(cfg)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(forward=None))])
+    q = torch.zeros(1, 1, 7, 128, dtype=torch.bfloat16)
+    broken_calls = []
+    original_calls = []
+
+    def broken(original, q, k, v, heads, **kw):
+        broken_calls.append(True)
+        raise ImportError(
+            "/tmp/sageattention/_fused.so: /lib/x86_64-linux-gnu/libstdc++.so.6: "
+            "version `GLIBCXX_3.4.32' not found"
+        )
+
+    def original(q, k, v, heads, **kw):
+        original_calls.append(True)
+        return q.transpose(1, 2).reshape(1, q.shape[2], -1)
+
+    monkeypatch.setattr(runtime, "_shape_reason", lambda *a, **k: None)
+    opts = {"optimized_attention_override": broken}
+
+    def block(args):
+        to = args["transformer_options"]
+        out = to["optimized_attention_override"](
+            original, q, q, q, 1, skip_reshape=True, transformer_options=to
+        )
+        return {"img": out}
+
+    for evaluation in range(2):
+        token = _FORWARD.set((model, state, evaluation, set(), []))
+        try:
+            BlockPatch(0, cfg)(
+                {"img": torch.zeros(7, 128), "layout": SimpleNamespace(
+                    seq_len=7, segments=[(0, 3, "text"), (3, 7, "video")]),
+                 "transformer_options": opts},
+                {"original_block": block},
+            )
+        finally:
+            _FORWARD.reset(token)
+
+    assert len(broken_calls) == 1
+    assert len(original_calls) == 2
+    assert sum(state.dense_provider_failures.values()) == 1
+    assert state.fallbacks["dense_provider_unavailable:binary_abi"] == 1
+    assert state.backend_transitions == 1
+    assert state.disabled_dense_providers == {id(broken)}
+    assert any("original" in name for name in state.dense_attention_backends)
+
+
+def test_dense_provider_compute_errors_are_not_swallowed(monkeypatch):
+    cfg = Config(exact=False, backend="sol", dense_evaluations=99, dense_layers=0)
+    state = Request(cfg)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(forward=None))])
+    q = torch.zeros(1, 1, 7, 128, dtype=torch.bfloat16)
+
+    def broken(original, q, k, v, heads, **kw):
+        raise RuntimeError("CUDA launch failed")
+
+    def original(q, k, v, heads, **kw):
+        raise AssertionError("must not fall back for compute errors")
+
+    monkeypatch.setattr(runtime, "_shape_reason", lambda *a, **k: None)
+    opts = {"optimized_attention_override": broken}
+
+    def block(args):
+        to = args["transformer_options"]
+        return {"img": to["optimized_attention_override"](
+            original, q, q, q, 1, skip_reshape=True, transformer_options=to
+        )}
+
+    token = _FORWARD.set((model, state, 0, set(), []))
+    try:
+        with pytest.raises(RuntimeError, match="CUDA launch failed"):
+            BlockPatch(0, cfg)(
+                {"img": torch.zeros(7, 128), "layout": SimpleNamespace(
+                    seq_len=7, segments=[(0, 3, "text"), (3, 7, "video")]),
+                 "transformer_options": opts},
+                {"original_block": block},
+            )
+    finally:
+        _FORWARD.reset(token)
+
+    assert not state.disabled_dense_providers
+    assert not state.dense_provider_failures
