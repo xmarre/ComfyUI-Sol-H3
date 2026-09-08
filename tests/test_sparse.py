@@ -30,6 +30,83 @@ def test_sink_geometry_rejects_nonprefix_and_out_of_range():
         sparse._sink_blocks(0, 131, 130)
 
 
+def test_production_calibration_metrics_allow_isolated_sm120_peak():
+    # Real RTX PRO 6000 full-stack calibration reached this aggregate error but
+    # the old max-only <=0.08 rule rejected one 0.125 peak. The aggregate error
+    # is far inside the BF16 SDPA calibration budget, so an isolated tail must
+    # not invalidate the provider.
+    metrics = {
+        "finite": True,
+        "max_abs": 0.125,
+        "mean_abs": 0.0002412556204944849,
+        "rel_l2": 0.0010161730460822582,
+        "tail_abs_threshold": sparse.ARITH_TAIL_ABS,
+        "tail_fraction": 0.001,
+        "reference_rms": 0.25,
+        "catastrophic_max_abs_limit": 2.0,
+    }
+    assert sparse.arithmetic_gate_passes(metrics)
+
+
+def test_arithmetic_gate_rejects_widespread_tail_error():
+    metrics = {
+        "finite": True,
+        "max_abs": 0.10,
+        "mean_abs": 0.001,
+        "rel_l2": 0.002,
+        "tail_abs_threshold": sparse.ARITH_TAIL_ABS,
+        "tail_fraction": sparse.ARITH_TAIL_FRACTION_LIMIT + 0.001,
+        "reference_rms": 0.25,
+        "catastrophic_max_abs_limit": 2.0,
+    }
+    assert not sparse.arithmetic_gate_passes(metrics)
+
+
+def test_arithmetic_gate_rejects_bad_relative_or_mean_error():
+    base = {
+        "finite": True,
+        "max_abs": 0.10,
+        "mean_abs": 0.001,
+        "rel_l2": 0.002,
+        "tail_abs_threshold": sparse.ARITH_TAIL_ABS,
+        "tail_fraction": 0.001,
+        "reference_rms": 0.25,
+        "catastrophic_max_abs_limit": 2.0,
+    }
+    assert not sparse.arithmetic_gate_passes({**base, "mean_abs": sparse.ARITH_MEAN_ABS_LIMIT + 1e-4})
+    assert not sparse.arithmetic_gate_passes({**base, "rel_l2": sparse.ARITH_REL_L2_LIMIT + 1e-4})
+
+
+def test_arithmetic_gate_rejects_catastrophic_peak_and_nonfinite():
+    base = {
+        "finite": True,
+        "max_abs": 0.10,
+        "mean_abs": 0.001,
+        "rel_l2": 0.002,
+        "tail_abs_threshold": sparse.ARITH_TAIL_ABS,
+        "tail_fraction": 0.001,
+        "reference_rms": 0.01,
+        "catastrophic_max_abs_limit": sparse.ARITH_CATASTROPHIC_MAX_FLOOR,
+    }
+    assert not sparse.arithmetic_gate_passes({
+        **base,
+        "max_abs": sparse.ARITH_CATASTROPHIC_MAX_FLOOR + 0.1,
+    })
+    assert not sparse.arithmetic_gate_passes({**base, "finite": False})
+
+
+def test_error_metrics_report_tail_fraction_and_scale_aware_cap():
+    want = torch.ones(1, 1, 1000, 1)
+    got = want.clone()
+    got.reshape(-1)[:2] += 0.125
+    metrics = sparse.error_metrics(got, want)
+    assert metrics["finite"] is True
+    assert metrics["max_abs"] == pytest.approx(0.125)
+    assert metrics["tail_fraction"] == pytest.approx(0.002)
+    assert metrics["catastrophic_max_abs_limit"] == pytest.approx(8.0)
+    assert sparse.arithmetic_gate_passes(metrics)
+
+
 def test_bridge_protects_prefix_and_uses_full_sink_gate(monkeypatch):
     # CPU bridge oracle only: deliberately fake the sparse output after the
     # all-selected call to verify that ALL prefix queries are overwritten.
