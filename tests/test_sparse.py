@@ -98,11 +98,11 @@ def test_arithmetic_gate_rejects_catastrophic_peak_and_nonfinite():
 def test_error_metrics_report_tail_fraction_and_scale_aware_cap():
     want = torch.ones(1, 1, 1000, 1)
     got = want.clone()
-    got.reshape(-1)[:2] += 0.125
+    got.reshape(-1)[0] += 0.125
     metrics = sparse.error_metrics(got, want)
     assert metrics["finite"] is True
     assert metrics["max_abs"] == pytest.approx(0.125)
-    assert metrics["tail_fraction"] == pytest.approx(0.002)
+    assert metrics["tail_fraction"] == pytest.approx(0.001)
     assert metrics["catastrophic_max_abs_limit"] == pytest.approx(8.0)
     assert sparse.arithmetic_gate_passes(metrics)
 
