@@ -28,6 +28,8 @@ class Request:
     vdn_square_kernel_rows: int = 0
     exact_blocks: int = 0
     fallbacks: Counter = field(default_factory=Counter)
+    dense_provider_failures: Counter = field(default_factory=Counter)
+    disabled_dense_providers: set = field(default_factory=set)
     exact_verified: set = field(default_factory=set)
     sparse_verified: set = field(default_factory=set)
     dense_attention_backends: set = field(default_factory=set)
@@ -60,6 +62,7 @@ class SamplingWrapper:
                      "sol_source_tree_verified": getattr(state.kernel, "source_tree_verified", False),
                      "sparse_calls": state.sparse_calls, "dense_warmup": state.dense_calls,
                      "compatibility_fallbacks": dict(state.fallbacks),
+                     "dense_provider_failures": dict(state.dense_provider_failures),
                      "vdn_local_sol_calls": state.vdn_local_sol_calls,
                      "vdn_square_expanded_calls": state.vdn_square_expanded_calls,
                      "vdn_square_requested_rows": state.vdn_square_requested_rows,
@@ -139,6 +142,31 @@ def _preprocess_chain(provider, q, k, v, heads, kw):
     return q, k, v, provider
 
 
+def _provider_leaf(provider):
+    """Return the dense leaf without executing preprocessing transforms."""
+    seen = set()
+    while hasattr(provider, "attention_preprocess_v1"):
+        if id(provider) in seen:
+            raise RuntimeError("Cyclic attention preprocessing contract")
+        seen.add(id(provider))
+        _, provider = provider.attention_preprocess_v1
+    return provider
+
+
+def _provider_unavailable_reason(exc):
+    """Classify optional-provider loader failures; never absorb compute errors."""
+    if not isinstance(exc, (ImportError, OSError)):
+        return None
+    message = str(exc)
+    if "GLIBCXX_" in message:
+        return "binary_abi"
+    if "undefined symbol" in message:
+        return "binary_symbol"
+    if "cannot open shared object file" in message or "No such file or directory" in message:
+        return "binary_dependency"
+    return "import_error" if isinstance(exc, ImportError) else "loader_error"
+
+
 def _vdn_provider_api():
     """Return the installed VDN softmax-provider capability without owning hybrid.py."""
     try:
@@ -182,16 +210,46 @@ class BlockPatch:
 
             def override(original, q, k, v, heads, mask=None, **kw):
                 dense_provider = previous
-                state.dense_attention_backends.add(provider_name(dense_provider or original))
 
                 def dense(qd=q, kd=k, vd=v, *, output_heads=None):
                     dense_kw = {**kw, "_inside_attn_wrapper": True}
                     if output_heads is not None:
                         dense_kw["skip_reshape"] = True
                         dense_kw["skip_output_reshape"] = output_heads
-                    if dense_provider is not None:
-                        return dense_provider(original, qd, kd, vd, heads, mask=mask, **dense_kw)
-                    return original(qd, kd, vd, heads, mask=mask, **dense_kw)
+                    provider = dense_provider
+                    leaf = _provider_leaf(provider) if provider is not None else None
+                    if leaf is not None and id(leaf) in state.disabled_dense_providers:
+                        provider = None
+                    if provider is not None:
+                        try:
+                            out = provider(original, qd, kd, vd, heads, mask=mask, **dense_kw)
+                        except (ImportError, OSError) as exc:
+                            reason = _provider_unavailable_reason(exc)
+                            if reason is None:
+                                raise
+                            name = provider_name(leaf)
+                            first_failure = id(leaf) not in state.disabled_dense_providers
+                            state.disabled_dense_providers.add(id(leaf))
+                            key = f"{name}:{reason}"
+                            state.dense_provider_failures[key] += 1
+                            state.fallbacks[f"dense_provider_unavailable:{reason}"] += 1
+                            if first_failure:
+                                state.backend_transitions += 1
+                                log.warning(
+                                    "Sol-H3 inherited dense provider %s unavailable (%s); "
+                                    "demoting it to the original Comfy attention for this request: %s",
+                                    name, reason, exc,
+                                )
+                        else:
+                            state.dense_attention_backends.add(provider_name(leaf))
+                            return out
+                    if original is None:
+                        raise RuntimeError(
+                            "Inherited dense provider is unavailable and no original attention fallback was supplied"
+                        )
+                    out = original(qd, kd, vd, heads, mask=mask, **dense_kw)
+                    state.dense_attention_backends.add(provider_name(original))
+                    return out
 
                 current_options = kw.get("transformer_options") or options
                 reason = _shape_reason(q, k, v, heads, mask, kw)
