@@ -45,9 +45,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xmarre/ComfyUI-VDN-H3-Plus
-          ref: 99ff31128d66efa508873f5072f8de88c677e55e
+          ref: b6f0755c4172ec5c17386c56998f454e78b2a2d4
           path: _deps/VDN
           persist-credentials: false
+      - name: Apply VDN SOL-provider overlay after audio overlay
+        run: |
+          git -C _deps/VDN fetch origin 99ff31128d66efa508873f5072f8de88c677e55e
+          git -C _deps/VDN -c user.name=ci -c user.email=ci@example.invalid cherry-pick 99ff31128d66efa508873f5072f8de88c677e55e
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
