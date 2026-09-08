@@ -1,124 +1,171 @@
 # Interoperability source audit — 2026-09-08
 
-Historical square-bridge audit below. The current rectangular implementation, its changed query grouping and pending GPU validation are documented in [RECTANGULAR](RECTANGULAR.md). Prior GPU numbers apply to the square implementation.
+This audit records the ownership decisions behind the current rectangular/mixed-grid revision of the existing Sol-H3 PR #1.
 
-Existing PR #1 is continued on a mirror branch. This audit supersedes both the initial exclusive-provider design and the later requirement for a separately exposed Sana `sol_attn` checkout.
+## Audited sources
 
 | Source | Inspected/tested revision |
 |---|---|
-| ComfyUI | `efa6c8f804bff78b46a0fd458ebd2e47bba07a30` |
-| Sana `sol-engine` | `2936c47637380842aaa4a4488fac5006cc542b70`, `models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn` |
+| ComfyUI | `efa6c8f804bff78b46a0fd458ebd2e47bba07a30` in the pinned native-interoperability lane |
+| Sana `sol-engine` | `2936c47637380842aaa4a4488fac5006cc542b70`, subtree `models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn` |
 | KJNodes | `c9869eade9920a1b949de07c4a197156006bcceb` |
-| VDN-H3-Plus companion | sequential PR #8 -> PR #11 stack; PR #11 head `99ff31128d66efa508873f5072f8de88c677e55e` |
+| VDN-H3-Plus companion | PR #8 `b6f0755c4172ec5c17386c56998f454e78b2a2d4` followed by PR #11 `5b63dc670229d419a6350b64f7ceda609dbc8194` |
 | Spectrum companion | `31de0cb89b472c965794fdc340de857360a58107` |
-| Flow | `fe0ef8752b92081b5a85bc9b39ad8e2a7037d591` |
-| Continuum | `a5b8943844594545301b20d01af5d9e3fa38ae29` |
+| Flow mixed-grid producer | `h3_flow_regenerate.mixed_grid.v1` API-2 contract on current Flow main inspected during this revision |
 | Untwist | PR #9 preprocessing contract |
-| DiffAid | `ba9d9efbcf7e64c755e068cb76547d8cc85481eb` |
 
-## Production reproductions that changed the design
+The original PR remains the integration vehicle. Development was performed on a mirror branch and is consolidated back to `feature/native-sol-h3` as one implementation commit.
 
-A correctly ordered production stack — VDN, runtime DoRA, DiffAid, Untwist, SOL, Spectrum, then preview/progressive/Continuum — ran on the RTX PRO 6000 with Sage enabled. Exact fusion executed, but the first interoperability revision still reported `sol_eligible_calls=0`, `sparse_calls=0`, `vdn_local_sol_calls=0`. Mixed-grid calls reported the expected `external_sequence_native` fallback.
+## Reproductions that changed the design
 
-That ruled out node ordering, dense warmup and tau. The deeper limitation was VDN provider API v1: normal H3 VDN local queries attend to an already-restricted KV domain that includes prefix/global rows, so the requested query set is usually rectangular against K/V while the SOL kernel requires square Q/K/V.
+### 1. Blanket interoperability gates were wrong
 
-VDN PR #11 therefore exposes provider API v2. For each local operation VDN still constructs its original restricted KV domain, then supplies an expanded query tensor over that same ordered domain plus a mapping back to the originally requested query rows. SOL may evaluate that square restricted domain and VDN keeps only the original query outputs. The operation does not gain KV rows and therefore does not become unrestricted full-sequence attention. Global/anchor operations remain native, masked Flex remains native, and VDN retains its learned gate and linear complement.
+Earlier revisions treated Sage/KJ, Spectrum, VDN and some external layouts as mutually exclusive with SOL. That was too restrictive. The current rule is narrower:
 
-The post-v2 handoff reported `sol_eligible_calls=2750` but zero sparse execution because the then-current source loader required an external package. That established routing only. The subsequent comfy-kitchen substitution was removed and replaced by the packaged Sana implementation. A ComfyUI startup capability report for comfy-kitchen does not prove Sana CuTe availability.
+- if coherent semantics exist, execute experimentally and record the route;
+- if ownership is unknown, delegate that operation rather than aborting the generation;
+- hard-fail only broken contracts, unsafe indexing, failed arithmetic verification, or actual execution errors.
 
-The current packaged Sana implementation has now been tested directly on the target RTX PRO 6000. Source verification passed all 51 files, backend dispatch selected `cute_sm120`, and a 4096-row BF16 synthetic probe compiled and executed the real CuTe SM120 kernel twice with exact dense-prefix parity. The all-selected arithmetic gate reported `max_abs=0.0009765625`, `mean_abs=4.484307282837108e-05`, `rel_l2=0.003004377940669656`. This closes the source-loader and basic SM120 kernel-execution questions, but does not yet validate VDN square-expanded GPU calls, full-stack speed, Spectrum forecasting behavior or decoded media.
+### 2. VDN local attention is rectangular
 
-The same local environment exposed a separate optional-provider failure when directly importing the installed SageAttention 2 package: its `_fused` extension resolved the system `libstdc++.so.6` and required `GLIBCXX_3.4.32` even though the active conda environment already contained a compatible newer runtime. Sol-H3 must not fix a third-party binary by globally mutating linker state. Instead, an inherited dense provider that raises a loader-level `ImportError`/`OSError` is request-locally demoted to the original Comfy attention callable with explicit telemetry. Arbitrary CUDA/runtime compute errors remain fatal.
+Normal VDN grouped-local queries attend to an already-restricted K/V domain containing global/prefix rows plus permitted video-window rows. Requested video Q rows are therefore usually rectangular against that K/V domain.
 
-## Source, licensing and dependencies
+The historical v2 bridge adapted this to a square-only kernel by expanding Q over the whole restricted K/V domain and selecting requested rows afterward. Production telemetry showed approximately 4.38-5.41x more kernel Q rows than requested in representative stages.
 
-The entire 51-file Sol-Attn subtree is retained to preserve its public architecture dispatch and internal support imports; no other engine code is imported. `interface.py`, `preprocess.py`, `common/`, SM120 mainloop and the upstream H3 sparse policy were inspected. `SOURCE_SNAPSHOT.json` identifies upstream validation on SM103 and explicitly lists SM120 as unvalidated at the upstream snapshot; this project now adds direct local SM120 execution evidence without rewriting that upstream claim.
+The packaged Sana SM120 path was then modified to support rectangular Q/KV directly. Production native-grid runs established 1:1 requested/kernel Q rows with zero Sol-H3 square expansion.
 
-Sana's pinned root README licenses repository code under Apache-2.0. The subtree's third-party notice identifies FlashAttention BSD-3-Clause and NVIDIA Apache-2.0 adaptations. Copyright/SPDX headers and the original third-party notice/BSD license are retained; the Apache-2.0 text is included. Import adaptation converts absolute `sol_attn.*` imports to relative imports. The rectangular revision additionally changes `interface.py`, `preprocess.py` and `sm120/mainloop.py`; see `tools/rectangular_sm120.patch` and [RECTANGULAR](RECTANGULAR.md). Original and packaged hashes are distinct provenance records. This avoids global module aliases, path mutations and collisions with other nodes, including when ComfyUI imports the node beneath a generated package name. The manifest records original and transformed hashes, verified before GPU runtime import.
+### 3. VDN API v3 removes the remaining dead square-Q allocation
 
-Imports require PyTorch, Triton (also used by CuTe preprocessing), CUDA Python, CUTLASS DSL and TVM FFI (`enable_tvm_ffi=True`). The pinned cuDNN frontend's `cutedsl` dependency metadata declares `nvidia-cutlass-dsl[cu13]>=4.5.0`, `cuda-python`, `apache-tvm-ffi>=0.1.11`; these dependencies are declared directly. No `cudnn` import exists in the packaged subtree. Upstream pins Triton 3.6.0; the node declares >=3.6,<4 so installation does not force a newer PyTorch environment to downgrade. CI retains the upstream 3.6.0 baseline. No diffusers, transformers, model downloader or full cuDNN frontend dependency is added.
+Even after Sol-H3 stopped executing expanded Q, VDN provider API v2 still constructed `square_q` and `query_positions` before calling the provider. That allocation/gather was no longer useful to a rectangular provider.
 
-Upstream maps SM120 to `cute_sm120` only when CuTe imports succeed; otherwise it selects Triton. This node explicitly requires `cute_sm120` on its existing SM120 integration path and records initialization failure as native fallback. It does not mislabel Triton execution as CuTe. Other architectures remain available in the packaged public source but retain the existing node-level per-call native fallback.
+VDN PR #11 now publishes provider API v3:
 
-## Compatibility-gate disposition
+```text
+requested q
+restricted k/v
+sink_rows
+```
 
-| Former rejection or invariant | Classification | Current behavior |
+with dispatch priority v3 -> v2 -> v1. The v2 square compatibility payload is built lazily only when a v2-only provider is installed. Sol-H3 publishes v3, so the current production path no longer requests or constructs `square_q`.
+
+PR #11 remains stack-compatible with PR #8 because the provider integration is implemented in the retained grouped-attention layer and does not edit `vdn_h3/hybrid.py`.
+
+### 4. Flow API-2 mixed-grid attention has coherent sparse semantics
+
+The prior Sol-H3 revision forced all VDN external/mixed sequences to inherited dense attention. Inspection of Flow's published API-2 mixed-grid contract showed a narrower coherent case:
+
+```text
+api = 2
+mode = dense_gate_no_linear
+topology = mixed_grid_low_suffix
+```
+
+Flow publishes the exact native carrier count, actual mixed row count, video start, temporal length, protected-prefix length, source rows/frame, and target-prefix rows/frame. VDN explicitly switches to whole-sequence gated attention and disables the geometry-dependent linear complement for that external sequence.
+
+Sol-H3 now validates those values against the current packed layout and allows the underlying whole-sequence attention operation to use SOL. It does not invent a uniform target-grid lattice. The leading non-video/global prefix remains the exact sink.
+
+Unknown or malformed external contracts still delegate. Later native-grid calls may resume SOL.
+
+This new mixed route is covered by CPU/native integration tests. It has not yet received a production GPU/media rerun; the previous live mixed-grid run predates this support and correctly remained dense.
+
+### 5. Optional Sage failure is a provider availability issue, not a Sol-H3 incompatibility
+
+The production environment exposed an installed SageAttention binary whose `_fused` extension required a newer `GLIBCXX` than the system `libstdc++` it resolved. Sol-H3 must not repair third-party ABI problems with global linker mutations.
+
+Loader-level `ImportError`/`OSError` from an inherited dense provider is therefore classified and request-locally demoted to the original Comfy attention callable. Explicit preprocessing remains active. Arbitrary CUDA/runtime compute failures continue to propagate.
+
+## Source and provenance
+
+The complete 51-file Sol-Attn subtree is packaged so its real public dispatch and support imports remain intact. The node does not use `comfy_kitchen.sol_attn`.
+
+Original upstream SHA-256 values remain recorded separately from packaged hashes. Functional changes beyond import adaptation are restricted to:
+
+- `interface.py`;
+- `preprocess.py`;
+- `sm120/mainloop.py`.
+
+`tools/rectangular_sm120.patch` records those changes. The import-adapted + patched tree is reproducible from the pinned Sana checkout and compared in CI.
+
+The original upstream snapshot is preserved as historical upstream evidence; this project does not rewrite it to claim upstream SM120 validation.
+
+Dependencies required by the packaged path are declared directly: PyTorch, Triton, CUDA Python, NVIDIA CUTLASS DSL with CUDA 13 support, and Apache TVM FFI. No runtime Sana checkout or `PYTHONPATH` injection is required.
+
+## Ownership table
+
+| Situation | Classification | Current behavior |
 |---|---|---|
-| Provider-name bans | Unvalidated/composable ownership | Removed; per-call dispatch/telemetry |
-| SOL + Spectrum blanket gate | Numerical-history ownership | Consumer preflight/receipt protocol; incompatible history becomes actual/reset rather than RuntimeError |
-| Generic optimized override including Sage/Sage3 | Composable dense provider | Retained as inherited dense provider, recursion marker preserved |
-| Optional inherited provider cannot load | Third-party binary/package availability | Attempt once per sampling request; classify loader failure, preserve explicit preprocessing, demote to original Comfy attention, record history transition |
-| Inherited provider raises arbitrary compute/runtime error | Actual execution failure | Propagate; never disguise as provider unavailability |
-| `_vdn_forward` | Multiple operation ownership | Explicit VDN restricted-subcall v1/v2 hooks; learned gate/linear math retained |
-| Rectangular VDN local Q vs KV | Kernel topology mismatch with coherent bridge | VDN v2 expands Q only over the same restricted KV domain, runs square SOL when eligible, then selects original query rows |
-| VDN external sequence API 1/2 | Per-call unsupported topology | Inherited gated attention for that call; later normal grid can resume SOL |
-| Preexisting block replacement | Composable ownership | Wrap/delegate; attention replacement remains its own operation |
-| Repeated block / zero or multiple sparse subcalls | Legitimate provider execution | Counters and routing receipts, no exactly-one enforcement |
-| Zero sparse / zero exact post-run checks | Optimization-usage policy | Removed; report counters |
-| Dense layers covering all blocks | Valid all-dense configuration | Allowed |
-| Duplicate Sol-H3 application | Composable configuration | Compatible exact/SOL requests merge; one keyed lifecycle |
-| Different SOL policies on same branch | Ambiguous configuration | Explicit ValueError; use separate branches |
-| Current PackedLayout/prefix unavailable or unsupported | Per-call kernel topology | Native fallback; no cached layout inference |
-| Mask / attention flags / precision / dtype / device unsupported | Per-call kernel topology | Inherited attention |
-| Whole-block forward hooks, compiled/custom block forward | Exact arithmetic ownership | Preserve native block invocation |
-| Native source hashes drift | Exact implementation unverified | Native block fallback |
-| Packaged Sana source/CuTe unavailable for the current GPU | Optional optimization unavailable | Native fallback with explicit telemetry; no external package search/download |
-| Arithmetic gate actually fails | Computed output violates tested invariant | Hard failure; never silently accept failed arithmetic |
-| Missing request scope / tampered metadata / cyclic transform | Broken internal lifecycle/contract | Hard failure |
-| Malformed affine indices/strides | Unsafe fused indexing | Existing hard invariant retained |
+| Generic inherited Sage/dense override | Composable dense owner | Used for warmup/dense-required work; SOL owns eligible sparse calls |
+| Optional dense provider loader/import failure | Provider availability | Request-local demotion to original Comfy attention with telemetry |
+| Dense provider compute/CUDA failure | Real execution failure | Propagates |
+| SOL + Spectrum | Numerical history ownership | Receipt/preflight coordination; route changes reset history instead of aborting |
+| VDN grouped local q vs restricted k/v | Coherent rectangular domain | v3 direct rectangular SOL when eligible |
+| VDN v2-only provider | Legacy compatibility | Lazy square-Q payload only when actually needed |
+| VDN global/anchor | VDN-owned operation | Native VDN attention |
+| VDN Flex masked attention | VDN-owned masked operation | Native Flex; existing grouped fallback can then use v3 |
+| Flow API-2 `mixed_grid_low_suffix` + `dense_gate_no_linear` | Explicit coherent external topology | Contract-validated whole-sequence SOL, experimental telemetry |
+| Unknown/malformed external sequence | Undefined/unsupported topology | Local inherited fallback |
+| Later native grid after external stage | New eligible operation | SOL may resume |
+| Preexisting block replacement | Composable block ownership | Wrap/delegate current args; unsupported ownership stays native |
+| Zero sparse calls | Valid optimization-usage outcome | Finish successfully and report counters |
+| Whole-block hook/custom forward | Exact arithmetic ownership uncertain | Native Exact fallback |
+| Failed arithmetic gate | Computed invariant violation | Hard failure |
+| Missing lifecycle/tampered metadata/cyclic preprocessing | Broken internal contract | Hard failure |
+| Malformed affine indices/strides | Unsafe fused indexing | Hard failure |
 
-## Numerical and ownership details
+## Numerical details
 
-Comfy's `wrap_attn` sets `_inside_attn_wrapper` before invoking the override and materializes `AttentionTensorContainer` inputs when the override has no container implementation. SOL accepts that tensor contract and retains the marker on inherited dense calls, including providers that themselves use wrapped fallbacks. It does not special-case Sage names.
+Comfy's attention wrapper marks recursion before invoking the override. Sol-H3 preserves that marker on inherited dense calls.
 
-Independent BF16 SDPA verifies the all-selected SOL kernel. Dense-prefix execution on ordinary native H3 attention uses the inherited provider and may therefore be approximate Sage. Pure `attention_preprocess_v1` transformations expose their inherited provider: SOL transforms QKV once and uses the dense leaf on transformed prefix queries.
+For ordinary packed H3 attention, prefix queries that must stay dense are recomputed through the inherited provider (or the original Comfy fallback after provider demotion). The sparse kernel receives BF16 Q/K/V and native scale.
 
-If that dense leaf cannot load, Sol-H3 does not discard the preprocessing contract. The explicit transform chain is still evaluated once and the transformed Q/K/V are handed to the original Comfy attention callable. The failed leaf identity is disabled only for the current sampling request; subsequent dense-required calls do not repeatedly trigger the same binary import failure. `dense_provider_failures` identifies the provider and failure class. The provider-history fingerprint marks the demoted state, so Spectrum cannot reuse a forecast across the numerical-owner change as if the provider were unchanged.
+For VDN v3 local calls, preprocessing occurs on the full post-RoPE packed sequence before VDN gathers the restricted domain. This keeps coordinate-dependent transforms such as Untwist well-defined. SOL then sees only requested Q plus the exact restricted K/V rows.
 
-The direct kernel call uses the packaged upstream `sol_attn` API on BF16 BTHD tensors with explicit native scale, direct tau, `thresh_type="diag"` and `kv_splits=1`, matching H3's upstream default policy. Sol-H3 always passes `sink_start=0`: upstream's omitted-start default is a suffix. Upstream `_sink_block_range` rounds the prefix end outward to the next 64-row boundary. Prefix queries remain dense on normal H3; the all-selected gate uses a full-length exact sink.
+For Flow mixed-grid external calls, Sol-H3 validates the explicit external contract and uses the packed leading non-video/global prefix as the exact sink. It does not interpret the mixed video rows as a regular native target lattice.
 
-VDN v2 preprocessing happens on the full post-RoPE VDN domain before local gather, so transforms such as Untwist retain their original packed-row coordinates. For an expanded VDN local SOL call, prefix/global rows remain sink KV. Their expanded query outputs are auxiliary and discarded, so SOL does not perform the ordinary native-H3 dense prefix-query recomputation for those unused rows.
-
-VDN's square expansion has a real performance cost: it computes additional query rows and may perform additional gathers. Telemetry separately records `vdn_square_expanded_calls`, requested query rows and kernel rows so GPU tests can determine whether the sparse work still wins. Correct execution is established structurally; speedup is not.
-
-Spectrum decides whether to forecast before executing H3, but captures anchors inside the final block replacement. Preflight therefore establishes expected policy and actual per-block receipts are consumed before `observe_actual`. Unknown/opaque routing is actual-only. Backend/provider transitions reset stage forecasters/controllers and invalidate incompatible offline archives rather than aborting execution.
-
-Flow can change layout, explicit RoPE rows and modulation rows through block callbacks. Exact uses current delegated arguments. SOL validates call-time row counts; stale or unsupported layouts fall back rather than inventing a lattice. Continuum's separate sampler invocations receive fresh request state.
-
-Projection/norm/MLP hooks remain invoked, preserving runtime adapters and ordinary Comfy weight patches structurally. Whole-block hooks force native Exact execution. Curve AdaLN remains native; no table eviction or stale projection cache is introduced.
+The rectangular all-selected arithmetic gate compares against independent BF16 SDPA and includes both Q and K/V shape in its calibration identity. Arithmetic failure is never converted into a compatibility fallback.
 
 ## Optimization decisions
 
-| Sol-H3 component | Classification and decision |
+| Component | Decision |
 |---|---|
-| Fused QKV projection | Already native in `Attention.qkv_proj`; retained |
-| Q/K RMSNorm + partial split-half RoPE | Already native `ck.rms_rope_split_half_`; retained, including quantized ops |
-| SwiGLU + down projection | Already native `linear_input_act`; retained |
-| Residual/gate | Native in-place `addcmul_` already fused per segment; retained |
-| Scale/shift modulation | Exact candidate: fused native add/multiply/add launches while preserving dtype rounding |
-| RMSNorm + modulation | Not fused here: native RMSNorm implementations/hooks and reduction order are retained |
-| AdaLN schedule tables | Compact curve format already removes the large full-width table cost; no fixed schedule cache is introduced |
-| Layout/copy elimination | Native packed target-video tail is already contiguous; direct SOL uses current contiguous BTHD Q/K/V |
-| Compilation/caches | Triton specializes the small affine kernel; no whole-model compile, CUDA graph capture or process-global activation cache |
-| Sol-Attn numerical kernel | Uses packaged Sana `sol_attn` / CuTe SM120; approximate, opt-in, complete prefix KV sink; direct SM120 compile/execution now proven |
-| VDN v2 square bridge | Preserves VDN restricted KV geometry while adapting rectangular local calls to the square kernel; extra-Q overhead must be measured |
-| ComfyUI Block Sparse Attention node | Separate kernel integration and H3 producer/policy (`sol_attn_chunked`, pooled state, Sol/SLA/VSA options); retained as a separate A/B path |
-| SOL-BSA + residual | Approximate; not exposed without supported validation |
-| FastH3/DMD2/VSA adapter | Learned acceleration, separate concern; not installed or required |
-| Ulysses / distributed execution / parallel VAE | Runtime-specific, outside this native MODEL patch; omitted |
+| Native fused QKV projection | Retained |
+| Native Q/K norm + RoPE | Retained |
+| Native SwiGLU/down projection | Retained |
+| Native residual/gate math | Retained |
+| Exact affine fusion | Implemented with native-rounding parity checks |
+| Rectangular Sana SM120 attention | Implemented in packaged real Sana/CuTe source |
+| VDN v2 square kernel bridge | Historical compatibility only; current Sol-H3 uses v3 direct rectangular routing |
+| VDN dead square-Q gather for current provider | Removed by PR #11 v3/lazy-v2 dispatch |
+| Flow mixed-grid whole-sequence SOL | Enabled only for explicit validated API-2 topology |
+| Core Comfy Block Sparse Attention | Separate integration/ownership path |
+| Learned FastH3/DMD2/VSA acceleration | Separate learned-model concern; not required here |
+| Distributed execution / parallel VAE | Outside this MODEL patch |
 
-## ComfyUI built-in sparse attention
+## Evidence and remaining limits
 
-Core BSA uses comfy-kitchen, including its chunked H3 QKV producer. Sol-H3 uses the pinned Sana source at the native attention/provider boundary. These are separate integrations; neither one's availability or benchmark establishes correctness/performance of the other.
+Real RTX PRO 6000 evidence exists for:
 
-## Evidence limits
+- Exact Runtime and a matched timing A/B;
+- packaged Sana source verification and direct `cute_sm120` execution;
+- rectangular SM120 GPU tests;
+- production native-grid VDN rectangular execution with 1:1 requested/kernel Q rows;
+- production Spectrum/VDN/Untwist/Flow stack completion on the pre-mixed-SOL revision.
 
-CPU CI exercises real ModelPatcher object-patch application, current KJ wrapper behavior, native H3, Spectrum capture and the sequential VDN PR #8 -> PR #11 stack with explicit CPU SOL substitutes.
+Current CPU/native CI additionally validates:
 
-Real RTX PRO 6000 evidence now exists for:
-- Exact Runtime and its matched timing A/B;
-- the pre-v2 VDN routing failure;
-- post-v2 routing reaching 2750 SOL-eligible calls before kernel loading;
-- current packaged Sana source verification and real CuTe SM120 compile/execution with two sparse calls and prefix parity.
+- VDN PR #8 -> PR #11 sequential application;
+- provider API v3;
+- absence of v2 square allocation when v3 is present;
+- real ModelPatcher VDN v3 -> Sol-H3 routing;
+- explicit mixed-grid SOL routing;
+- mixed-grid -> native SOL resumption;
+- malformed external-contract fallback.
 
-Still unvalidated on GPU are VDN v2 square-expanded sparse execution in the full production model, combined Spectrum forecasting after qualified SOL actuals, warmed end-to-end performance and decoded audiovisual quality. The broken standalone SageAttention 2 binary import is separate from the proven CuTe SOL execution; current Sol-H3 classifies/demotes such optional-provider loader failures instead of imposing a global linker workaround.
+Still outstanding are:
+
+- GPU timing of the VDN v3 allocation removal;
+- production GPU execution of the newly enabled mixed-grid SOL route;
+- decoded-media comparison for that mixed route;
+- a matched warmed end-to-end performance A/B for the current full stack.
+
+See [RECTANGULAR](RECTANGULAR.md) for kernel geometry and [VALIDATION](VALIDATION.md) for commands/counters.
