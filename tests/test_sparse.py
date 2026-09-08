@@ -1,4 +1,3 @@
-import hashlib
 from types import ModuleType
 import sys
 
@@ -16,52 +15,52 @@ def test_real_loader_rejects_cpu():
         sparse.load_kernel(torch.device("cpu"))
 
 
-def test_pinned_source_checks(tmp_path):
-    raw = b"example source\n"
-    manifest = {
-        "git_blobs": {"interface.py": "0" * 40},
-        "sha256": {"interface.py": hashlib.sha256(raw).hexdigest()},
-    }
-    with pytest.raises(RuntimeError, match="missing"):
-        sparse.verify_sources(tmp_path, manifest)
-    (tmp_path / "interface.py").write_bytes(raw)
-    sparse.verify_sources(tmp_path, manifest)
-    (tmp_path / "interface.py").write_bytes(raw + b"changed")
-    with pytest.raises(RuntimeError, match="mismatch"):
-        sparse.verify_sources(tmp_path, manifest)
+def test_comfy_kitchen_loader_requires_available_api(monkeypatch):
+    fake = ModuleType("comfy_kitchen")
+    fake.sol_attn_is_available = lambda device: False
+    fake.sol_attn = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "comfy_kitchen", fake)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 0))
+    with pytest.raises(RuntimeError, match="no compiled sol_attn"):
+        sparse.load_kernel(torch.device("cuda"))
 
 
-def test_pinned_manifest_requires_matching_security_file_set(tmp_path):
-    (tmp_path / "interface.py").write_text("x")
-    with pytest.raises(RuntimeError, match="file sets differ"):
-        sparse.verify_sources(
-            tmp_path,
-            {"git_blobs": {"interface.py": "0" * 40}, "sha256": {}},
-        )
+def test_comfy_kitchen_loader_maps_prefix_rows_to_exact_blocks(monkeypatch):
+    calls = []
+    fake = ModuleType("comfy_kitchen")
+    fake.sol_attn_is_available = lambda device: True
+
+    def sol_attn(q, k, v, **kw):
+        calls.append(kw)
+        return v
+
+    fake.sol_attn = sol_attn
+    monkeypatch.setitem(sys.modules, "comfy_kitchen", fake)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 0))
+    kernel = sparse.load_kernel(torch.device("cuda"))
+    q = torch.zeros(1, 130, 2, 128)
+    kernel(q, q, q, tau=1.0, sink_start=0, sink_tokens=65)
+    assert calls == [{
+        "tau": 1.0,
+        "scale": None,
+        "sink_blocks": [0, 2],
+        "sink_q": [0, 0],
+        "topk_ratio": 0.0,
+        "tail": True,
+        "token_aug": 0,
+    }]
+    assert kernel.backend_name == "comfy_kitchen.sol_attn"
+    assert kernel.block_size == 64
 
 
-def test_package_lookup_does_not_execute_init(monkeypatch, tmp_path):
-    package = tmp_path / "sol_attn"
-    package.mkdir()
-    (package / "__init__.py").write_text("raise RuntimeError('package code executed')\n")
-    monkeypatch.setattr(sys, "path", [str(tmp_path)])
-    assert sparse._find_package_root() == package.resolve()
-    assert "sol_attn" not in sys.modules
-
-
-def test_preimported_package_is_rejected_before_use(monkeypatch, tmp_path):
-    package = tmp_path / "sol_attn"
-    package.mkdir()
-    raw = b"# pinned\n"
-    (package / "__init__.py").write_bytes(raw)
-    manifest = {
-        "git_blobs": {"__init__.py": "0" * 40},
-        "sha256": {"__init__.py": hashlib.sha256(raw).hexdigest()},
-    }
-    monkeypatch.setitem(sys.modules, "sol_attn", ModuleType("sol_attn"))
-    sparse._VERIFIED_ROOTS.discard(package.resolve())
-    with pytest.raises(RuntimeError, match="imported before"):
-        sparse._load_verified_interface(package, manifest)
+def test_sink_geometry_rejects_nonprefix_and_out_of_range():
+    assert sparse._sink_blocks(0, 0, 130) == [0, 0]
+    assert sparse._sink_blocks(0, 64, 130) == [0, 1]
+    assert sparse._sink_blocks(0, 65, 130) == [0, 2]
+    with pytest.raises(RuntimeError, match="beginning at row zero"):
+        sparse._sink_blocks(64, 64, 130)
+    with pytest.raises(RuntimeError, match="outside"):
+        sparse._sink_blocks(0, 131, 130)
 
 
 def test_bridge_protects_prefix_and_uses_full_sink_gate(monkeypatch):
