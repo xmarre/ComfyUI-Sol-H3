@@ -32,7 +32,7 @@ class Config:
                 "attention_ownership": "sol" if owns_sol else "inherit",
                 "sink_mode": "prefix" if owns_sol else None,
                 "threshold": "diag" if owns_sol else None,
-                "kernel_contract": "sana-2936c476-sol-sm120" if owns_sol else None,
+                "kernel_contract": "comfy-kitchen-sol-attn-64-v1" if owns_sol else None,
                 "exact_kernel": "rounded-affine-v1" if self.exact else "native",
                 "history_policy": "attention_backend_history_v1"}
         data["fingerprint"] = hashlib.sha256(
@@ -68,4 +68,3 @@ def adaln_status(model):
             raise RuntimeError("Curve AdaLN model is missing adaln_t_table")
         return "not_applicable_compact_curve"
     return "native_full_width_no_schedule_precompute"
-
