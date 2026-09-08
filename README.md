@@ -65,6 +65,12 @@ python -m pip install -r requirements.txt
 
 Run the dependency command in the same environment as ComfyUI (for example `comfy312`), including when updating an existing checkout. Manager installations use `requirements.txt`. Dependencies are PyTorch, Triton >=3.6,<4 (Linux), NVIDIA CUTLASS DSL with its CUDA 13 extra, CUDA Python and Apache TVM FFI. The cuDNN frontend and full Sana engine are not required. The current production target is Linux/WSL SM120; native Windows dependency/kernel execution remains unvalidated.
 
+### SageAttention on Blackwell
+
+SageAttention is optional and is **not** installed by Sol-H3. On SM120, upstream SageAttention 2.2.0 routes `sageattn`/`auto` to its CUDA FP8 SageAttention2++ path and explicitly states that its Triton path is currently not usable on SM120. If using KJNodes on an RTX 50-series or RTX PRO 6000 Blackwell GPU, select **`auto`**, not `sageattn_qk_int8_pv_fp16_triton`.
+
+If Sage fails with a binary ABI error such as `GLIBCXX_3.4.32 not found`, do not repair it with a global `LD_LIBRARY_PATH`/`LD_PRELOAD` override. Rebuild the official SageAttention package from source against the same Python environment, host compiler and CUDA toolkit that run ComfyUI. The complete pinned install/repair commands and verification probes are in **[SageAttention installation and repair](docs/SAGEATTENTION.md)**.
+
 `sol_h3/sol_manifest.json` records upstream and packaged SHA-256 hashes. Only absolute package imports are converted to relative imports, with modified-file headers. Developers can reproduce the snapshot with `python tools/vendor_sol_attn.py /path/to/pinned/Sana`; this is not an installation step.
 
 ## Validation and diagnostics
