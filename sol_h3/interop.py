@@ -118,7 +118,10 @@ class HistoryPolicy:
         return (self.config.metadata()["fingerprint"], phase, repr(signature),
                 getattr(layout, "seq_len", None), tuple(getattr(layout, "segments", ())),
                 str(getattr(model, "dtype", None)),
-                provider_identity(options.get("optimized_attention_override")), tuple(vdn))
+                provider_identity(
+                    options.get("optimized_attention_override"),
+                    state.disabled_dense_providers,
+                ), tuple(vdn))
 
     def accept_receipts(self, receipts):
         return bool(receipts) and all(
@@ -129,7 +132,7 @@ class HistoryPolicy:
             for item in receipts)
 
 
-def provider_identity(provider):
+def provider_identity(provider, disabled_dense_providers=()):
     transforms = []
     seen = set()
     while hasattr(provider, "attention_preprocess_v1"):
@@ -138,4 +141,7 @@ def provider_identity(provider):
         seen.add(id(provider))
         transform, provider = provider.attention_preprocess_v1
         transforms.append(provider_name(transform))
-    return (tuple(transforms), provider_name(provider), id(provider))
+    identity = (tuple(transforms), provider_name(provider), id(provider))
+    if id(provider) in disabled_dense_providers:
+        return (*identity, "unavailable_fallback")
+    return identity
