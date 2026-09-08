@@ -20,7 +20,7 @@ Repository = "https://github.com/xmarre/ComfyUI-Sol-H3"
 include = ["sol_h3*"]
 
 [tool.setuptools.package-data]
-sol_h3 = ["sol_manifest.json", "native_manifest.json"]
+sol_h3 = ["native_manifest.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
