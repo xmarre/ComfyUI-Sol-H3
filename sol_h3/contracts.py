@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+from .provenance import CONTRACT, SOURCE, REVISION
 import hashlib
 import json
 import math
@@ -32,7 +33,9 @@ class Config:
                 "attention_ownership": "sol" if owns_sol else "inherit",
                 "sink_mode": "prefix" if owns_sol else None,
                 "threshold": "diag" if owns_sol else None,
-                "kernel_contract": "comfy-kitchen-sol-attn-64-v1" if owns_sol else None,
+                "kernel_contract": CONTRACT if owns_sol else None,
+                "sol_source": SOURCE if owns_sol else None,
+                "sana_revision": REVISION if owns_sol else None,
                 "exact_kernel": "rounded-affine-v1" if self.exact else "native",
                 "history_policy": "attention_backend_history_v1"}
         data["fingerprint"] = hashlib.sha256(

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Native ComfyUI MiniMax-H3 exact affine fusion and experimental SOL attention"
 requires-python = ">=3.10"
 license = {text = "GPL-3.0-or-later"}
-dependencies = []
+dependencies = ["torch", "triton==3.6.0; sys_platform == 'linux'", "nvidia-cutlass-dsl[cu13]>=4.5.0", "cuda-python", "apache-tvm-ffi>=0.1.11"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff"]
@@ -20,7 +20,7 @@ Repository = "https://github.com/xmarre/ComfyUI-Sol-H3"
 include = ["sol_h3*"]
 
 [tool.setuptools.package-data]
-sol_h3 = ["native_manifest.json"]
+sol_h3 = ["native_manifest.json", "sol_manifest.json", "_vendor/LICENSE.*", "_vendor/*.json", "_vendor/sol_attn/THIRD_PARTY_NOTICES.md", "_vendor/sol_attn/sm100/LICENSE.flash-attention"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -29,6 +29,7 @@ markers = ["gpu: requires CUDA and Triton; not a CPU parity claim"]
 
 [tool.ruff]
 line-length = 120
+extend-exclude = ["sol_h3/_vendor"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]

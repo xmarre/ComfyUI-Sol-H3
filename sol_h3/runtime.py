@@ -56,6 +56,8 @@ class SamplingWrapper:
             _REQUEST.reset(token)
             log.info("Sol-H3 %s", json.dumps({"success": success, **self.config.metadata(),
                      "actual_evaluations": state.evaluations, "sol_eligible_calls": state.eligible_calls,
+                     "sol_backend": getattr(state.kernel, "backend_name", None),
+                     "sol_source_tree_verified": getattr(state.kernel, "source_tree_verified", False),
                      "sparse_calls": state.sparse_calls, "dense_warmup": state.dense_calls,
                      "compatibility_fallbacks": dict(state.fallbacks),
                      "vdn_local_sol_calls": state.vdn_local_sol_calls,

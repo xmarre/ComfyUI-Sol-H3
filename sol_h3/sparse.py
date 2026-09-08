@@ -1,4 +1,4 @@
-"""Native attention bridge to ComfyUI's maintained comfy-kitchen Sol-Attn kernel."""
+"""Native attention bridge to the packaged Sana Sol-H3 implementation."""
 import torch
 import torch.nn.functional as F
 
@@ -11,7 +11,7 @@ class KernelUnavailable(RuntimeError):
 
 
 def _sink_blocks(start, tokens, rows):
-    """Convert an exact row interval to comfy-kitchen's exact 64-row block interval.
+    """Validate an exact prefix interval and describe its overlapping 64-row blocks.
 
     Sol-H3 only requests prefix sinks beginning at row zero. The final partial
     block is intentionally rounded outward: this makes a few extra keys exact,
@@ -29,48 +29,33 @@ def _sink_blocks(start, tokens, rows):
 
 
 def load_kernel(device):
-    """Return the ComfyUI-installed Sol-Attn kernel with the Sol-H3 call contract.
-
-    Current ComfyUI ships the compiled Sol-Attn implementation in
-    ``comfy-kitchen``. No external Sana checkout, PYTHONPATH mutation, runtime
-    download or duplicate kernel installation is required.
-    """
+    """Load the verified node-local public API; SM120 requires its CuTe backend."""
+    from .provenance import verify_source
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("This experimental SOL integration currently targets single-GPU SM120 only")
     try:
-        import comfy_kitchen as ck
-    except ImportError as exc:
-        raise RuntimeError(
-            "ComfyUI's comfy-kitchen package is unavailable; update the current ComfyUI environment"
-        ) from exc
-    available = getattr(ck, "sol_attn_is_available", None)
-    sol_attn = getattr(ck, "sol_attn", None)
-    if not callable(available) or not callable(sol_attn):
-        raise RuntimeError(
-            "The installed comfy-kitchen does not expose the required sol_attn API; update ComfyUI/comfy-kitchen"
-        )
-    if not available(device):
-        raise RuntimeError("The installed comfy-kitchen has no compiled sol_attn kernel for this GPU")
+        verify_source()
+        from ._vendor.sol_attn import get_sol_attn_backend, sol_attn
+        backend = get_sol_attn_backend(device)
+        if backend != "cute_sm120":
+            raise RuntimeError(
+                f"Sana selected {backend}; SM120 requires CuTe (cutlass.cute and cuda.bindings.driver)"
+            )
+        # Import lazy dependencies before returning a usable kernel. No compilation here.
+        from ._vendor.sol_attn import preprocess  # noqa: F401
+        from ._vendor.sol_attn.sm120 import make_kernel  # noqa: F401
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise RuntimeError(f"Sana Sol-Attn initialization failed: {exc}") from exc
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
                sink_start=0, sink_tokens=0):
-        if thresh_type != "diag":
-            raise RuntimeError(f"Unsupported comfy-kitchen SOL threshold policy {thresh_type!r}")
-        if kv_splits != 1:
-            raise RuntimeError("Sol-H3 currently requires one logical KV partition")
-        sink_blocks = _sink_blocks(sink_start, sink_tokens, q.shape[1])
-        return sol_attn(
-            q, k, v,
-            tau=float(tau),
-            scale=None,
-            sink_blocks=sink_blocks,
-            sink_q=[0, 0],
-            topk_ratio=0.0,
-            tail=True,
-            token_aug=0,
-        )
+        _sink_blocks(sink_start, sink_tokens, q.shape[1])  # validate prefix geometry
+        return sol_attn(q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
+                        thresh_type=thresh_type, kv_splits=kv_splits,
+                        sink_start=sink_start, sink_tokens=sink_tokens)
 
-    kernel.backend_name = "comfy_kitchen.sol_attn"
+    kernel.backend_name = backend
+    kernel.source_tree_verified = True
     kernel.block_size = BLOCK_SIZE
     return kernel
 
@@ -122,7 +107,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         if not all(metrics[n] <= limits[n] for n in limits):
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
         state.sparse_verified.add(key)
-        state.gates.append({"shape": list(q.shape), "backend": "comfy_kitchen.sol_attn", **metrics})
+        state.gates.append({"shape": list(q.shape), "backend": getattr(state.kernel, "backend_name", "test_substitute"), **metrics})
         del got, want
     out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                        sink_start=0, sink_tokens=prefix)
