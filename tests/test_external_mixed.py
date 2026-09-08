@@ -34,6 +34,9 @@ def _contract(**changes):
 
 def test_external_mixed_contract_derives_only_the_global_sink_prefix():
     assert runtime._external_sequence_prefix(_contract(), _layout(9), 9) == (3, None)
+    # Production Flow keeps the native low-grid carrier layout in the payload
+    # while the wrapped transformer block executes the larger mixed stream.
+    assert runtime._external_sequence_prefix(_contract(), _layout(7), 9) == (3, None)
     assert runtime._external_sequence_prefix(_contract(api=1), _layout(9), 9) == (
         None, "external_sequence_native")
     assert runtime._external_sequence_prefix(
@@ -41,6 +44,9 @@ def test_external_mixed_contract_derives_only_the_global_sink_prefix():
     ) == (None, "external_sequence_contract")
     assert runtime._external_sequence_prefix(
         _contract(video_start=4), _layout(9), 9
+    ) == (None, "external_sequence_contract")
+    assert runtime._external_sequence_prefix(
+        _contract(native_sequence_rows=8), _layout(7), 9
     ) == (None, "external_sequence_contract")
 
 
@@ -72,8 +78,10 @@ def test_valid_external_mixed_sequence_uses_sol_then_native_grid_resumes(monkeyp
             assert out.shape == (1, 9, 128)
             return {"img": args["img"]}
 
+        # Match the real Flow wrapper: the block attention sees nine mixed rows,
+        # while the surrounding model payload still carries the seven-row native layout.
         BlockPatch(0, cfg)(
-            {"img": torch.zeros(9, 128), "layout": _layout(9), "transformer_options": opts},
+            {"img": torch.zeros(9, 128), "layout": _layout(7), "transformer_options": opts},
             {"original_block": mixed_block},
         )
 
@@ -100,6 +108,7 @@ def test_valid_external_mixed_sequence_uses_sol_then_native_grid_resumes(monkeyp
     assert state.external_mixed_sol_calls == 1
     assert state.external_mixed_q_rows == state.external_mixed_kernel_q_rows == 9
     assert state.fallbacks["external_sequence_native"] == 0
+    assert state.fallbacks["external_sequence_layout"] == 0
 
 
 def test_legacy_external_contract_stays_native(monkeypatch):
