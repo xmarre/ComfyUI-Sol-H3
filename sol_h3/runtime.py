@@ -204,8 +204,18 @@ def _external_sequence_prefix(contract, layout, rows):
             or native != start + temporal * source_rows
             or actual != start + prefix_t * prefix_rows + (temporal - prefix_t) * source_rows):
         return None, "external_sequence_contract"
+
+    # Flow's mixed-grid wrapper deliberately keeps the native low-grid carrier
+    # layout in the model payload while each wrapped transformer block executes
+    # a larger mixed hidden stream. Depending on wrapper ordering, Sol-H3 may
+    # therefore see either the mixed block layout (`actual`) or the native
+    # carrier layout (`native`). Both are valid evidence as long as the packed
+    # prefix agrees with the explicit API-2 contract.
+    layout_rows = getattr(layout, "seq_len", None)
+    if layout_rows not in {native, actual}:
+        return None, "external_sequence_layout"
     try:
-        current_prefix = prefix_length(layout, rows)
+        current_prefix = prefix_length(layout, layout_rows)
     except RuntimeError:
         return None, "external_sequence_layout"
     if current_prefix != start:
