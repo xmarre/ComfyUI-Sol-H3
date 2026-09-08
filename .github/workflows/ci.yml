@@ -78,7 +78,7 @@ jobs:
       - run: pip install torch==2.10.0+cpu torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
       - run: pip install -r _deps/ComfyUI/requirements.txt
       - run: pip install -e '.[test]'
-      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py
+      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py tests/test_real_diffaid_stack.py
         env:
           COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
           KJNODES_PATH: ${{ github.workspace }}/_deps/KJNodes
