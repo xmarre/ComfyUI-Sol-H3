@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xmarre/ComfyUI-VDN-H3-Plus
-          ref: c05a7a8ddd457e17bc459f6eca97b4683c3803c9
+          ref: 748c85e7a2574075efe690b04037a46d1a0c4360
           path: _deps/VDN
           persist-credentials: false
       - uses: actions/setup-python@v5
