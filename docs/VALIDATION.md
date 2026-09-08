@@ -1,6 +1,18 @@
 # Validation status and RTX PRO 6000 commands
 
-The current revision combines Exact Runtime, rectangular Sana/CuTe SM120 attention, VDN provider API v3, and explicit Flow API-2 mixed-grid SOL routing.
+The current revision combines Exact Runtime, rectangular Sana/CuTe SM120 attention, VDN provider API v3, explicit Flow API-2 mixed-grid SOL routing, and Spectrum backend-history coordination through the audited MiniMax-H3 Diff-Aid replacement chain.
+
+## Current reviewed companion set
+
+```text
+Sol-H3         feature/native-sol-h3
+Spectrum #104  34f3c3d6c8ca738b76694a6321650e2db9bc892d
+VDN #8         b6f0755c4172ec5c17386c56998f454e78b2a2d4
+VDN #11        5b63dc670229d419a6350b64f7ceda609dbc8194
+Sana           2936c47637380842aaa4a4488fac5006cc542b70
+```
+
+Flow-Aligned Regenerate's API-2 `mixed_grid_low_suffix` producer is already merged/released in v0.3.0. Sol-H3 consumes that explicit contract; it does not infer arbitrary mixed layouts.
 
 ## What is already proven
 
@@ -29,9 +41,16 @@ rel_l2 = 0.003004377940669656
 
 The rectangular SM120 GPU suite later passed **9 tests**, covering rectangular all-selected and sparse-sink behavior.
 
-### Production native-grid rectangular VDN
+### Production native-grid rectangular VDN v3
 
-A live Comfy production run with VDN + DiffAid + Untwist + SOL + Spectrum + progressive/Continuum completed successfully on the rectangular revision. Native stages reported:
+Full SOL-enabled production runs with VDN + DiffAid + Untwist + SOL + Spectrum + progressive/Continuum now confirm that VDN provider API v3 is active:
+
+```text
+VDN object patches=50
+softmax-provider module API=3
+```
+
+Native stages reported:
 
 | Stage | Rectangular SOL calls | Requested Q rows | Kernel Q rows | Square-expanded calls |
 |---|---:|---:|---:|---:|
@@ -39,7 +58,25 @@ A live Comfy production run with VDN + DiffAid + Untwist + SOL + Spectrum + prog
 | First high grid | 1,056 | 4,972,800 | 4,972,800 | 0 |
 | Later high grid | 1,248 | 5,967,360 | 5,967,360 | 0 |
 
-That run used the prior VDN provider API v2. Sol-H3 already executed only requested Q, but VDN still constructed the unused v2 `square_q` compatibility payload. Current VDN PR #11 API v3 removes that gather/allocation. The v3 integration is structurally/CI validated; its GPU timing improvement has not yet been measured.
+Thus the preferred v3 path executes direct rectangular Q/KV domains and does not construct the old v2-only square-Q compatibility payload for Sol-H3. This proves route activation and removes the historical square-Q kernel expansion. The available production timings are not a clean v3-only A/B because compile/cache state and Spectrum NFE schedules differ between runs.
+
+### Production Flow mixed-grid SOL
+
+The explicit API-2 mixed stage is also now exercised on the production GPU stack:
+
+```text
+sol_eligible_calls               250
+external_mixed_sol_calls         192
+dense_warmup                      58
+external_mixed_q_rows       8,360,640
+external_mixed_kernel_q_rows 8,360,640
+compatibility_fallbacks           {}
+rel_l2                    0.0009817115
+```
+
+The 58 dense calls are expected from `dense_evaluations=1` plus two configured dense layers. The remaining eligible mixed calls execute packaged `cute_sm120`. Later target-grid stages resume ordinary rectangular native SOL.
+
+This proves coherent production routing and arithmetic behavior for the mixed path. It does not establish an isolated performance gain.
 
 ### Exact Runtime
 
@@ -52,28 +89,56 @@ Matched historical production A/B:
 
 This is Exact-only evidence, not a SOL speed claim.
 
+## Spectrum / Diff-Aid history compatibility
+
+Spectrum #104 is the generic backend-history consumer. It preflights provider identities and observes actual receipts before retaining H3 anchors. Sol-H3 must therefore prove its own replacement/routing topology; Spectrum does not declare Sol, Diff-Aid or Untwist transparent by name.
+
+Production exposed one important provider-side gap. The prior Sol history policy accepted only a bare Sol `BlockPatch`, while the real workflow composes MiniMax-H3 Diff-Aid around the DIT replacement. Sol therefore reported the route as opaque and Spectrum correctly forced actual transformer execution.
+
+Current Sol-H3 recognizes only the audited Diff-Aid H3 activation-only chain when Diff-Aid publishes its existing Spectrum runtime declaration:
+
+```text
+spectrum_h3_external_patch_runtime
+provider = comfyui-diffaid-patches
+schema = 1
+valid instance id
+```
+
+Both valid Sol/Diff-Aid wrapper orders are supported. Static Diff-Aid configuration is included in the history identity. Changing normalized sigma is excluded because Spectrum's existing external-patch compatibility layer owns patch-regime transitions. Cycles, duplicate/mismatched Sol patches, unknown wrappers, and missing Diff-Aid declarations remain opaque/actual-only. Untwist is not generically declared history-transparent through this mechanism.
+
+The native interoperability suite covers both valid wrapper orders, stable identity across changing normalized sigma, repeated sampling scopes, missing declarations, and unknown wrappers.
+
 ## Current CI evidence
 
-The validated mirror code passes:
+Spectrum #104 was rebased directly onto v0.2.25/current `main` and reconsolidated to one commit:
 
 ```text
-full Sol-H3 suite: 90 passed, 42 skipped, 2 warnings
-native interoperability: 24 passed
-Ruff: pass
-pip check: pass
+Spectrum head: 34f3c3d6c8ca738b76694a6321650e2db9bc892d
+Spectrum mirror CI #595: 34274660434 — 9/9 green
+Spectrum final CI  #596: 34274812445 — 9/9 green
 ```
 
-The native lane checks the sequential VDN overlay order:
+Sol-H3 was then repinned to that exact Spectrum head and revalidated:
 
 ```text
-VDN PR #8 b6f0755c4172ec5c17386c56998f454e78b2a2d4
-then
-VDN PR #11 5b63dc670229d419a6350b64f7ceda609dbc8194
+Sol repin mirror: mirror/spectrum-104-repin-20260908
+mirror head:      5625b55cdd7bae8e05e2c733baf5dbec28c46dab
+mirror tree:      4c1ec90b0faabb0aafdb7e3eb9c256930e9783a6
+mirror CI #158:   34274917627 — CPU-contract + native-interop green
 ```
 
-and covers real Comfy ModelPatcher integration, KJ wrappers, Spectrum wrapper ordering, VDN API v3, lazy v2 compatibility, Flow API-2 mixed-grid SOL routing, malformed-contract fallback, and mixed -> later-native SOL resumption.
+The final one-commit Sol branch before this documentation sync was:
 
-CPU tests use explicit CPU substitutes where GPU kernels are unavailable. They do not establish GPU performance or decoded-media quality.
+```text
+head:   9b3f96b7aa1360ad9ce196e402955414f86842ff
+parent: 5db282ca836416a32cf114346b946fe75136e4f1
+tree:   4c1ec90b0faabb0aafdb7e3eb9c256930e9783a6
+CI #160: 34275146796 — CPU-contract + native-interop green
+```
+
+The final documentation-sync head will supersede that SHA while preserving the same implementation behavior and one-commit PR topology.
+
+CPU tests use explicit CPU substitutes where GPU kernels are unavailable. They establish contracts/composition, not GPU performance or decoded-media quality.
 
 ## Current checkout: dependency and source checks
 
@@ -162,12 +227,13 @@ Restart ComfyUI after updating the node/companions and preserve the workflow set
 | E | VDN flex + SOL | Masked Flex stays native; existing grouped fallback may then use v3 |
 | F | VDN full coverage + SOL | Eligible softmax can use SOL; VDN learned gate remains active |
 | G | VDN + Spectrum + SOL | Stable grouped/full routing may forecast only after qualified actual history |
-| H | Flow API-2 `mixed_grid_low_suffix` | Explicit contract can route whole-sequence external attention through SOL; VDN external gate semantics retained, linear complement disabled |
-| I | Mixed-grid stage -> later native grid | `sol_external_mixed` during valid mixed stage, then normal native SOL may resume |
+| H | Flow API-2 `mixed_grid_low_suffix` | Explicit contract routes coherent whole-sequence external attention through SOL; VDN external gate retained, linear complement disabled |
+| I | Mixed-grid stage -> later native grid | `sol_external_mixed` during valid mixed stage, then normal native SOL resumes |
 | J | Malformed/unknown external contract | Local `external_sequence_*` fallback, generation continues |
 | K | Repeated Continuum chunks | Fresh Sol-H3 request state, no stale VDN/Spectrum/provider state |
 | L | Untwist + SOL + VDN | Full-domain preprocess occurs once before VDN gather; coordinates preserved |
-| M | Runtime DoRA/LoRA + DiffAid + preview/progressive stack | Projection/hooks preserved; unsupported ownership delegated explicitly |
+| M | Runtime DoRA/LoRA + DiffAid + preview/progressive stack | Projection/hooks preserved; audited Diff-Aid replacement chain keeps qualified Spectrum history |
+| N | Diff-Aid outside Sol / Sol outside Diff-Aid | Both audited wrapper orders produce stable backend identities; unknown wrappers remain actual-only |
 
 ## Native-grid success counters
 
@@ -205,18 +271,35 @@ sol_external_mixed
 
 The current implementation intentionally does not infer arbitrary external layouts. `external_sequence_native`, `external_sequence_contract`, or `external_sequence_layout` means that particular call delegated to inherited attention.
 
-The newly enabled mixed-grid SOL path is not yet production-GPU/media validated. The previous successful progressive run predates this route and correctly kept the mixed stage dense. A new run is needed before claiming mixed-grid quality or performance.
+Production has already established `192` external mixed SOL calls and `8,360,640` requested/kernel Q rows with no compatibility fallbacks in the cited run. Future A/Bs still need matched NFE schedules before timing attribution.
 
-## Spectrum interpretation
+## Performance interpretation: compare NFE schedules first
 
-Spectrum may forecast only from qualified history matching the current numerical attention owner. Important transitions include:
+The most recent control exposed a large Spectrum schedule confound.
 
-- dense provider demotion;
-- native <-> SOL route changes;
-- external mixed <-> normal native-grid transitions;
-- opaque Flex/fallback outcomes.
+| | SOL enabled, prior hot run | SOL bypassed |
+|---|---:|---:|
+| End-to-end | 366.90 s | 287.51 s |
+| Continuum sampler | 320.98 s | 240.55 s |
+| Target-grid invocation | 144.44 s | 96.63 s |
+| Mixed-grid invocation | 169.37 s | 136.64 s |
+| Logical calls | 18 | 18 |
+| Actual transformer NFEs | **18** | **13** |
+| Spectrum forecasts | **0** | **5** |
 
-A history reset is not a runtime incompatibility. It is the conservative response to a changed numerical backend.
+The five avoided transformer calls are roughly an 80-90 s amount of work from neighboring actual-call timings, approximately the observed sampler delta. Therefore the raw wall-time difference is not evidence that SOL itself is ~25% slower.
+
+The next SOL-enabled run must inspect these counters before wall-time interpretation:
+
+```text
+sampler_logical_calls
+transformer_actual_nfe
+spectrum_forecast_calls
+```
+
+Spectrum forecasts should reappear with the corrected provider history. Do not require exactly 13 actual + 5 forecast: legitimate dense/SOL ownership transitions can require fresh actual anchors. Once schedules are comparable, normalize target-grid/mixed-grid time by actual transformer NFEs and then evaluate SOL cost.
+
+A possible later optimization target is the native SOL adapter's Q/K/V transpose+contiguous materialization versus suitable innermost-contiguous strided packed views accepted by the packaged Sana interface. Do not change that before the corrected schedule-matched production rerun; the previous five-NFE discrepancy is large enough to invalidate performance attribution.
 
 ## Performance and media acceptance
 
@@ -241,7 +324,9 @@ cold/warm latency
 sampler wall time
 end-to-end wall time
 peak allocated/reserved VRAM
-actual/forecast transformer counts
+sampler_logical_calls
+transformer_actual_nfe
+spectrum_forecast_calls
 sol_eligible_calls
 sparse_calls
 dense_warmup
