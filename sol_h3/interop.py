@@ -143,6 +143,96 @@ def _diffaid_replacement_identity(patch, options):
     )
 
 
+def _flow_mixed_grid_replacement_identity(patch, block_index):
+    """Recognize Flow v0.3.x's audited exact-prefix mixed-grid block wrapper.
+
+    Flow constructs one wrapper per H3 block immediately outside the existing DiT
+    replacement chain. The wrapper deterministically changes only the block-local
+    packed geometry/RoPE/modulation metadata, publishes VDN external-sequence API 2,
+    and then delegates to the previous replacement. Spectrum preflights before the
+    wrapper executes, so treating this known closure as opaque would turn every
+    scheduler forecast into an actual transformer NFE. Describe the geometry here
+    without executing the wrapper; unknown or malformed closures remain opaque.
+    """
+    module = str(getattr(patch, "__module__", ""))
+    qualname = str(getattr(patch, "__qualname__", ""))
+    if not (
+        (module == "h3_flow_regenerate.mixed_grid" or module.endswith(".h3_flow_regenerate.mixed_grid"))
+        and qualname.endswith("mixed_diffusion_wrapper.<locals>.wrap.<locals>.call")
+    ):
+        return None
+
+    values = _closure_values(patch)
+    required = {"layer", "previous", "plan", "layout", "mixed_layout", "va", "vb", "old_prefix", "inner"}
+    if values is None or not required.issubset(values):
+        return None
+    if type(values["layer"]) is not int or values["layer"] != int(block_index):
+        return None
+
+    plan = values["plan"]
+    layout = values["layout"]
+    mixed_layout = values["mixed_layout"]
+    inner = values["inner"]
+    try:
+        prefix_t = int(plan.prefix_t)
+        temporal = int(plan.temporal)
+        source_rows = int(plan.source_rows)
+        target_rows = int(plan.target_rows)
+        prefix_rows = int(plan.prefix_rows)
+        mixed_rows = int(plan.mixed_rows)
+        target_hw = tuple(int(value) for value in plan.target_hw)
+        va = int(values["va"])
+        vb = int(values["vb"])
+        old_prefix = int(values["old_prefix"])
+        native_rows = int(layout.seq_len)
+        mixed_sequence_rows = int(mixed_layout.seq_len)
+        native_segments = tuple(layout.segments)
+        mixed_segments = tuple(mixed_layout.segments)
+        inner_blocks = len(inner.blocks)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    if (
+        not 0 < prefix_t < temporal
+        or source_rows <= 0
+        or target_rows <= source_rows
+        or len(target_hw) != 2
+        or any(value <= 0 or value % 2 for value in target_hw)
+        or prefix_rows != prefix_t * target_rows
+        or old_prefix != prefix_t * source_rows
+        or mixed_rows != prefix_rows + (temporal - prefix_t) * source_rows
+        or va < 0
+        or vb != va + temporal * source_rows
+        or native_rows != vb
+        or mixed_sequence_rows != va + mixed_rows
+        or not native_segments
+        or native_segments[-1] != (va, vb, "video")
+        or not mixed_segments
+        or mixed_segments[-1] != (va, mixed_sequence_rows, "video")
+        or not isinstance(getattr(mixed_layout, "signature", None), tuple)
+        or not mixed_layout.signature
+        or mixed_layout.signature[0] != "h3_flow_mixed_grid_v1"
+        or block_index < 0
+        or block_index >= inner_blocks
+    ):
+        return None
+
+    identity = (
+        "h3_flow_mixed_grid_v1",
+        native_rows,
+        mixed_sequence_rows,
+        va,
+        temporal,
+        prefix_t,
+        source_rows,
+        target_rows,
+        target_hw,
+        repr(getattr(layout, "signature", None)),
+        repr(mixed_layout.signature),
+    )
+    return identity, values["previous"]
+
+
 def _replacement_history_identity(patch, block_index, config, options):
     """Describe one proven-transparent replacement chain containing Sol-H3 once.
 
@@ -169,7 +259,9 @@ def _replacement_history_identity(patch, block_index, config, options):
             chain.append(("sol_h3_block_patch", config.metadata()["fingerprint"]))
             current = current.previous
             continue
-        declared = _diffaid_replacement_identity(current, options)
+        declared = _flow_mixed_grid_replacement_identity(current, block_index)
+        if declared is None:
+            declared = _diffaid_replacement_identity(current, options)
         if declared is None:
             return None
         identity, current = declared
