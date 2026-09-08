@@ -93,7 +93,7 @@ def test_actual_kj_sage_wrapper_and_comfy_recursion(native, monkeypatch, mode):
     assert state.sparse_calls == 1
 
 
-def test_real_modelpatcher_vdn_v2_object_patch_reaches_sol(monkeypatch):
+def test_real_modelpatcher_vdn_v3_object_patch_reaches_sol(monkeypatch):
     vdn_path = os.environ.get("VDN_PATH")
     if not vdn_path:
         pytest.skip("set VDN_PATH for real VDN ModelPatcher integration")
@@ -111,7 +111,7 @@ def test_real_modelpatcher_vdn_v2_object_patch_reaches_sol(monkeypatch):
     from sol_h3.contracts import Config
     from sol_h3.runtime import install, _REQUEST
 
-    assert PROVIDER_API_VERSION == 2
+    assert PROVIDER_API_VERSION == 3
     torch.manual_seed(41)
     inner = MiniMaxH3Model(
         hidden_size=128, num_layers=3, token_refiner_num_layers=0,
