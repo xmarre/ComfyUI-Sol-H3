@@ -58,6 +58,12 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
+          repository: xmarre/ComfyUI-DiffAid-Patches
+          ref: ba9d9efbcf7e64c755e068cb76547d8cc85481eb
+          path: _deps/DiffAid
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
           repository: xmarre/ComfyUI-VDN-H3-Plus
           ref: b6f0755c4172ec5c17386c56998f454e78b2a2d4
           path: _deps/VDN
@@ -78,4 +84,5 @@ jobs:
           KJNODES_PATH: ${{ github.workspace }}/_deps/KJNodes
           SPECTRUM_PATH: ${{ github.workspace }}/_deps/Spectrum
           UNTWIST_PATH: ${{ github.workspace }}/_deps/Untwist
+          DIFFAID_PATH: ${{ github.workspace }}/_deps/DiffAid
           VDN_PATH: ${{ github.workspace }}/_deps/VDN
