@@ -58,8 +58,8 @@ jobs:
           persist-credentials: false
       - name: Apply VDN SOL-provider overlay after audio overlay
         run: |
-          git -C _deps/VDN fetch origin e8a1e528b798fcfef2c0cc976cb881badb57d6f1
-          git -C _deps/VDN -c user.name=ci -c user.email=ci@example.invalid cherry-pick e8a1e528b798fcfef2c0cc976cb881badb57d6f1
+          git -C _deps/VDN fetch origin 5b63dc670229d419a6350b64f7ceda609dbc8194
+          git -C _deps/VDN -c user.name=ci -c user.email=ci@example.invalid cherry-pick 5b63dc670229d419a6350b64f7ceda609dbc8194
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
