@@ -1,6 +1,6 @@
 # ComfyUI-Sol-H3
 
-Native MiniMax-H3 affine fusion and experimental NVIDIA BF16 CuTe SOL attention for ComfyUI. **Draft: no production SM120, performance or audiovisual validation yet.**
+Native MiniMax-H3 affine fusion and experimental NVIDIA BF16 CuTe SOL attention for ComfyUI. **Draft: Exact Runtime has production RTX PRO 6000 evidence; sparse SOL and the new interoperability paths still require current-head GPU/performance/audiovisual validation.**
 
 ComfyUI already provides a separate Block Sparse Attention implementation through `comfy-kitchen`. Its chunked/int8 H3 producer differs from this repository's pinned NVIDIA BF16 kernel and routing policy. Keep both as separate A/B baselines.
 
@@ -16,7 +16,7 @@ Exact fusion preserves native intermediate affine rounding. It retains norms, Ad
 
 ## Optional interoperability companions
 
-- [VDN-H3-Plus #11](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/11): restricted softmax-subcall provider contract.
+- [VDN-H3-Plus #11](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/11): restricted softmax-subcall provider contract, including v2 restricted-domain square expansion for SOL's square-QKV kernel.
 - [Spectrum #104](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/pull/104): numerical attention policy/receipt history coordination.
 - [Untwisting RoPE #9](https://github.com/xmarre/ComfyUI-Untwisting-RoPE/pull/9): pure QKV preprocessing contract.
 
@@ -26,17 +26,17 @@ These remain draft and require combined runtime validation. They are not automat
 |---|---|---|
 | Sage/Sage3 or generic dense override + SOL | SOL on eligible calls; inherited provider on dense-required rows/calls | Real Comfy/KJ Python wrappers, CPU kernel substitutions |
 | VDN full coverage + SOL | Softmax component can use SOL; learned gate remains active | Real VDN/H3/Spectrum dispatch with CPU oracle |
-| VDN grouped + SOL | Only square, aligned local domains can use SOL; rectangular/global/anchor calls retain native SDPA | Restricted-domain and native math tests |
-| VDN flex + SOL | Masked Flex remains native; its existing grouped fallback remains available | Mask tests and Flex-to-grouped CPU fallback; no Flex GPU execution |
-| VDN reduced/mixed API 1/2 | Inherited gated attention for the current external sequence; later eligible native calls may resume SOL | Component contract tests; full Flow workflow outstanding |
+| VDN grouped + SOL | v2 expands each already-restricted local KV domain to matching square Q, runs SOL there when eligible, then selects only the original VDN query rows; global/anchor operations remain native | Exact restricted-domain oracle tests plus real ModelPatcher object-patch integration test |
+| VDN flex + SOL | Masked Flex remains native; its existing grouped fallback can then use the grouped v2 contract | Mask tests and Flex-to-grouped CPU fallback; no Flex GPU execution |
+| VDN reduced/mixed API 1/2 | Inherited gated attention for the current external sequence; later eligible native calls may resume SOL | Component contract tests; full Flow workflow GPU rerun outstanding |
 | Spectrum + SOL | Actual backend receipts qualify history; policy/receipt changes reset histories before capture | Both real wrapper orders and repeated CPU sampling scopes |
 | Core Block Sparse Attention + SOL | Explicit block attention ownership wins; other calls follow SOL eligibility | Source audit and ownership contracts; GPU stack outstanding |
 | Core Block Sparse Attention + Spectrum | Actual-only while core lacks a predictive backend-history contract | Consumer contract test; no forecasting speedup claimed |
-| Untwist + SOL | New pure QKV contract preserves K scaling once, including dense prefixes | Transform tests; legacy overrides retain native fallback |
+| Untwist + SOL | Pure QKV contract preserves K scaling once, including VDN's full post-RoPE domain before local gathers | Transform tests plus real ModelPatcher VDN/SOL preprocessing regression |
 | DiffAid / Flow / other block replacements | Delegate current arguments; unsupported layouts use inherited calls | Source/contract evidence; opaque replacement history remains actual-only |
 | Runtime adapters, ordinary LoRA, curve AdaLN, KJ preview | Native submodules/hooks remain active; unsupported Exact ownership uses native block | Source and projection-hook tests; full GPU/media stack outstanding |
 
-VDN's normal local windows include prefix KV and are often rectangular. **Running VDN + SOL does not imply VDN-local SOL calls or a speedup.** The linear complement, local/window domains, anchors and softmax gate remain VDN-owned. The integration does not broaden local attention to full-sequence attention.
+VDN remains the owner of its trained local/window geometry, anchors, learned softmax gate and linear complement. The v2 bridge does **not** broaden a local VDN operation to unrestricted model attention: it evaluates extra query rows only over the same already-restricted KV domain so the NVIDIA square-QKV kernel can run, then discards those extra query outputs. This adds query/gather overhead, so successful VDN-local SOL execution does not by itself establish a speedup.
 
 Spectrum histories use `attention_backend_history_v1` preflight policies and `attention_backend_receipts_v1` actual receipts. Unpredictable routing executes actual calls rather than using unqualified anchors. Transitions clear stage histories/controllers and incompatible offline archives; offline replay may therefore be unavailable for a changing backend. With older Spectrum lacking the consumer contract, SOL delegates its affected attention calls to the inherited provider.
 
@@ -44,7 +44,7 @@ Spectrum histories use `attention_backend_history_v1` preflight policies and `at
 
 Eligible Q/K/V are BF16, matching `[1, heads, rows, 128]` tensors on SM120, with supported unmasked attention flags and a current contiguous packed prefix/video-tail layout. Unsupported calls delegate locally and do not permanently disable later eligible calls.
 
-The full prefix is a KV sink. Every prefix query is recomputed by the inherited dense backend. The all-selected arithmetic gate instead uses **independent BF16 SDPA**, so approximate Sage arithmetic cannot falsely fail the SOL kernel gate. The gate tests arithmetic, not sparse output quality. Pure QKV preprocessing contracts run before SOL and its reference; prefix recomputation uses the remaining dense provider without repeating the transformation.
+For ordinary native H3 attention the full prefix is a KV sink and every prefix query is recomputed by the inherited dense backend. VDN v2 differs deliberately: its square-expanded prefix/global query rows are auxiliary outputs that VDN discards, so SOL keeps those rows as sink KV without paying a second dense query recomputation. The all-selected arithmetic gate uses **independent BF16 SDPA**, so approximate Sage arithmetic cannot falsely fail the SOL kernel gate. The gate tests arithmetic, not sparse output quality. Pure QKV preprocessing contracts run before SOL and its reference without repeating the transformation.
 
 Sources are SHA-256 verified before import. Missing or mismatched optional kernel dependencies cause recorded native fallback; their code is not accepted as the requested kernel. A kernel that actually runs and fails its arithmetic gate still raises. SOL-BSA, learned distillation, full-width AdaLN schedule-table eviction and distributed execution are not implemented.
 
@@ -82,8 +82,8 @@ python -m ruff check .
 python -m pytest -q
 ```
 
-Set `COMFYUI_PATH`, `KJNODES_PATH`, `SPECTRUM_PATH`, and `VDN_PATH` to their checkouts to enable the real-wrapper/stack tests. GPU skips and CPU oracle substitutions are not GPU validation. See [VALIDATION](docs/VALIDATION.md) for RTX PRO 6000 commands and the required media matrix.
+Set `COMFYUI_PATH`, `KJNODES_PATH`, `SPECTRUM_PATH`, and `VDN_PATH` to their checkouts to enable the real-wrapper/stack tests. GPU skips and CPU oracle substitutions are not GPU validation. See [VALIDATION](docs/VALIDATION.md) for RTX PRO 6000 evidence, commands and the remaining media matrix.
 
-Sampling logs expose actual evaluations, SOL-eligible calls, sparse calls, dense warmup, fallback reasons, VDN-local SOL calls, backend transitions, inherited dense providers and arithmetic gates. Spectrum reports backend-history resets and opaque actual calls separately. A successful run with zero sparse calls is valid telemetry and cannot be used as a SOL performance sample.
+Sampling logs expose actual evaluations, SOL-eligible calls, sparse calls, dense warmup, fallback reasons, VDN-local SOL calls, VDN square-expansion requested/kernel row counts, backend transitions, inherited dense providers and arithmetic gates. Spectrum reports backend-history resets and opaque actual calls separately. A successful run with zero sparse calls is valid telemetry and cannot be used as a SOL performance sample.
 
 See [AUDIT](docs/AUDIT.md) for ownership decisions and remaining limitations. GPL-3.0-or-later; see LICENSE and NOTICE.
