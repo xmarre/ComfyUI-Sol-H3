@@ -7,6 +7,7 @@ VDN_KEY = "vdn_softmax_provider_v1"
 VDN_KEY_V2 = "vdn_softmax_provider_v2"
 VDN_KEY_V3 = "vdn_softmax_provider_v3"
 VDN_PREPROCESS_KEY = "vdn_attention_preprocess_v1"
+SPECTRUM_EXTERNAL_RUNTIME_KEY = "spectrum_h3_external_patch_runtime"
 
 
 def provider_name(provider):
@@ -89,9 +90,100 @@ def _vdn_history_identity(forward, options, layout):
     )
 
 
+def _diffaid_runtime_identity(options):
+    """Return stable Diff-Aid instance identities published to transformer options.
+
+    Diff-Aid's Spectrum compatibility layer publishes one runtime entry per active
+    MiniMax-H3 patch instance before Spectrum preflights attention history. The
+    normalized sigma in that payload is intentionally excluded: Spectrum already
+    owns patch-regime transitions, while Sol-H3 only needs proof that a known
+    activation-only replacement is the wrapper around its block patch.
+    """
+    raw = options.get(SPECTRUM_EXTERNAL_RUNTIME_KEY)
+    if raw is None:
+        return ()
+    entries = raw if isinstance(raw, (tuple, list)) else (raw,)
+    identities = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("provider") != "comfyui-diffaid-patches" or entry.get("schema_version") != 1:
+            continue
+        instance = entry.get("instance_id")
+        if not isinstance(instance, str) or not instance:
+            continue
+        identities.append(("comfyui-diffaid-patches", 1, instance))
+    return tuple(sorted(set(identities)))
+
+
+def _diffaid_replacement_identity(patch, options):
+    """Recognize the audited MiniMax-H3 Diff-Aid activation-only block wrapper.
+
+    This deliberately requires Diff-Aid's per-call Spectrum runtime declaration.
+    A same-named or structurally similar wrapper without that declaration remains
+    opaque. The replacement itself only modulates ``args['img']`` and delegates to
+    ``existing_patch``/``original_block``; it does not own attention routing.
+    """
+    cls = type(patch)
+    if cls.__name__ != "MiniMaxH3BlockReplacePatch" or "diffaid" not in cls.__module__.lower():
+        return None
+    runtime_identity = _diffaid_runtime_identity(options)
+    if not runtime_identity or not hasattr(patch, "existing_patch"):
+        return None
+    config = getattr(patch, "config", None)
+    fields = (
+        "strength", "sigma_start", "sigma_end", "sigma_ramp",
+        "token_weight_mode", "token_tail", "cond_only",
+    )
+    if config is None or any(not hasattr(config, name) for name in fields):
+        return None
+    config_identity = tuple((name, _freeze_history_value(getattr(config, name))) for name in fields)
+    return (
+        ("spectrum_declared_diffaid_h3_v1", runtime_identity, config_identity),
+        patch.existing_patch,
+    )
+
+
+def _replacement_history_identity(patch, block_index, config, options):
+    """Describe one proven-transparent replacement chain containing Sol-H3 once.
+
+    Unknown replacement wrappers remain opaque. This is intentionally stricter
+    than merely observing a previous successful receipt: a forecast skips the
+    transformer and therefore cannot discover a later wrapper-owned route change.
+    """
+    from .runtime import BlockPatch
+
+    current = patch
+    seen = set()
+    chain = []
+    sol_count = 0
+    while current is not None:
+        if id(current) in seen:
+            return None
+        seen.add(id(current))
+        if isinstance(current, BlockPatch):
+            if current.index != block_index or current.config != config:
+                return None
+            sol_count += 1
+            if sol_count != 1:
+                return None
+            chain.append(("sol_h3_block_patch", config.metadata()["fingerprint"]))
+            current = current.previous
+            continue
+        declared = _diffaid_replacement_identity(current, options)
+        if declared is None:
+            return None
+        identity, current = declared
+        chain.append(identity)
+    if sol_count != 1:
+        return None
+    return tuple(chain)
+
+
 @dataclass(frozen=True)
 class HistoryPolicy:
     config: object
+    block_count: int | None = None
 
     def __call__(self, *, layout, options, model):
         # Called BEFORE Spectrum decides whether to use an anchor. Never advances
@@ -102,10 +194,13 @@ class HistoryPolicy:
         if state is None:
             return None
         replacements = options.get("patches_replace", {}).get("dit", {})
-        from .runtime import BlockPatch
-        for patch in replacements.values():
-            if not isinstance(patch, BlockPatch) or patch.previous is not None:
+        replacement_identity = []
+        for index in range(len(model.blocks)):
+            patch = replacements.get(("double_block", index))
+            identity = _replacement_history_identity(patch, index, self.config, options)
+            if identity is None:
                 return None
+            replacement_identity.append(identity)
         vdn = []
         for block in model.blocks:
             forward = block.attn.forward
@@ -118,19 +213,26 @@ class HistoryPolicy:
         phase = "dense" if state.evaluations < self.config.dense_evaluations else "sol"
         return (self.config.metadata()["fingerprint"], phase, repr(signature),
                 getattr(layout, "seq_len", None), tuple(getattr(layout, "segments", ())),
-                str(getattr(model, "dtype", None)),
+                str(getattr(model, "dtype", None)), tuple(replacement_identity),
                 provider_identity(
                     options.get("optimized_attention_override"),
                     state.disabled_dense_providers,
                 ), tuple(vdn))
 
     def accept_receipts(self, receipts):
-        return bool(receipts) and all(
+        valid = bool(receipts) and all(
             len(item) == 3 and item[0] == "sol_h3" and item[2] in (
                 "sol", "sol_external_mixed", "dense_warmup", "vdn_local_sol", "vdn_dense_warmup",
                 "vdn_local_native", "vdn_global_native", "vdn_anchor_native",
                 "vdn_flex_masked_native", "external_sequence_native")
             for item in receipts)
+        if not valid or self.block_count is None:
+            return valid
+        blocks = {
+            item[1] for item in receipts
+            if type(item[1]) is int and 0 <= item[1] < self.block_count
+        }
+        return blocks == set(range(self.block_count))
 
 
 def provider_identity(provider, disabled_dense_providers=()):
