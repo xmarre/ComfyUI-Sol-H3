@@ -1,0 +1,22 @@
+ComfyUI-Sol-H3
+Copyright (C) 2026 ComfyUI-Sol-H3 contributors
+Licensed under GNU GPL version 3 or later.
+
+The native DiT block integration follows ComfyUI's GPL-3.0 code and preserves
+its mathematical ordering. The source contract was originally derived from
+ComfyUI 9ac7352f70b2206d4ef7a345b30106d0fa3807d1,
+comfy/ldm/minimax/model.py, and rechecked against current audited head
+41db8f4fa1587d139e412a57b9b69394e3b13f95. The intervening commit changes
+only comfy/model_management.py; the MiniMax-H3 block/modulation source and
+canonical source hashes are unchanged. ComfyUI copyright belongs to its
+respective contributors.
+
+The affine Triton kernel and Sol-H3 integration/interop code are authored for
+this project. They are informed by the published NVIDIA/Sana Sol-H3 and
+Sol-Attn contracts.
+
+Sparse attention execution uses the `sol_attn` public API supplied by the
+ComfyUI installation's `comfy-kitchen` package. comfy-kitchen is Copyright
+(c) 2025 Comfy Org and is licensed under the Apache License 2.0. This project
+does not redistribute comfy-kitchen or the previous Sana/CuTe Sol-Attn source;
+it links to the already-installed ComfyUI runtime API.
