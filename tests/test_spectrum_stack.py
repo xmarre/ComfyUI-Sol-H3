@@ -110,9 +110,14 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
                 assert state.vdn_square_expanded_calls > 0
                 assert state.vdn_square_kernel_rows > state.vdn_square_requested_rows > 0
                 assert state.fallbacks["vdn_global_native"] > 0
-                if vdn_mode == "flex":
-                    assert state.fallbacks["vdn_flex_masked_native"] > 0
-            assert spectrum.stats.forecast_model_calls > 0
+            if vdn_mode == "flex":
+                # Flex can fail into grouped at runtime and the stack-compatible VDN
+                # overlay intentionally does not own hybrid.py, so preflight cannot
+                # prove that route. Spectrum must execute actuals rather than forecast
+                # across an opaque transition; the grouped fallback still consumes SOL.
+                assert spectrum.stats.forecast_model_calls == 0
+            else:
+                assert spectrum.stats.forecast_model_calls > 0
         with torch.no_grad():
             SamplingWrapper(cfg)(sample)
         spectrum.end_run(run)
