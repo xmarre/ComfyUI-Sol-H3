@@ -64,6 +64,12 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: fe0ef8752b92081b5a85bc9b39ad8e2a7037d591
+          path: _deps/Flow
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
           repository: xmarre/ComfyUI-VDN-H3-Plus
           ref: b6f0755c4172ec5c17386c56998f454e78b2a2d4
           path: _deps/VDN
@@ -78,11 +84,12 @@ jobs:
       - run: pip install torch==2.10.0+cpu torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
       - run: pip install -r _deps/ComfyUI/requirements.txt
       - run: pip install -e '.[test]'
-      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py tests/test_real_diffaid_stack.py
+      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py tests/test_real_diffaid_stack.py tests/test_flow_mixed_history.py
         env:
           COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
           KJNODES_PATH: ${{ github.workspace }}/_deps/KJNodes
           SPECTRUM_PATH: ${{ github.workspace }}/_deps/Spectrum
           UNTWIST_PATH: ${{ github.workspace }}/_deps/Untwist
           DIFFAID_PATH: ${{ github.workspace }}/_deps/DiffAid
+          FLOW_PATH: ${{ github.workspace }}/_deps/Flow
           VDN_PATH: ${{ github.workspace }}/_deps/VDN
