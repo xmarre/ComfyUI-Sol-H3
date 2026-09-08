@@ -80,6 +80,7 @@ def test_real_diffaid_runtime_declaration_remains_forecast_safe(monkeypatch, sol
     from comfy.ldm.minimax.model import MiniMaxH3Model, PackedLayout
     from comfy.patcher_extension import WrapperExecutor
     from comfyui_spectrum_h3.config import SpectrumH3Config
+    from comfyui_spectrum_h3.external_patch_compat import configure_runtime_external_patches
     from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
     from comfyui_spectrum_h3.minimax_h3 import diffusion_model_wrapper
     from comfyui_spectrum_h3.sampling import RUNTIME_KEY, RUN_ID_KEY, STEP_ID_KEY
@@ -229,6 +230,11 @@ def test_real_diffaid_runtime_declaration_remains_forecast_safe(monkeypatch, sol
             bootstrap_first_forecast=False,
             offline_smoothing_replay=False,
         )
+    )
+    configure_runtime_external_patches(
+        spectrum,
+        patched.model_options,
+        block_count=len(model.blocks),
     )
     sigmas = torch.linspace(1, 0, 9)
     run = spectrum.start_run(sigmas, "sample_euler", supported_sampler=True)
