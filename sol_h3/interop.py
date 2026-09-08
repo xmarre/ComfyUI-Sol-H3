@@ -5,6 +5,7 @@ HISTORY_KEY = "attention_backend_history_v1"
 RECEIPTS_KEY = "attention_backend_receipts_v1"
 VDN_KEY = "vdn_softmax_provider_v1"
 VDN_KEY_V2 = "vdn_softmax_provider_v2"
+VDN_KEY_V3 = "vdn_softmax_provider_v3"
 VDN_PREPROCESS_KEY = "vdn_attention_preprocess_v1"
 
 
@@ -126,7 +127,7 @@ class HistoryPolicy:
     def accept_receipts(self, receipts):
         return bool(receipts) and all(
             len(item) == 3 and item[0] == "sol_h3" and item[2] in (
-                "sol", "dense_warmup", "vdn_local_sol", "vdn_dense_warmup",
+                "sol", "sol_external_mixed", "dense_warmup", "vdn_local_sol", "vdn_dense_warmup",
                 "vdn_local_native", "vdn_global_native", "vdn_anchor_native",
                 "vdn_flex_masked_native", "external_sequence_native")
             for item in receipts)
