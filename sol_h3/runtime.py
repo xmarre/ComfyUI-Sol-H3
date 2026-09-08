@@ -137,6 +137,18 @@ def _preprocess_chain(provider, q, k, v, heads, kw):
     return q, k, v, provider
 
 
+def _vdn_provider_api():
+    """Return the installed VDN softmax-provider capability without owning hybrid.py."""
+    try:
+        from vdn_h3.softmax_provider import PROVIDER_API_VERSION
+    except (ImportError, AttributeError):
+        return None
+    try:
+        return int(PROVIDER_API_VERSION)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class BlockPatch:
     index: int
@@ -333,7 +345,7 @@ class BlockPatch:
         if config.backend == "sol" and len(routes) == route_start:
             attn_forward = getattr(getattr(model.blocks[self.index], "attn", None), "forward", None)
             if getattr(attn_forward, "_vdn_forward", False):
-                api = getattr(attn_forward, "_vdn_softmax_provider_api", None)
+                api = _vdn_provider_api()
                 if api is None:
                     record("vdn_provider_contract_missing", True)
                 elif api < 2:
@@ -380,12 +392,14 @@ def install(model, config):
             previous = replacements.get(("double_block", i))
             cloned.set_model_patch_replace(BlockPatch(i, config, previous), "dit", "double_block", i)
     if config.backend == "sol":
-        apis = Counter()
-        for i in range(len(inner.blocks)):
-            patched = cloned.object_patches.get(f"diffusion_model.blocks.{i}.attn.forward")
-            if getattr(patched, "_vdn_forward", False):
-                apis[str(getattr(patched, "_vdn_softmax_provider_api", "missing"))] += 1
-        if apis:
-            log.info("Sol-H3 detected VDN object-patch provider APIs: %s", dict(apis))
+        vdn_patches = sum(
+            bool(getattr(cloned.object_patches.get(
+                f"diffusion_model.blocks.{i}.attn.forward"), "_vdn_forward", False))
+            for i in range(len(inner.blocks))
+        )
+        if vdn_patches:
+            api = _vdn_provider_api()
+            log.info("Sol-H3 detected VDN object patches=%d; softmax-provider module API=%s",
+                     vdn_patches, api if api is not None else "missing")
     log.info("Sol-H3 active: %s; AdaLN precompute=%s", config.metadata(), adaln_status(inner))
     return cloned
