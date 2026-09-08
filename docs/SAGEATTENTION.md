@@ -20,7 +20,7 @@ That revision's root package is SageAttention 2.2.0 and its build supports compu
 
 Run these commands in the same Python environment that launches ComfyUI. For the documented production environment this is `comfy312`.
 
-First check the active environment and toolchain:
+First check the active environment and GPU:
 
 ```bash
 conda activate comfy312
@@ -28,26 +28,74 @@ which python
 python - <<'PY'
 import torch
 print('torch:', torch.__version__)
-print('torch CUDA:', torch.version.cuda)
+print('torch CUDA runtime:', torch.version.cuda)
 print('GPU:', torch.cuda.get_device_name(0))
 print('capability:', torch.cuda.get_device_capability(0))
 PY
-which nvcc
-nvcc --version
 /usr/bin/g++ --version
 ```
 
-For SM120, the capability check must report `(12, 0)` and the CUDA toolkit used for the build must be >=12.8.
+For SM120, the capability check must report `(12, 0)`.
 
-Install the normal build prerequisites if needed:
+### Important: PyTorch CUDA is not the CUDA compiler toolkit
+
+`torch.version.cuda == 13.0` only tells you which CUDA runtime PyTorch was built against. It does **not** mean the system has the CUDA toolkit or `nvcc` installed. SageAttention builds native CUDA extensions and therefore requires an actual CUDA toolkit with `nvcc`.
+
+Check it explicitly:
+
+```bash
+if command -v nvcc >/dev/null 2>&1; then
+    nvcc --version
+else
+    echo 'nvcc is not installed'
+fi
+```
+
+Do not derive `CUDA_HOME` from `command -v nvcc` until this check succeeds. If `nvcc` is absent, expressions based on an empty command result can incorrectly produce `CUDA_HOME=.` and the Sage build then fails with `./bin/nvcc: No such file or directory`.
+
+### WSL: install the CUDA toolkit without installing a Linux NVIDIA driver
+
+On WSL2, NVIDIA explicitly warns not to install driver-bearing CUDA meta-packages because the NVIDIA driver comes from Windows and is exposed into WSL. Use the NVIDIA **WSL-Ubuntu toolkit** package only.
+
+For the documented PyTorch `2.10.0+cu130` environment, install CUDA Toolkit 13.0 from NVIDIA's WSL repository:
 
 ```bash
 sudo apt update
+sudo apt install -y cuda-toolkit-13-0
+```
+
+Do **not** use Ubuntu's `nvidia-cuda-toolkit`, and do not install the `cuda`, `cuda-13-0`, or `cuda-drivers` meta-packages on WSL.
+
+If `apt` says `cuda-toolkit-13-0` cannot be found, add/repair NVIDIA's WSL repository keyring first:
+
+```bash
+wget -O /tmp/cuda-keyring.deb \
+  https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i /tmp/cuda-keyring.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-13-0
+```
+
+Then verify the exact toolkit path:
+
+```bash
+/usr/local/cuda-13.0/bin/nvcc --version
+```
+
+The toolkit package normally installs `/usr/local/cuda-13.0`; use that exact versioned path for the Sage build instead of relying on a shell `PATH` or `/usr/local/cuda` symlink.
+
+An unrelated APT repository signature warning, for example from the GitHub CLI repository, does not explain a missing `nvcc` if the NVIDIA WSL repository itself is reachable. It should still be repaired separately, but it is not a reason to install Ubuntu's `nvidia-cuda-toolkit` as a workaround.
+
+### Normal build prerequisites
+
+```bash
 sudo apt install -y build-essential git ninja-build libgomp1
 python -m pip install -U packaging ninja
 ```
 
-Then remove any incompatible binary/wheel install and rebuild the official package from source against the machine's own C++ runtime and CUDA toolkit:
+### Rebuild SageAttention 2.2.0 from source
+
+Remove any incompatible binary/wheel install and rebuild the official package against the Python environment, host compiler and CUDA toolkit that actually run ComfyUI:
 
 ```bash
 conda activate comfy312
@@ -58,7 +106,8 @@ git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention
 git -C /tmp/SageAttention checkout d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
 
 cd /tmp/SageAttention
-export CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
 export TORCH_CUDA_ARCH_LIST=12.0
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
@@ -71,7 +120,9 @@ printf 'CUDA_HOME=%s\n' "$CUDA_HOME"
 python -m pip install --no-build-isolation --no-cache-dir -v .
 ```
 
-The derived `CUDA_HOME` must be the root of the CUDA toolkit that provides the `nvcc` you intend to use. If `nvcc` is not on `PATH`, set `CUDA_HOME` explicitly to that toolkit root before the build. Do not fix a Sage binary ABI failure by globally injecting another `libstdc++.so.6` through `LD_LIBRARY_PATH`, `LD_PRELOAD`, or `ctypes`; rebuild SageAttention against the environment/toolchain that will actually run ComfyUI.
+If you intentionally use another supported toolkit version, set `CUDA_HOME` to that toolkit's actual root and verify `$CUDA_HOME/bin/nvcc --version` before invoking pip. For Blackwell, upstream requires CUDA >=12.8. Matching the toolkit major/minor to the active PyTorch build is the least surprising choice when possible.
+
+Do not fix a Sage binary ABI failure by globally injecting another `libstdc++.so.6` through `LD_LIBRARY_PATH`, `LD_PRELOAD`, or `ctypes`; rebuild SageAttention against the environment/toolchain that will actually run ComfyUI.
 
 ### Why this repairs `GLIBCXX_3.4.32` failures
 
@@ -79,7 +130,7 @@ The derived `CUDA_HOME` must be the root of the CUDA toolkit that provides the `
 
 ## Verify the SageAttention installation
 
-First verify that both compiled extensions load:
+First verify that the compiled extensions load:
 
 ```bash
 conda activate comfy312
@@ -124,7 +175,7 @@ From the Sol-H3 checkout, run the packaged kernel checks first:
 
 ```bash
 conda activate comfy312
-cd /home/toor/ComfyUI/custom_nodes/ComfyUI-Sol-H3
+cd /home/toor/ComfyUI/custom_nodes/comfyui-sol-h3
 python -m pip install -r requirements.txt
 python -m pip check
 
