@@ -28,7 +28,7 @@ class SolH3Experimental:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
     CATEGORY = "model/optimizations/Sol-H3/experimental"
-    DESCRIPTION = "Approximate SOL attention, experimental SM120. Protects the entire pre-video prefix. Sparse + Spectrum is gated."
+    DESCRIPTION = "Approximate Sol-Attn through ComfyUI's comfy-kitchen kernel on eligible SM120 H3/VDN calls; unsupported calls fall back locally."
 
     def apply(self, model, exact_fusion=True, tau=1.0, dense_evaluations=1, dense_layers=2):
         from .runtime import install
