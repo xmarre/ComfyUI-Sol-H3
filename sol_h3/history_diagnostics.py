@@ -2,7 +2,8 @@
 
 This module does not change routing. It wraps the existing HistoryPolicy methods
 only to explain why a preflight is opaque, which semantic identity component
-changes between calls, or which actual receipt set is rejected.
+changes between calls, which providers participate in the shared Spectrum
+history contract, or which actual receipt set is rejected.
 """
 from __future__ import annotations
 
@@ -59,6 +60,30 @@ def _label(value: Any) -> str:
         return f"{module or '<unknown>'}.{qualname or type(value).__name__}"
     cls = type(value)
     return f"{getattr(cls, '__module__', '<unknown>')}.{getattr(cls, '__qualname__', cls.__name__)}"
+
+
+def _record_provider_set(state, options) -> None:
+    policies = options.get(interop.HISTORY_KEY, {})
+    if not isinstance(policies, dict):
+        summary = (("<malformed>", _label(policies), False),)
+    else:
+        summary = tuple(
+            (
+                str(name),
+                _label(provider),
+                callable(getattr(provider, "accept_receipts", None)),
+            )
+            for name, provider in sorted(policies.items(), key=lambda item: str(item[0]))
+        )
+    key = ("providers", summary)
+    if key in _seen(state):
+        return
+    _seen(state).add(key)
+    rendered = ";".join(
+        f"{name}:{provider}:accept={str(accepts).lower()}"
+        for name, provider, accepts in summary
+    ) or "-"
+    log.info("Sol-H3 backend-history diagnostic providers=%s", rendered)
 
 
 def _opaque_reason(policy, *, layout, options, model) -> str:
@@ -134,6 +159,7 @@ def _diagnostic_call(self, *, layout, options, model):
         return result
 
     call_index = _next_call(state)
+    _record_provider_set(state, options)
     if result is None:
         reason = _opaque_reason(self, layout=layout, options=options, model=model)
         key = ("opaque", reason)
