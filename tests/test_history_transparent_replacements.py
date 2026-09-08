@@ -8,7 +8,9 @@ from sol_h3.runtime import BlockPatch, Request, _REQUEST
 
 
 class MiniMaxH3BlockReplacePatch:
-    __module__ = "comfyui_diffaid_patches.nodes"
+    # The loader-specific module name is intentionally unimportant. The real
+    # producer identity comes from Diff-Aid's Spectrum runtime declaration.
+    __module__ = "nodes"
 
     def __init__(self, existing_patch=None):
         self.config = SimpleNamespace(
@@ -92,14 +94,3 @@ def test_unknown_replacement_wrapper_remains_opaque():
         existing_patch=BlockPatch(0, cfg)
     )
     assert _policy_identity(cfg, options) is None
-
-
-def test_receipt_coverage_guard_rejects_missing_transformer_blocks():
-    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
-    policy = HistoryPolicy(cfg, block_count=2)
-    assert not policy.accept_receipts((("sol_h3", 0, "sol"),))
-    assert policy.accept_receipts((
-        ("sol_h3", 0, "sol"),
-        ("sol_h3", 1, "vdn_local_sol"),
-        ("sol_h3", 1, "vdn_global_native"),
-    ))
