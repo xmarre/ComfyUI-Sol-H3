@@ -28,6 +28,15 @@ Generic `optimized_attention_override` providers such as KJ Sage remain the dens
 
 These companions are not automatically installed.
 
+Current reviewed pins for the primary stack are:
+
+```text
+Spectrum #104  34f3c3d6c8ca738b76694a6321650e2db9bc892d
+VDN #8         b6f0755c4172ec5c17386c56998f454e78b2a2d4
+VDN #11        5b63dc670229d419a6350b64f7ceda609dbc8194
+Sana           2936c47637380842aaa4a4488fac5006cc542b70
+```
+
 ### VDN grouped attention
 
 VDN retains ownership of its trained local-window geometry, global/anchor operations, learned softmax gate, linear complement, and output projection.
@@ -41,7 +50,7 @@ unchanged restricted V rows
 leading global/prefix KV sink count
 ```
 
-directly to Sol-H3. No extra square query domain is constructed for a v3 provider. VDN's v2 `square_q`/`query_positions` compatibility payload is now lazy and is created only when a v2-only provider is actually installed.
+directly to Sol-H3. No extra square query domain is constructed for a v3 provider. VDN's v2 `square_q`/`query_positions` compatibility payload is lazy and is created only when a v2-only provider is actually installed.
 
 For the Sol-H3 v3 path:
 
@@ -51,6 +60,8 @@ vdn_square_expanded_calls == 0
 ```
 
 Global/anchor calls remain VDN-native. Masked Flex remains VDN-native; if its existing fallback switches to grouped attention, that grouped path can use v3.
+
+Production runs on RTX PRO 6000 now confirm the v3 module is actually active (`softmax-provider module API=3`) and the native grouped stages execute with 1:1 requested/kernel Q rows and zero square expansion. That establishes the direct rectangular route. It does **not** isolate a v3-only timing delta because the later production comparisons also changed Spectrum's actual/forecast schedule.
 
 ### Flow mixed-grid external sequences
 
@@ -62,7 +73,7 @@ mode = dense_gate_no_linear
 topology = mixed_grid_low_suffix
 ```
 
-is no longer automatically forced to dense attention. Sol-H3 validates the contract against the current mixed packed row count and layout, then allows the underlying whole-sequence VDN softmax call to use SOL. VDN still owns the external-mode gate semantics and keeps the geometry-dependent linear complement disabled.
+is not automatically forced to dense attention. Sol-H3 validates the contract against the current mixed packed row count and layout, then allows the underlying whole-sequence VDN softmax call to use SOL. VDN still owns the external-mode gate semantics and keeps the geometry-dependent linear complement disabled.
 
 This support is intentionally narrow: arbitrary reduced/external layouts are not inferred. Unknown, stale, or malformed contracts delegate to the inherited dense implementation. Successful mixed-grid sparse execution is recorded separately as:
 
@@ -73,11 +84,37 @@ external_mixed_kernel_q_rows
 route = sol_external_mixed
 ```
 
-CPU/native integration tests cover this route and mixed -> later-native SOL resumption. A production GPU/media rerun of the new mixed-grid sparse path is still outstanding; the previous live mixed-grid run predates this support and correctly remained dense.
+The current production stack has now exercised this route on RTX PRO 6000:
+
+```text
+sol_eligible_calls               250
+external_mixed_sol_calls         192
+dense_warmup                      58
+external_mixed_q_rows       8,360,640
+external_mixed_kernel_q_rows 8,360,640
+compatibility_fallbacks           {}
+rel_l2                    0.0009817115
+```
+
+The 58 dense calls are expected from `dense_evaluations=1` plus two configured dense layers. Later native target-grid stages resumed normal rectangular CuTe execution. This proves routing and arithmetic behavior in the production stack; it is not by itself a clean performance A/B.
 
 ### Spectrum
 
 Spectrum consumes preflight policy plus actual backend receipts. Provider demotion or route changes alter the numerical identity and reset incompatible history instead of aborting execution. Opaque/unpredictable routing executes actual transformer calls rather than forecasting from an unqualified anchor.
+
+Production also composes MiniMax-H3 Diff-Aid. Sol-H3's history preflight therefore recognizes only the audited Diff-Aid H3 activation-only replacement chain when Diff-Aid's own Spectrum runtime declaration is present. Both valid wrapper orders are supported. Static Diff-Aid configuration participates in the history identity; changing normalized sigma does not because Spectrum's existing external-patch layer already owns patch-regime transitions. Cycles, duplicate/mismatched Sol patches, unknown replacement wrappers, or missing Diff-Aid declarations remain opaque/actual-only. Untwist is not generically declared history-transparent through this mechanism.
+
+A recent SOL-bypassed production control exposed why this matters. The previous hot SOL run executed 18/18 logical calls as actual transformer NFEs, while the bypass run executed 13 actual + 5 Spectrum forecasts. Those five avoided NFEs account for roughly the same 80-90 s scale as the observed sampler-time delta, so the raw 320.98 -> 240.55 s comparison cannot be attributed directly to Sol-Attn.
+
+The next SOL-enabled performance rerun must compare the execution schedule first:
+
+```text
+sampler_logical_calls
+transformer_actual_nfe
+spectrum_forecast_calls
+```
+
+Do not require exactly 13 actual + 5 forecast; legitimate dense/SOL ownership transitions can force fresh actual anchors. Only compare per-NFE SOL cost after the schedules are comparable.
 
 ## SOL kernel contract
 
@@ -123,7 +160,14 @@ The rectangular GPU suite subsequently passed **9 tests** on the same SM120 clas
 
 ### Production rectangular VDN execution
 
-A prior live Comfy run with VDN + DiffAid + Untwist + SOL + Spectrum + progressive/Continuum established real rectangular native-grid execution:
+Full SOL-enabled production runs with VDN + DiffAid + Untwist + SOL + Spectrum + progressive/Continuum now confirm the direct v3 route:
+
+```text
+VDN object patches=50
+softmax-provider module API=3
+```
+
+Native grouped stages report:
 
 | Stage | Rectangular SOL calls | Requested Q rows | Kernel Q rows | Square-expanded calls |
 |---|---:|---:|---:|---:|
@@ -131,9 +175,7 @@ A prior live Comfy run with VDN + DiffAid + Untwist + SOL + Spectrum + progressi
 | First high grid | 1,056 | 4,972,800 | 4,972,800 | 0 |
 | Later high grid | 1,248 | 5,967,360 | 5,967,360 | 0 |
 
-That run used the previous v2 companion contract, while Sol-H3 already ignored the disposable square-Q values. Current VDN API v3 removes the remaining upstream `square_q` gather/allocation itself. The v3 integration is covered by current CI; its allocation/time improvement has not yet been measured on GPU.
-
-The same prior workflow's mixed-grid stage remained dense because external mixed SOL support did not exist yet. Do not treat that historical zero as evidence against the current mixed-grid route.
+The same production stack also executed the Flow mixed-grid route as 192 external SOL calls with exact 1:1 mixed requested/kernel Q rows. These results establish route activation and removal of the historical square-Q kernel expansion. They do not isolate the allocation/time benefit of v3 because the available runs differ in compile/cache state and Spectrum NFE schedule.
 
 ### Exact Runtime
 
@@ -148,7 +190,9 @@ This is Exact-only evidence and does not establish SOL speed.
 
 ### Current CI
 
-The current mirror validation covers:
+The final one-commit Sol PR head is `9b3f96b7aa1360ad9ce196e402955414f86842ff` on neutral `main` `5db282ca836416a32cf114346b946fe75136e4f1`.
+
+Current validation covers:
 
 - `pip check`;
 - Ruff;
@@ -159,7 +203,10 @@ The current mirror validation covers:
 - Spectrum stack behavior;
 - sequential VDN #8 -> #11 application;
 - VDN provider API v3 and lazy v2 compatibility;
+- both audited Diff-Aid/Sol wrapper orders;
 - Flow API-2 mixed-grid SOL routing and mixed -> native resumption.
+
+Spectrum #104 was rebased onto v0.2.25/current main at `34f3c3d6c8ca738b76694a6321650e2db9bc892d`; Spectrum final CI #596 passed all nine lanes. Sol's repin mirror CI #158 and final PR CI #160 both passed their full CPU-contract and native-interop lanes with that exact Spectrum pin.
 
 GPU/media validation remains separate from CPU CI.
 
@@ -201,6 +248,9 @@ GPU validation and production telemetry are documented in [VALIDATION](docs/VALI
 Useful successful-run counters include:
 
 ```text
+sampler_logical_calls
+transformer_actual_nfe
+spectrum_forecast_calls
 sol_backend
 sol_source_tree_verified
 sol_eligible_calls
