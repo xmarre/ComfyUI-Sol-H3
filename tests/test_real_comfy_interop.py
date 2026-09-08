@@ -180,8 +180,9 @@ def test_real_modelpatcher_vdn_v2_object_patch_reaches_sol(monkeypatch):
             state = _REQUEST.get()
             assert state.sparse_calls > 0
             assert state.vdn_local_sol_calls > 0
-            assert state.vdn_square_expanded_calls > 0
-            assert state.vdn_square_kernel_rows > state.vdn_square_requested_rows > 0
+            assert state.vdn_rectangular_sol_calls > 0
+            assert state.vdn_square_expanded_calls == 0
+            assert state.vdn_kernel_q_rows == state.vdn_requested_q_rows > 0
             assert state.fallbacks["vdn_global_native"] > 0
             assert state.fallbacks["vdn_provider_contract_missing"] == 0
 

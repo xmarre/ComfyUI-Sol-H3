@@ -1,3 +1,7 @@
+# Current rectangular revision
+
+Use [RECTANGULAR](RECTANGULAR.md) for current commands and counters. The earlier square-bridge validation below is historical; its GPU measurements do not validate the rectangular revision.
+
 # Validation status and RTX PRO 6000 commands
 
 **Production RTX PRO 6000 evidence exists for Exact Runtime, and direct synthetic GPU evidence now exists for the packaged Sana CuTe SM120 SOL kernel.** Full ComfyUI/VDN/Spectrum sparse execution, warmed performance and audiovisual acceptance remain outstanding.

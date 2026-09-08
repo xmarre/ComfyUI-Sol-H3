@@ -16,7 +16,7 @@ Exact fusion preserves native intermediate affine rounding. It retains norms, Ad
 
 ## Optional interoperability companions
 
-- [VDN-H3-Plus #11](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/11): restricted softmax-subcall provider contract, including v2 restricted-domain square expansion for SOL's square-QKV kernel.
+- [VDN-H3-Plus #11](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/11): restricted softmax-subcall provider contract, including requested Q, restricted K/V and exact global-prefix sink rows.
 - [Spectrum #104](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/pull/104): numerical attention policy/receipt history coordination.
 - [Untwisting RoPE #9](https://github.com/xmarre/ComfyUI-Untwisting-RoPE/pull/9): pure QKV preprocessing contract.
 
@@ -27,7 +27,7 @@ These remain draft and require combined runtime validation. They are not automat
 | Native dense + SOL | SOL on eligible calls; original Comfy attention on dense-required rows/calls | **Real RTX PRO 6000 CuTe SM120 compile/execution; `sparse_calls=2`, prefix parity passed** |
 | Sage/Sage3 or generic dense override + SOL | SOL on eligible calls; inherited provider when usable; loader/import failure demotes request-locally to original Comfy attention with explicit telemetry | Real Comfy/KJ Python wrappers and CPU fallback contracts; installed Sage2 ABI-failure reproduction classified, GPU fallback rerun pending |
 | VDN full coverage + SOL | Softmax component can use SOL; learned gate remains active | Real VDN/H3/Spectrum dispatch with CPU oracle |
-| VDN grouped + SOL | v2 expands each already-restricted local KV domain to matching square Q, runs SOL there when eligible, then selects only the original VDN query rows; global/anchor operations remain native | Exact restricted-domain oracle tests plus real ModelPatcher object-patch integration test |
+| VDN grouped + SOL | v2 passes requested Q directly against its restricted K/V; global/anchor operations remain native | Exact restricted-domain oracle tests plus real ModelPatcher object-patch integration test |
 | VDN flex + SOL | Masked Flex remains native; its existing grouped fallback can then use the grouped v2 contract | Mask tests and Flex-to-grouped CPU fallback; no Flex GPU execution |
 | VDN reduced/mixed API 1/2 | Inherited gated attention for the current external sequence; later eligible native calls may resume SOL | Component contract tests; full Flow workflow GPU rerun outstanding |
 | Spectrum + SOL | Actual backend receipts qualify history; policy/receipt/provider-demotion changes reset history before capture | Real wrapper orders, repeated CPU sampling scopes, provider-demotion identity regression |
@@ -37,15 +37,15 @@ These remain draft and require combined runtime validation. They are not automat
 | DiffAid / Flow / other block replacements | Delegate current arguments; unsupported layouts use inherited calls | Source/contract evidence; opaque replacement history remains actual-only |
 | Runtime adapters, ordinary LoRA, curve AdaLN, KJ preview | Native submodules/hooks remain active; unsupported Exact ownership uses native block | Source and projection-hook tests; full GPU/media stack outstanding |
 
-VDN remains the owner of its trained local/window geometry, anchors, learned softmax gate and linear complement. The v2 bridge does **not** broaden a local VDN operation to unrestricted model attention: it evaluates extra query rows only over the same already-restricted KV domain so the square-QKV Sol-Attn kernel can run, then discards those extra query outputs. This adds query/gather overhead, so successful VDN-local SOL execution does not by itself establish a speedup.
+VDN owns its local/window geometry, anchors, learned softmax gate and linear complement. The rectangular SM120 bridge evaluates only requested Q rows over the unchanged restricted K/V domain. VDN #11 still constructs its compatibility `square_q` payload; Sol-H3 accepts that contract but does not read or execute those extra queries. Untwist runs over the full original packed sequence before VDN gathering. See [rectangular design and GPU validation](docs/RECTANGULAR.md).
 
 Spectrum histories use `attention_backend_history_v1` preflight policies and `attention_backend_receipts_v1` actual receipts. Unpredictable routing executes actual calls rather than using unqualified anchors. Provider demotion changes the inherited-provider identity and increments the backend transition, so Spectrum cannot forecast across an optional-provider failure as if the numerical backend were unchanged. Transitions clear stage histories/controllers and incompatible offline archives; offline replay may therefore be unavailable for a changing backend. With older Spectrum lacking the consumer contract, SOL delegates its affected attention calls to the inherited provider.
 
 ## SOL kernel contract
 
-Eligible Q/K/V are BF16, matching `[1, heads, rows, 128]` tensors on SM120, with supported unmasked attention flags and a current contiguous packed prefix/video-tail layout. Unsupported calls delegate locally and do not permanently disable later eligible calls.
+Native packed Q/K/V are BF16, matching `[1, heads, rows, 128]` tensors on SM120; VDN v2 local calls use Q `[1, heads, Tq, 128]` and K/V `[1, heads, Tkv, 128]`, with supported unmasked attention flags and a current contiguous packed prefix/video-tail layout. Unsupported calls delegate locally and do not permanently disable later eligible calls.
 
-The bridge converts Comfy BHTD tensors to upstream BTHD, preserving BF16 and the native scale `128**-0.5`. It passes `tau` directly with the upstream H3 `diag` threshold policy and `kv_splits=1`. Explicit `sink_start=0` keeps prefix KV exact; upstream rounds partially overlapping 64-row blocks outward. Omitting this argument would incorrectly select a suffix sink. Ordinary H3 prefix queries are recomputed through the inherited dense provider or its explicit original-Comfy fallback. VDN v2 auxiliary query rows are discarded, so they do not incur that extra dense recomputation.
+The bridge converts Comfy BHTD tensors to upstream BTHD, preserving BF16 and the native scale `128**-0.5`. It passes `tau` directly with the upstream H3 `diag` threshold policy and `kv_splits=1`. Explicit `sink_start=0` keeps prefix KV exact; upstream rounds partially overlapping 64-row blocks outward. Omitting this argument would incorrectly select a suffix sink. Ordinary H3 prefix queries are recomputed through the inherited dense provider or its explicit original-Comfy fallback. VDN v2 has no auxiliary kernel queries; its `sink_rows` refers only to global-prefix K/V.
 
 An all-selected sink call is checked against independent BF16 SDPA. This gate checks arithmetic, not sparse quality. On the RTX PRO 6000 4096-row synthetic probe, the real packaged `cute_sm120` kernel produced `max_abs=0.0009765625`, `mean_abs=4.484307282837108e-05`, and `rel_l2=0.003004377940669656`, with exact prefix parity and two sparse calls. Untwist preprocessing runs exactly once before SOL and the dense reference/fallback. Missing Sana dependencies, failed source verification or CuTe initialization produce a local native fallback with the reason; SM120 never silently substitutes Triton or comfy-kitchen. Arithmetic-gate failures and arbitrary provider compute errors remain fatal.
 
@@ -71,7 +71,7 @@ SageAttention is optional and is **not** installed by Sol-H3. On SM120, upstream
 
 If Sage fails with a binary ABI error such as `GLIBCXX_3.4.32 not found`, do not repair it with a global `LD_LIBRARY_PATH`/`LD_PRELOAD` override. Rebuild the official SageAttention package from source against the same Python environment, host compiler and CUDA toolkit that run ComfyUI. The complete pinned install/repair commands and verification probes are in **[SageAttention installation and repair](docs/SAGEATTENTION.md)**.
 
-`sol_h3/sol_manifest.json` records upstream and packaged SHA-256 hashes. Only absolute package imports are converted to relative imports, with modified-file headers. Developers can reproduce the snapshot with `python tools/vendor_sol_attn.py /path/to/pinned/Sana`; this is not an installation step.
+`sol_h3/sol_manifest.json` records upstream and packaged SHA-256 hashes. Import adaptation is followed by functional rectangular-SM120 changes in `interface.py`, `preprocess.py`, and `sm120/mainloop.py`. Original source hashes remain intact; packaged hashes describe the modified files. `tools/rectangular_sm120.patch` records the reproducible functional diff. Developers can reproduce the snapshot with `python tools/vendor_sol_attn.py /path/to/pinned/Sana`; this is not an installation step.
 
 ## Validation and diagnostics
 
@@ -83,6 +83,6 @@ python -m pytest -q
 
 Set `COMFYUI_PATH`, `KJNODES_PATH`, `SPECTRUM_PATH`, and `VDN_PATH` to their checkouts to enable the real-wrapper/stack tests. GPU skips and CPU oracle substitutions are not GPU validation. See [VALIDATION](docs/VALIDATION.md) for the RTX PRO 6000 evidence, exact commands and remaining media matrix.
 
-Sampling logs expose `sol_source`, `sana_revision`, `sol_backend`, `sol_source_tree_verified`, actual evaluations, SOL-eligible calls, sparse calls, dense warmup, fallback reasons, `dense_provider_failures`, VDN-local SOL calls, VDN square-expansion requested/kernel row counts, backend transitions, effective inherited dense providers and arithmetic gates. Spectrum reports backend-history resets and opaque actual calls separately. A successful run with zero sparse calls is valid telemetry and cannot be used as a SOL performance sample.
+Sampling logs expose `sol_source`, `sana_revision`, `sol_backend`, `sol_source_tree_verified`, actual evaluations, SOL-eligible calls, sparse calls, dense warmup, fallback reasons, `dense_provider_failures`, VDN-local SOL calls, `vdn_rectangular_sol_calls`, `vdn_requested_q_rows`, `vdn_kernel_q_rows` (expected 1:1); legacy square-expansion counters remain zero, backend transitions, effective inherited dense providers and arithmetic gates. Spectrum reports backend-history resets and opaque actual calls separately. A successful run with zero sparse calls is valid telemetry and cannot be used as a SOL performance sample.
 
 See [AUDIT](docs/AUDIT.md) for ownership decisions and remaining limitations. GPL-3.0-or-later; see LICENSE and NOTICE.

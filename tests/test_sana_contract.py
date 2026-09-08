@@ -12,7 +12,7 @@ import torch
 
 from sol_h3._vendor.sol_attn import interface
 from sol_h3.provenance import verify_source, REVISION
-from tools.vendor_sol_attn import relocate
+from tools.vendor_sol_attn import package_sources
 
 
 def test_provenance_and_node_local_imports():
@@ -20,6 +20,7 @@ def test_provenance_and_node_local_imports():
     assert manifest['revision'] == REVISION
     root = Path(interface.__file__).parent
     assert len(manifest['files']) == 51
+    raw_files = {}
     for name, hashes in manifest['files'].items():
         if name.endswith('.py'):
             tree = ast.parse((root / name).read_text())
@@ -33,7 +34,10 @@ def test_provenance_and_node_local_imports():
             raw = subprocess.check_output(['git', '-C', source, 'show',
                                           f"{REVISION}:{manifest['subtree']}/{name}"])
             assert hashlib.sha256(raw).hexdigest() == hashes['upstream_sha256']
-            assert relocate(raw, name) == (root / name).read_bytes()
+            raw_files[name] = raw
+    if raw_files:
+        for name, data in package_sources(raw_files).items():
+            assert data == (root / name).read_bytes()
     assert 'BSD 3-Clause' in (root / 'sm100/LICENSE.flash-attention').read_text()
     assert 'Apache License' in (root.parent / 'LICENSE.Apache-2.0').read_text()
     assert 'NVIDIA' in (root / 'THIRD_PARTY_NOTICES.md').read_text()

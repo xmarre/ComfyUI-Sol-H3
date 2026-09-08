@@ -107,8 +107,9 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
                 assert state.dense_calls == 3
             else:
                 assert state.vdn_local_sol_calls > 0
-                assert state.vdn_square_expanded_calls > 0
-                assert state.vdn_square_kernel_rows > state.vdn_square_requested_rows > 0
+                assert state.vdn_rectangular_sol_calls > 0
+                assert state.vdn_square_expanded_calls == 0
+                assert state.vdn_kernel_q_rows == state.vdn_requested_q_rows > 0
                 assert state.fallbacks["vdn_global_native"] > 0
             if vdn_mode == "flex":
                 # Flex can fail into grouped at runtime and the stack-compatible VDN

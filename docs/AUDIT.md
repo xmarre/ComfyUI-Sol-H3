@@ -1,5 +1,7 @@
 # Interoperability source audit — 2026-09-08
 
+Historical square-bridge audit below. The current rectangular implementation, its changed query grouping and pending GPU validation are documented in [RECTANGULAR](RECTANGULAR.md). Prior GPU numbers apply to the square implementation.
+
 Existing PR #1 is continued on a mirror branch. This audit supersedes both the initial exclusive-provider design and the later requirement for a separately exposed Sana `sol_attn` checkout.
 
 | Source | Inspected/tested revision |
@@ -32,7 +34,7 @@ The same local environment exposed a separate optional-provider failure when dir
 
 The entire 51-file Sol-Attn subtree is retained to preserve its public architecture dispatch and internal support imports; no other engine code is imported. `interface.py`, `preprocess.py`, `common/`, SM120 mainloop and the upstream H3 sparse policy were inspected. `SOURCE_SNAPSHOT.json` identifies upstream validation on SM103 and explicitly lists SM120 as unvalidated at the upstream snapshot; this project now adds direct local SM120 execution evidence without rewriting that upstream claim.
 
-Sana's pinned root README licenses repository code under Apache-2.0. The subtree's third-party notice identifies FlashAttention BSD-3-Clause and NVIDIA Apache-2.0 adaptations. Copyright/SPDX headers and the original third-party notice/BSD license are retained; the Apache-2.0 text is included. Modified files identify the sole change: absolute `sol_attn.*` imports become relative imports. This avoids global module aliases, path mutations and collisions with other nodes, including when ComfyUI imports the node beneath a generated package name. The manifest records original and transformed hashes, verified before GPU runtime import.
+Sana's pinned root README licenses repository code under Apache-2.0. The subtree's third-party notice identifies FlashAttention BSD-3-Clause and NVIDIA Apache-2.0 adaptations. Copyright/SPDX headers and the original third-party notice/BSD license are retained; the Apache-2.0 text is included. Import adaptation converts absolute `sol_attn.*` imports to relative imports. The rectangular revision additionally changes `interface.py`, `preprocess.py` and `sm120/mainloop.py`; see `tools/rectangular_sm120.patch` and [RECTANGULAR](RECTANGULAR.md). Original and packaged hashes are distinct provenance records. This avoids global module aliases, path mutations and collisions with other nodes, including when ComfyUI imports the node beneath a generated package name. The manifest records original and transformed hashes, verified before GPU runtime import.
 
 Imports require PyTorch, Triton (also used by CuTe preprocessing), CUDA Python, CUTLASS DSL and TVM FFI (`enable_tvm_ffi=True`). The pinned cuDNN frontend's `cutedsl` dependency metadata declares `nvidia-cutlass-dsl[cu13]>=4.5.0`, `cuda-python`, `apache-tvm-ffi>=0.1.11`; these dependencies are declared directly. No `cudnn` import exists in the packaged subtree. Upstream pins Triton 3.6.0; the node declares >=3.6,<4 so installation does not force a newer PyTorch environment to downgrade. CI retains the upstream 3.6.0 baseline. No diffusers, transformers, model downloader or full cuDNN frontend dependency is added.
 

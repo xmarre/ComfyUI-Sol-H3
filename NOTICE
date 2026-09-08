@@ -15,17 +15,15 @@ The affine Triton kernel and Sol-H3 integration/interop code are authored for
 this project. They are informed by the published NVIDIA/Sana Sol-H3 and
 Sol-Attn contracts.
 
-Sparse attention execution uses the `sol_attn` public API supplied by the
-ComfyUI installation's `comfy-kitchen` package. comfy-kitchen is Copyright
-(c) 2025 Comfy Org and is licensed under the Apache License 2.0. This project
-does not redistribute comfy-kitchen or the previous Sana/CuTe Sol-Attn source;
-it links to the already-installed ComfyUI runtime API.
-
 Packaged Sana Sol-Attn: xmarre/Sana, sol-engine, revision
 2936c47637380842aaa4a4488fac5006cc542b70, subtree
 models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn.
 Sana's root README declares Apache-2.0 for repository code. The packaged
 subtree retains upstream copyright/SPDX headers, THIRD_PARTY_NOTICES.md
 and sm100/LICENSE.flash-attention (BSD-3-Clause). Apache-2.0 text is in
-sol_h3/_vendor/LICENSE.Apache-2.0. Modified imports are marked in each file.
+sol_h3/_vendor/LICENSE.Apache-2.0. Modified imports are marked in each file. interface.py, preprocess.py and
+sm120/mainloop.py additionally carry functional rectangular-Q geometry changes.
+The pinned upstream source identity and original hashes remain unchanged; packaged
+files are not claimed to be byte-equivalent upstream source. The reproducible
+functional diff is tools/rectangular_sm120.patch.
 See sol_h3/sol_manifest.json for original and packaged hashes.
