@@ -6,8 +6,8 @@
 
 - Original SOL baseline: 45 passed, 19 skipped before Triton installation.
 - Previous broad local suite: 66 passed, 18 GPU skips.
-- Current Linux CI on the v2 Sol mirror: **55 passed, 30 expected GPU/optional-integration skips**; `pip check` and Ruff pass.
-- Current native interoperability CI: **12 passed**, exercising current Comfy ModelPatcher/wrappers, current KJ Python wrapper code, Spectrum and the consolidated VDN v2 companion with CPU kernel substitutes.
+- Current Linux CI on the v2 Sol mirror: **57 passed, 30 expected GPU/optional-integration skips**; `pip check` and Ruff pass.
+- Current native interoperability CI: **12 passed**, exercising current Comfy ModelPatcher/wrappers, current KJ Python wrapper code, Spectrum and the sequential VDN PR #8 -> PR #11 stack with CPU kernel substitutes.
 - VDN v2 companion CI: pinned-Comfy + official-oracle suite, legacy workflow migration and current-Comfy smoke all pass.
 - Spectrum companion baseline: 911 passed, 13 skipped against the audited Comfy revision.
 - Untwist companion baseline: 40 passed.
@@ -53,7 +53,7 @@ VDN_PATH=/path/to/ComfyUI-VDN-H3-Plus \
 python -m pytest -q
 ```
 
-Use the linked companion PR branches/heads. The CI pins exact tested revisions.
+Use the linked companion PR branches/heads. The CI pins exact tested revisions. For VDN, the integration lane intentionally checks out PR #8 first and cherry-picks the one-commit PR #11 overlay afterward; this is the supported sequential stack and is itself a merge-conflict regression check.
 
 ## Production machine: kernel checks
 
@@ -94,9 +94,9 @@ Start with Exact off to isolate sparse interoperability, then enable it and comp
 | C | Sage3 + SOL | Same routing checks; independent gate passes |
 | D | Spectrum + SOL, then Sage + Spectrum + SOL | SOL actual count agrees with actual transformer calls; history resets at backend transitions |
 | E | VDN grouped + SOL, with and without Sage | v2 local square expansion executes SOL on eligible restricted domains; `vdn_square_kernel_rows > vdn_square_requested_rows > 0`; global/anchor remain native |
-| F | VDN flex + SOL | Masked Flex remains native; if Flex falls back to grouped, grouped v2 routing is visible |
+| F | VDN flex + SOL | Masked Flex remains native; if Flex falls back to grouped, grouped v2 routing is visible. With Spectrum, Flex remains actual-only because the fallback outcome is not preflight-predictable |
 | G | VDN full coverage + SOL | Eligible softmax can use SOL; learned gate remains active |
-| H | VDN + Spectrum + SOL | Backend receipts cover VDN multi-call routing; no incompatible cross-backend anchors |
+| H | VDN + Spectrum + SOL | Grouped/full VDN publishes a stable audited history identity and can forecast after qualified actuals; opaque/Flex routing stays actual-only without aborting |
 | I | Flow API-1 reduced / API-2 mixed, then normal target grid | `external_sequence_native` on unsupported calls; later native-grid v2 SOL eligibility resumes |
 | J | Repeated Continuum chunks | Fresh sampling scopes, correct warmup, no stale VDN/SOL/Spectrum state |
 | K | Core Block Sparse Attention + Spectrum, with/without SOL | Current core provider is actual-only under the companion history consumer; explicit ownership recorded |
@@ -114,7 +114,9 @@ vdn_square_kernel_rows > vdn_square_requested_rows > 0
 
 `vdn_global_native`, `vdn_anchor_native` and mixed-grid `external_sequence_native` may still appear and are expected. Their presence is not a failure. If the native-grid stage still reports `vdn_provider_contract_missing`, `vdn_provider_v1_not_consumed` or `vdn_provider_not_consumed`, save the complete log; those reasons now identify the exact lifecycle break instead of collapsing it into generic inherited ownership.
 
-Also exercise Exact → SOL, SOL exact=true → Exact, SOL exact=false → Exact, repeated identical applications, independently cloned branches, all-warmup requests and all-fallback requests. Legitimate zero-sparse runs must finish, but they are not evidence of SOL acceleration.
+Spectrum preflight does not require PR #11 to modify `vdn_h3/hybrid.py`. For the audited VDN closure shape, Sol-H3 derives the grouped routing identity from the captured VDN state/config and includes the model layout plus inherited provider identity in the numerical-history key. If that closure shape changes, the backend is unknown, or Flex is selected, preflight returns opaque and Spectrum executes actual calls. That is a conservative performance fallback, not a runtime incompatibility.
+
+Also exercise Exact -> SOL, SOL exact=true -> Exact, SOL exact=false -> Exact, repeated identical applications, independently cloned branches, all-warmup requests and all-fallback requests. Legitimate zero-sparse runs must finish, but they are not evidence of SOL acceleration.
 
 ## Performance and media acceptance
 
