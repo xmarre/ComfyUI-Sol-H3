@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from sol_h3 import runtime, sparse
 from sol_h3.contracts import Config, KEY
-from sol_h3.interop import RECEIPTS_KEY, VDN_KEY
+from sol_h3.interop import HistoryPolicy, RECEIPTS_KEY, VDN_KEY
 from sol_h3.runtime import BlockPatch, DiffusionWrapper, Request, SamplingWrapper, _FORWARD, _REQUEST
 
 
@@ -162,3 +162,61 @@ def test_preprocessing_is_once_before_sparse_and_dense_prefix(scope, monkeypatch
         "transformer_options": {"optimized_attention_override": provider}}, {"original_block": block})
     assert transforms == [True]
     assert len(dense_inputs) == 1 and torch.equal(dense_inputs[0], q * 2)
+
+
+def _stack_vdn_forward(state, cfg, base_branch):
+    def forward(*args, **kwargs):
+        # These names are intentionally captured: the compatibility adapter audits
+        # the same closure shape produced by VDN's make_vdn_forward.
+        return state, cfg, base_branch
+    forward._vdn_forward = True
+    return forward
+
+
+def test_grouped_vdn_closure_has_stable_forecast_identity():
+    sol_cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    vdn_cfg = {"radius": 1, "chunk": 5, "anchor_frames": "both", "linear_enabled": True}
+    state = SimpleNamespace(cfg=vdn_cfg, softmax_backend="grouped")
+    branch = SimpleNamespace(enable_text_state=True)
+    forward = _stack_vdn_forward(state, vdn_cfg, branch)
+    model = SimpleNamespace(
+        blocks=[SimpleNamespace(attn=SimpleNamespace(forward=forward))],
+        dtype=torch.bfloat16,
+    )
+    options = {"patches_replace": {"dit": {("double_block", 0): BlockPatch(0, sol_cfg)}}}
+    request = Request(sol_cfg)
+    token = _REQUEST.set(request)
+    try:
+        policy = HistoryPolicy(sol_cfg)
+        first = policy(layout=layout(), options=options, model=model)
+        second = policy(layout=layout(), options=options, model=model)
+        assert first is not None and first == second
+        vdn_cfg["radius"] = 2
+        changed = policy(layout=layout(), options=options, model=model)
+        assert changed is not None and changed != first
+    finally:
+        _REQUEST.reset(token)
+
+
+def test_flex_and_unknown_vdn_history_stay_actual_only():
+    sol_cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    vdn_cfg = {"radius": 1, "chunk": 5, "anchor_frames": "both"}
+    state = SimpleNamespace(cfg=vdn_cfg, softmax_backend="flex")
+    forward = _stack_vdn_forward(state, vdn_cfg, SimpleNamespace(enable_text_state=False))
+    model = SimpleNamespace(
+        blocks=[SimpleNamespace(attn=SimpleNamespace(forward=forward))],
+        dtype=torch.bfloat16,
+    )
+    options = {"patches_replace": {"dit": {("double_block", 0): BlockPatch(0, sol_cfg)}}}
+    token = _REQUEST.set(Request(sol_cfg))
+    try:
+        policy = HistoryPolicy(sol_cfg)
+        assert policy(layout=layout(), options=options, model=model) is None
+
+        def opaque_forward(*args, **kwargs):
+            return None
+        opaque_forward._vdn_forward = True
+        model.blocks[0].attn.forward = opaque_forward
+        assert policy(layout=layout(), options=options, model=model) is None
+    finally:
+        _REQUEST.reset(token)
