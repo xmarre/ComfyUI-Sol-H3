@@ -16,7 +16,6 @@ class KernelUnavailable(RuntimeError):
     """The native provider can execute safely without importing this kernel."""
 
 
-
 def verify_sources(root, manifest):
     root = Path(root).resolve()
     git_blobs = manifest.get("git_blobs")
@@ -66,9 +65,6 @@ def _find_package_root():
 
 def _load_verified_interface(root, manifest):
     root = Path(root).resolve()
-    # Verify every pinned package file before Python is allowed to execute package
-    # __init__ or interface code. The Git blob IDs remain in the manifest only as
-    # provenance; SHA-256 is the runtime integrity gate.
     verify_sources(root, manifest)
     loaded = any(name == "sol_attn" or name.startswith("sol_attn.") for name in sys.modules)
     if loaded:
@@ -86,8 +82,6 @@ def _load_verified_interface(root, manifest):
         module_file = getattr(module, "__file__", None)
         if module_file is None or Path(module_file).resolve().parent != root:
             raise RuntimeError("Imported sol_attn.interface does not come from the verified package root")
-        # Recheck after import so a package that mutates lazy-import source files
-        # cannot turn a successful pre-import verification into a later code load.
         verify_sources(root, manifest)
         _VERIFIED_ROOTS.add(root)
     return module
@@ -119,12 +113,11 @@ def _dense_reference(q, k, v, dense_attention):
         if out.shape != expected:
             raise RuntimeError(f"Dense SOL reference returned {tuple(out.shape)}, expected {expected}")
         return out
-    # Test/reference fallback only. Production passes the active Comfy dense provider
-    # from the optimized-attention wrapper so prefix rows preserve current semantics.
     return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
 
 
-def attention(q, k, v, prefix, config, state, dense_attention=None):
+def attention(q, k, v, prefix, config, state, dense_attention=None,
+              recompute_prefix_queries=True):
     if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape or q.shape[0] != 1 or q.shape[-1] != 128:
         raise RuntimeError("SOL requires matching QKV [1, heads, packed rows, 128]")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
@@ -141,13 +134,9 @@ def attention(q, k, v, prefix, config, state, dense_attention=None):
         state.kernel_device = q.device
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
-    # SM120 interleaved views remain unvalidated upstream; contiguous BTHD
-    # buffers avoid inheriting SM100-specific zero-copy assumptions.
     qb, kb, vb = (x.transpose(1, 2).contiguous() for x in (q, k, v))
     key = (q.device, q.dtype, tuple(q.shape))
     if key not in state.sparse_verified:
-        # Make EVERY KV block exact using the sink, rather than assuming an
-        # extreme tau necessarily selects every block on arbitrary activations.
         got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                            sink_start=0, sink_tokens=qb.shape[1])
         want = _dense_reference(q, k, v, None)
@@ -161,9 +150,10 @@ def attention(q, k, v, prefix, config, state, dense_attention=None):
         del got, want
     out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                        sink_start=0, sink_tokens=prefix)
-    # Generated audio, references, conditioning and text query rows remain dense
-    # through the same active Comfy dense provider used by the baseline path.
-    if prefix:
+    # Normal H3 replaces non-video query rows with the inherited dense provider.
+    # A VDN v2 expanded square domain discards those extra query outputs entirely,
+    # so it can retain exact sink keys without paying for unused dense query rows.
+    if prefix and recompute_prefix_queries:
         out[:, :prefix] = _dense_reference(q[:, :, :prefix], k, v, dense_attention)
     state.sparse_calls += 1
     return out.reshape(1, q.shape[2], -1)
