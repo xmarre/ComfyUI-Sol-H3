@@ -1,73 +1,87 @@
-# Validation on the production SM120 GPU
+# Validation status and RTX PRO 6000 commands
 
-GPU and audiovisual validation are outstanding. CPU tests cannot establish kernel correctness, performance, model equivalence or quality.
+**No real GPU or media validation has occurred in this session.** Keep PR #1 and companions draft. CPU structural correctness, offline compilation and media quality are different evidence.
 
-## Patch ordering for matched tests
+## Completed evidence
 
-For **Exact Runtime**, apply every compatible provider that may short-circuit the diffusion model or replace H3 blocks **before** Sol-H3 Exact. The important Spectrum order is:
+- Original SOL baseline: 45 passed, 19 skipped before Triton installation.
+- SOL final local suite: 66 passed, 18 GPU skips, including offline SM120 affine compilation, real Comfy/KJ wrappers and integrated stack tests.
+- Additional integrated native H3 + Spectrum + SOL + optional VDN tests: 8 passed, covering both wrapper orders, repeated scopes, full coverage, grouped windows and Flex-to-grouped fallback. External CuTe is replaced by CPU SDPA; VDN linear work is explicitly disabled in this test.
+- Spectrum: 911 passed, 13 skipped against current Comfy. Native fixture updates accommodate core's optional attention argument and native options augmentation.
+- VDN: 133 passed, 12 skipped. Restricted-domain provider tests preserve exact native results; absent official/GPU prerequisites remain skips.
+- Untwist: 40 passed.
 
-`MODEL -> Spectrum -> other compatible MODEL patches -> Sol-H3 Exact Runtime -> sampler`
+Environment: Python 3.12, torch 2.14.0+cpu, Triton 3.6.0, comfy-kitchen 0.2.33. The original CI also covers torch 2.10 CPU. No claims are made about empirically equivalent output or speedup.
 
-Spectrum forecast calls should then bypass Sol-H3; Spectrum actual calls should enter it. If Sol-H3 logs a bypass on a forecast call, the patch order is wrong.
-
-For **external NVIDIA SOL**, do not stack Spectrum, ComfyUI Block Sparse Attention, VDN hybrid/window attention or another optimized-attention owner. Those combinations are intentionally rejected.
-
-## Exact-kernel gate
-
-Set the checkout root first:
+To reproduce CPU contracts from the Sol-H3 checkout:
 
 ```bash
-COMFYUI_ROOT=/path/to/ComfyUI
+COMFYUI_PATH=/path/to/ComfyUI \
+KJNODES_PATH=/path/to/ComfyUI-KJNodes \
+SPECTRUM_PATH=/path/to/ComfyUI-Spectrum-MiniMax-H3 \
+VDN_PATH=/path/to/ComfyUI-VDN-H3-Plus \
+python -m pytest -q
 ```
 
-In the Comfy conda environment:
+Use the linked companion branches. CPU tests replace unavailable Sage/SOL kernels explicitly; they do not secretly run CUDA. The real KJ get_sage_func source and Comfy wrap_attn behavior are exercised separately from the substituted kernel.
+
+## Production machine: kernel checks
+
+In your WSL shell, using the documented pinned Sana checkout:
 
 ```bash
+conda activate comfy312
+COMFYUI_ROOT=/home/toor/ComfyUI
+SOL_ROOT=/home/toor/Sana-sol-h3
 cd "$COMFYUI_ROOT/custom_nodes/ComfyUI-Sol-H3"
-python -m pip install -e '.[test]'
+export PYTHONPATH="$SOL_ROOT/models/minimax_h3/Sol-H3/h3_runtime/third_party${PYTHONPATH:+:$PYTHONPATH}"
 python -m pytest -q tests/test_gpu.py
 python tools/gpu_probe.py --tokens 4096 --hidden 5376
+python tools/attention_probe.py --backend pytorch --tokens 4096 --prefix 512
+python tools/attention_probe.py --backend sage --tokens 4096 --prefix 512
+python tools/attention_probe.py --backend sage3 --tokens 4096 --prefix 512
 ```
 
-Expected: all GPU cases pass, **zero skips**. Tests include BF16/FP16/FP32, strided AdaLN chunk views, indexed mask rows and irregular hidden width. They compare exact bitwise outputs; do not loosen the threshold to hide a regression.
+Sage/Sage3 commands require their respective installed extensions. Expected: GPU tests have zero skips; affine probe reports bitwise parity; each attention probe reports `sparse_calls=2`, successful independent arithmetic gates and exact prefix parity against the selected provider. The probe intentionally asserts sparse execution because it is a kernel test; normal sampling has no fatal zero-sparse requirement. Do not relax arithmetic tolerances to hide failures.
 
-The probe allocates synthetic activations directly on the GPU and loads no model weights. It reports bitwise parity, warmed operator CUDA timings and peak allocated/reserved VRAM. Both paths include the same input clone. Its timing does not establish full-model speedup. Repeat with the production row count.
+Repeat attention probes at representative packed row counts and heads after the small probe passes. The probe uses synthetic tensors, no model weights, and does not establish model speedup. The first shape includes verification/compile cost; record cold and warmed costs separately.
 
-Offline compilation is also covered by `tests/test_compile.py` when Triton 3.6 is installed. It compiles scalar/indexed variants for SM120 without requiring a GPU; passing that test is not execution validation. `N`, hidden-row stride and scalar modulation row are runtime, non-specialized Triton arguments so segment-length/layout changes do not create value-specialized variants.
+Launch the full stack with the same environment:
 
-## External NVIDIA SOL gate
+```bash
+cd "$COMFYUI_ROOT"
+python main.py 2>&1 | tee /home/toor/sol_h3_full_stack.log
+```
 
-Install the pinned optional kernel and launch Comfy with its `PYTHONPATH` as described in README. The package root is located without importing `sol_attn`; SHA-256 verification of every pinned package file must complete before package code is imported. The first real QKV shape must then pass the all-selected arithmetic gate. The end-of-sampling `Sol-H3` JSON log must show `success=true`, `backend=sol`, `approximate=true`, and `sparse_calls>0`. `dense_calls` counts configured dense warmup/layers, not sparse execution.
+The original workflow/runtime log was not actually attached to this session. No exact queue command or reconstructed workflow is provided because its graph, input paths and settings are not available. Use the original saved workflow and preserve its settings for the comparisons below; provide the workflow plus complete log with results.
 
-Failed/gated requests are not timing samples. Initial source verification, correctness probes and kernel compilation affect cold latency and must be reported separately from measured warmed runs.
+## Full-stack matrix
 
-## Matched matrix
+Use the companion PRs linked in README. Start with Exact off to isolate sparse interoperability, then enable it and compare again.
 
-Preserve model file/hash, quantization, LoRAs/strengths, prompt, dialogue, seed, references/order, sampler, complete sigma tensor, resolution, duration, audio conditioning and all other patches. Save the actual workflow for every run.
-
-| Run | Configuration | Acceptance |
+| Run | Combination | Required observation |
 |---|---|---|
-| A | Native dense | Baseline |
-| B | Sol-H3 Exact | Packed hidden/output latent parity against A, then media |
-| C | Native + Spectrum | Separate forecasting baseline; record actual/forecast counts |
-| D | Spectrum -> Sol-H3 Exact | Compare against C with identical Spectrum schedule/counts |
-| E-core | ComfyUI Block Sparse Attention | Native sparse baseline; record `comfy-kitchen` version and every node setting |
-| E | External NVIDIA CuTe SOL, exact fusion off | Reference-policy sparse path; dialogue/video acceptance |
-| E2 | External NVIDIA CuTe SOL + exact fusion | Compare with E; isolate affine interaction |
-| F | SOL-BSA | Unavailable; do not label any dense run F |
-| G | External SOL + Spectrum | Gated pending backend-history integration and sparse-quality acceptance |
-| H | Few-step adapter | Separate comparison; record adapter and changed sigmas |
+| A | Native selected dense provider | Baseline latency and media |
+| B | Sage + SOL | Dense inherited backend recorded; sparse calls after warmup |
+| C | Sage3 + SOL | Same routing checks; independent gate passes |
+| D | Spectrum + SOL, then Sage + Spectrum + SOL | SOL actual count agrees with actual transformer calls; history resets at backend transitions |
+| E | VDN grouped + SOL, with and without Sage | Gate/linear semantics and native rectangular window fallbacks preserved |
+| F | VDN flex + SOL | Native Flex mask preserved; grouped fallback reason if used |
+| G | VDN full coverage + SOL | Eligible softmax can use SOL; learned gate remains active |
+| H | VDN + Spectrum + SOL | Backend receipts cover multi-call VDN; no cross-backend anchors |
+| I | Flow API-1 reduced / API-2 mixed, then normal target grid | Native fallback on unsupported calls; later eligibility can resume SOL |
+| J | Repeated Continuum chunks | New sampling scopes, correct warmup, no stale state or boundary errors |
+| K | Core Block Sparse Attention + Spectrum, with/without SOL | Current core provider is actual-only under the companion history consumer; explicit ownership recorded |
+| L | DiffAid + Untwist + runtime DoRA/LoRA + KJ preview + production stack | Projection/key transforms preserved; any native/actual-only fallback explicitly identified |
 
-For **E-core**, use the current upstream `Block Sparse Attention` node deliberately rather than trying to force it to masquerade as E. Its implementation differs from NVIDIA's released H3 policy. At minimum record selection mode, tau/keep-percent, start/end percent, dense blocks, `min_tokens`, `extra_tokens`, and `sink_conditioning`. A useful quality-oriented starting point is Sol-Attn with `tau=1.0`, `sink_conditioning=exact_kv_and_rows`, and dense blocks `0,1`, but this still does **not** reproduce NVIDIA's one-dense-evaluation schedule or full-prefix dense-query recomputation. Treat it as a separate backend.
+Also exercise Exact → SOL, SOL exact=true → Exact, SOL exact=false → Exact, repeated identical applications, independently cloned branches, all-warmup requests, and all-fallback requests. All legitimate zero-sparse runs must finish. They are not evidence of SOL speedup.
 
-Do **not** combine E-core with Spectrum in the current validation matrix. The audited Spectrum consumer does not track the core sparse schedule's numerical-backend transitions, so such a run would mix incompatible actual-history evidence rather than establish a valid Spectrum comparison.
+Use ordinary LoRA and runtime DoRA/LoRA separately; change strengths between runs and test offload/reload. Test pruned/curve AdaLN and the actual INT8/ConvRot model separately from BF16.
 
-Run T2VA, I2V/FL2VA, Ref2VA with seven references, explicit dialogue, whispered dialogue, no dialogue, motion/grass, variable masks, Continuum boundaries and progressive handoff. Change one factor per comparison. Test normal BF16 and the production INT8/ConvRot model separately. Test model offload/reload and LoRA strength changes between runs to expose stale ownership.
+## Performance and media acceptance
 
-Record cold and warm transformer CUDA time, end-to-end wall time, peak allocated and reserved VRAM, backend fingerprint, sparse/dense calls and Spectrum actual/forecast counts. Synchronize CUDA before/after timed regions. Reuse the same warmed shape and run three measured repetitions; report medians and range. The package does not add default CUDA synchronizations or full-sequence copies solely to collect timings. Use existing runtime metrics/profiling tools.
+Preserve exact model/adapter files and hashes, quantization, seed, full sigma schedule, sampler, prompt/dialogue, reference order, dimensions, duration, audio conditioning and patch settings. Save each workflow and output metadata. Progressive lower-resolution stages change composition; matching only the seed does not make them composition-matched A/B samples.
 
-For exact mode, compare packed hidden states and output latents before decoding; bitwise affine parity alone does not prove integration parity. In the Spectrum combination, verify that Sol-H3 `actual_evaluations` tracks Spectrum actual transformer calls rather than logical calls.
+Record cold/warm latency, end-to-end wall time, peak allocated/reserved VRAM, actual/forecast counts, sparse/eligible/warmup counts, fallback reasons, VDN-local SOL calls and history resets. Run three warmed repetitions at the same shape. Compare current core BSA against external CuTe as separate policies.
 
-For sparse paths, compare decoded video temporal stability, identity, reference fidelity and artifacts. Listen to the entire audio for missing/wrong words, unprompted chatter, volume/whispering, sync and boundary discontinuity. LPIPS or tensor error alone is insufficient. Keep failed dialogue runs in the results even if video looks good.
-
-The most informative sparse comparison is **E-core vs E** at the same seed/model/output geometry. If the built-in Comfy Kitchen path is equal or better in both quality and speed, the external CuTe dependency should not be promoted merely because it comes from the newer Sol-H3 runtime.
+Inspect video identity, reference fidelity, motion/grass artifacts, temporal stability and Continuum boundaries. Listen to the entire audio for wrong/missing words, unsolicited speech, whisper/volume fidelity, synchronization and discontinuities. Tensor metrics and unit tests cannot replace this assessment.

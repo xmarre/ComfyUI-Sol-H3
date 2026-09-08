@@ -46,6 +46,8 @@ class HistoryPolicy:
         signature = getattr(layout, "signature", None)
         phase = "dense" if state.evaluations < self.config.dense_evaluations else "sol"
         return (self.config.metadata()["fingerprint"], phase, repr(signature),
+                getattr(layout, "seq_len", None), tuple(getattr(layout, "segments", ())),
+                str(getattr(model, "dtype", None)),
                 provider_identity(options.get("optimized_attention_override")), tuple(vdn))
 
     def accept_receipts(self, receipts):

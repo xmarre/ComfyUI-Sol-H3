@@ -1,4 +1,6 @@
-# Interoperability checkpoint — 2026-09-08
+# Historical interoperability checkpoint — 2026-09-08
+
+This records an earlier saved state. Subsequent implementation review, companion PRs and validation supersede its pending-work list; consult README.md, AUDIT.md and VALIDATION.md for current status. The immutable SHAs below remain recovery points.
 
 This is unfinished work, saved at the user's urgent checkpoint request. Continue existing Sol-H3 PR #1; DO NOT create a replacement Sol-H3 PR or merge it. PR #1 remains draft on `feature/native-sol-h3`, one implementation commit `049939c4ef9f08d05c1557b52c602f0b9a75eaaa` above main `5db282ca836416a32cf114346b946fe75136e4f1`. Its branch has NOT yet been rewritten. Work is on a mirror branch.
 
