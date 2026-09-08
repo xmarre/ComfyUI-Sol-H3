@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sol_h3.contracts import Config
-from sol_h3.interop import HistoryPolicy
+from sol_h3.interop import HISTORY_KEY, HistoryPolicy
 from sol_h3.runtime import BlockPatch, Request, _REQUEST
 
 
@@ -54,6 +54,31 @@ def test_history_diagnostic_reports_semantic_identity_component_changes(caplog):
         "backend-history diagnostic transition" in message and "components=phase" in message
         for message in messages
     )
+
+
+def test_history_diagnostic_reports_shared_provider_set_and_accept_capability(caplog):
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    request = Request(cfg)
+    token = _REQUEST.set(request)
+    caplog.set_level(logging.INFO, logger="comfy.sol_h3")
+    try:
+        policy = HistoryPolicy(cfg)
+        options = _options(cfg)
+        options[HISTORY_KEY] = {
+            "other": lambda **kwargs: ("other",),
+            "sol_h3": policy,
+        }
+        assert policy(layout=_layout(), options=options, model=_model()) is not None
+    finally:
+        _REQUEST.reset(token)
+
+    provider_message = next(
+        record.getMessage()
+        for record in caplog.records
+        if "backend-history diagnostic providers=" in record.getMessage()
+    )
+    assert "other:" in provider_message and "accept=false" in provider_message
+    assert "sol_h3:" in provider_message and "accept=true" in provider_message
 
 
 def test_history_diagnostic_reports_opaque_replacement_without_changing_fail_closed_result(caplog):
