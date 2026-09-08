@@ -106,10 +106,12 @@ def test_real_modelpatcher_vdn_v2_object_patch_reaches_sol(monkeypatch):
     from comfy.model_patcher import ModelPatcher
     from comfy.patcher_extension import WrapperExecutor, WrappersMP
     from vdn_h3.hybrid import VDNState, apply_vdn
+    from vdn_h3.softmax_provider import PROVIDER_API_VERSION
     from sol_h3 import runtime, sparse
     from sol_h3.contracts import Config
     from sol_h3.runtime import install, _REQUEST
 
+    assert PROVIDER_API_VERSION == 2
     torch.manual_seed(41)
     inner = MiniMaxH3Model(
         hidden_size=128, num_layers=3, token_refiner_num_layers=0,
@@ -136,7 +138,7 @@ def test_real_modelpatcher_vdn_v2_object_patch_reaches_sol(monkeypatch):
     })
     apply_vdn(patcher, vdn_state)
     assert all(getattr(patcher.object_patches[
-        f"diffusion_model.blocks.{i}.attn.forward"], "_vdn_softmax_provider_api", 0) == 2
+        f"diffusion_model.blocks.{i}.attn.forward"], "_vdn_forward", False)
         for i in range(3))
 
     preprocess_calls = []
@@ -163,7 +165,7 @@ def test_real_modelpatcher_vdn_v2_object_patch_reaches_sol(monkeypatch):
     patched_outer = sol.patch_model(load_weights=False)
     patched = patched_outer.diffusion_model
     try:
-        assert getattr(patched.blocks[0].attn.forward, "_vdn_softmax_provider_api", 0) == 2
+        assert getattr(patched.blocks[0].attn.forward, "_vdn_forward", False)
         to = dict(sol.model_options["transformer_options"])
         to.update({"cond_or_uncond": [0], "uuids": ["positive"]})
 
@@ -181,6 +183,7 @@ def test_real_modelpatcher_vdn_v2_object_patch_reaches_sol(monkeypatch):
             assert state.vdn_square_expanded_calls > 0
             assert state.vdn_square_kernel_rows > state.vdn_square_requested_rows > 0
             assert state.fallbacks["vdn_global_native"] > 0
+            assert state.fallbacks["vdn_provider_contract_missing"] == 0
 
         with torch.no_grad():
             WrapperExecutor.new_executor(
