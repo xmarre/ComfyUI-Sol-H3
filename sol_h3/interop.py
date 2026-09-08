@@ -20,6 +20,74 @@ def receipt(options, block, route):
         sink.append(("sol_h3", block, route))
 
 
+def _freeze_history_value(value):
+    """Turn small provider config/state into a stable hashable history identity."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (str(key), _freeze_history_value(item)) for key, item in value.items()))
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_history_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_history_value(item) for item in value), key=repr))
+    return repr(value)
+
+
+def _closure_values(function):
+    code = getattr(function, "__code__", None)
+    cells = getattr(function, "__closure__", None)
+    if code is None or cells is None or len(code.co_freevars) != len(cells):
+        return None
+    values = {}
+    for name, cell in zip(code.co_freevars, cells):
+        try:
+            values[name] = cell.cell_contents
+        except ValueError:
+            return None
+    return values
+
+
+def _vdn_history_identity(forward, options, layout):
+    """Describe known VDN routing without requiring VDN to own hybrid.py metadata.
+
+    Newer/older VDN builds may publish ``attention_history_v1`` directly; prefer it.
+    The stack-compatible VDN overlay deliberately does not edit ``hybrid.py`` because
+    the audio-fidelity overlay owns that file. For the audited closure shape, grouped
+    routing is still deterministic from its captured config/backend, so expose that
+    identity here. Any unknown closure or Flex routing remains opaque/actual-only.
+    """
+    describe = getattr(forward, "attention_history_v1", None)
+    if callable(describe):
+        return describe(options, layout)
+
+    values = _closure_values(forward)
+    if values is None:
+        return None
+    state = values.get("state")
+    cfg = values.get("cfg", getattr(state, "cfg", None))
+    base_branch = values.get("base_branch")
+    backend = getattr(state, "softmax_backend", None)
+    if backend != "grouped" or not isinstance(cfg, dict):
+        # Flex can fail into grouped at runtime, so its next numerical route is not
+        # preflight-provable. Unknown backends likewise execute actuals rather than
+        # being rejected or forecast across an opaque transition.
+        return None
+    if state is None or getattr(state, "cfg", cfg) is not cfg:
+        return None
+
+    branch_identity = (
+        "none" if base_branch is None else provider_name(type(base_branch)),
+        bool(getattr(base_branch, "enable_text_state", False)) if base_branch is not None else False,
+    )
+    return (
+        "vdn_h3_grouped_closure_v1",
+        id(forward),
+        _freeze_history_value(cfg),
+        branch_identity,
+    )
+
+
 @dataclass(frozen=True)
 class HistoryPolicy:
     config: object
@@ -39,9 +107,9 @@ class HistoryPolicy:
                 return None
         vdn = []
         for block in model.blocks:
-            if getattr(block.attn.forward, "_vdn_forward", False):
-                describe = getattr(block.attn.forward, "attention_history_v1", None)
-                identity = describe(options, layout) if callable(describe) else None
+            forward = block.attn.forward
+            if getattr(forward, "_vdn_forward", False):
+                identity = _vdn_history_identity(forward, options, layout)
                 if identity is None:
                     return None
                 vdn.append(identity)
