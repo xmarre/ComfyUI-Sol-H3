@@ -143,6 +143,54 @@ def _diffaid_replacement_identity(patch, options):
     )
 
 
+def _flow_layout_replacement_identity(patch, block_index):
+    """Recognize Flow v0.3.x's marked generic H3 layout/context wrapper.
+
+    ``patch_flow_model`` installs this wrapper around block 0 even when Flow's
+    optional attention modes are disabled. The wrapper only publishes the already
+    known packed layout/layer as temporary transformer context, records metrics,
+    delegates to the previous replacement, and restores the prior context. Flow
+    explicitly marks the wrapper and its previous link. Validate both those public
+    markers and the real closure captures so same-named lookalikes remain opaque.
+    """
+    module = str(getattr(patch, "__module__", ""))
+    qualname = str(getattr(patch, "__qualname__", ""))
+    if not (
+        (module == "h3_flow_regenerate.attention" or module.endswith(".h3_flow_regenerate.attention"))
+        and qualname.endswith("make_layout_block_wrapper.<locals>.wrapper")
+        and getattr(patch, "_h3_flow_layout_wrapper", False) is True
+    ):
+        return None
+
+    scope = getattr(patch, "_h3_flow_layout_scope", None)
+    if scope not in {"layout", "attention"}:
+        return None
+    marker_previous = getattr(patch, "_h3_flow_previous", None)
+    marker_metrics = getattr(patch, "_h3_flow_metrics", None)
+    values = _closure_values(patch)
+    required = {"layer", "metrics", "previous", "record_layout"}
+    if values is None or not required.issubset(values):
+        return None
+    if type(values["layer"]) is not int or values["layer"] != int(block_index):
+        return None
+    if values["previous"] is not marker_previous or values["metrics"] is not marker_metrics:
+        return None
+    if type(values["record_layout"]) is not bool:
+        return None
+
+    record_layout = values["record_layout"]
+    if scope == "layout":
+        if block_index != 0 or record_layout is not True:
+            return None
+    elif record_layout != (block_index == 0):
+        return None
+
+    return (
+        ("h3_flow_layout_wrapper_v1", scope, block_index, record_layout),
+        marker_previous,
+    )
+
+
 def _flow_mixed_grid_replacement_identity(patch, block_index):
     """Recognize Flow v0.3.x's audited exact-prefix mixed-grid block wrapper.
 
@@ -259,7 +307,9 @@ def _replacement_history_identity(patch, block_index, config, options):
             chain.append(("sol_h3_block_patch", config.metadata()["fingerprint"]))
             current = current.previous
             continue
-        declared = _flow_mixed_grid_replacement_identity(current, block_index)
+        declared = _flow_layout_replacement_identity(current, block_index)
+        if declared is None:
+            declared = _flow_mixed_grid_replacement_identity(current, block_index)
         if declared is None:
             declared = _diffaid_replacement_identity(current, options)
         if declared is None:
