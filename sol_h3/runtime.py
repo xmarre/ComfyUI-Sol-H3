@@ -5,7 +5,10 @@ import json
 import logging
 
 from .contracts import KEY, Config, adaln_status, prefix_length
-from .interop import HISTORY_KEY, VDN_KEY, HistoryPolicy, provider_name, receipt
+from .interop import (
+    HISTORY_KEY, VDN_KEY, VDN_KEY_V2, VDN_PREPROCESS_KEY,
+    HistoryPolicy, provider_name, receipt,
+)
 
 log = logging.getLogger("comfy.sol_h3")
 _REQUEST = ContextVar("sol_h3_request", default=None)
@@ -20,6 +23,9 @@ class Request:
     sparse_calls: int = 0
     dense_calls: int = 0
     vdn_local_sol_calls: int = 0
+    vdn_square_expanded_calls: int = 0
+    vdn_square_requested_rows: int = 0
+    vdn_square_kernel_rows: int = 0
     exact_blocks: int = 0
     fallbacks: Counter = field(default_factory=Counter)
     exact_verified: set = field(default_factory=set)
@@ -53,6 +59,9 @@ class SamplingWrapper:
                      "sparse_calls": state.sparse_calls, "dense_warmup": state.dense_calls,
                      "compatibility_fallbacks": dict(state.fallbacks),
                      "vdn_local_sol_calls": state.vdn_local_sol_calls,
+                     "vdn_square_expanded_calls": state.vdn_square_expanded_calls,
+                     "vdn_square_requested_rows": state.vdn_square_requested_rows,
+                     "vdn_square_kernel_rows": state.vdn_square_kernel_rows,
                      "numerical_backend_transitions": state.backend_transitions,
                      "exact_blocks": state.exact_blocks,
                      "inherited_dense_backends": sorted(state.dense_attention_backends),
@@ -71,8 +80,6 @@ class DiffusionWrapper:
         if state is None or state.config != self.config:
             raise RuntimeError("Sol-H3 must execute inside its native OUTER_SAMPLE lifecycle")
         model = executor.class_obj
-        # The first executed block, not the diffusion wrapper, consumes warmup.
-        # This works with forecasting wrappers on either side of this wrapper.
         seen = set()
         routes = []
         token = _FORWARD.set((model, state, state.evaluations, seen, routes))
@@ -111,6 +118,25 @@ def _shape_reason(q, k, v, heads, mask, kw):
     return None
 
 
+def _preprocess_chain(provider, q, k, v, heads, kw):
+    """Apply only explicit QKV transforms and return the remaining dense leaf."""
+    seen = set()
+    while hasattr(provider, "attention_preprocess_v1"):
+        if id(provider) in seen:
+            raise RuntimeError("Cyclic attention preprocessing contract")
+        seen.add(id(provider))
+        transform, provider = provider.attention_preprocess_v1
+        shapes = (q.shape, k.shape, v.shape)
+        dtypes = (q.dtype, k.dtype, v.dtype)
+        devices = (q.device, k.device, v.device)
+        q, k, v = transform(q, k, v, heads, **kw)
+        if (q.shape, k.shape, v.shape) != shapes:
+            raise RuntimeError("Attention preprocessing changed its promised QKV topology")
+        if (q.dtype, k.dtype, v.dtype) != dtypes or (q.device, k.device, v.device) != devices:
+            raise RuntimeError("Attention preprocessing changed its promised QKV dtype/device")
+    return q, k, v, provider
+
+
 @dataclass(frozen=True)
 class BlockPatch:
     index: int
@@ -122,7 +148,7 @@ class BlockPatch:
         if active is None:
             raise RuntimeError("Sol-H3 block called outside its diffusion scope")
         model, state, evaluation, seen, routes = active
-        config = state.config  # merged configuration; clones may share old immutable callbacks
+        config = state.config
         if not seen:
             state.evaluations += 1
         seen.add(self.index)
@@ -155,8 +181,6 @@ class BlockPatch:
 
                 current_options = kw.get("transformer_options") or options
                 reason = _shape_reason(q, k, v, heads, mask, kw)
-                # This override transforms K rather than merely evaluating dense
-                # attention. Until it exposes a transform contract, preserve it whole.
                 if (current_options.get("minimax_h3_untwist_rope", {}).get("enabled")
                         and not hasattr(previous, "attention_preprocess_v1")):
                     reason = "inherited_key_transform"
@@ -181,19 +205,8 @@ class BlockPatch:
                     record("dense_warmup")
                     return dense()
 
-                # Pure QKV transforms explicitly expose their inherited provider.
-                # Apply them once to sparse QKV; prefix queries use only the dense
-                # leaf afterwards, so neither RoPE nor reference K scaling repeats.
-                chain_seen = set()
-                while hasattr(dense_provider, "attention_preprocess_v1"):
-                    if id(dense_provider) in chain_seen:
-                        raise RuntimeError("Cyclic attention preprocessing contract")
-                    chain_seen.add(id(dense_provider))
-                    transform, dense_provider = dense_provider.attention_preprocess_v1
-                    shapes = (q.shape, k.shape, v.shape)
-                    q, k, v = transform(q, k, v, heads, **kw)
-                    if (q.shape, k.shape, v.shape) != shapes:
-                        raise RuntimeError("Attention preprocessing changed its promised QKV topology")
+                q, k, v, dense_provider = _preprocess_chain(
+                    dense_provider, q, k, v, heads, kw)
 
                 def dense_attention(qd, kd, vd):
                     out = dense(qd, kd, vd, output_heads=True)
@@ -211,16 +224,50 @@ class BlockPatch:
                 record("sol")
                 return result
 
-            def vdn_provider(native, q, k, v, *, kind, scale, square_aligned=False):
-                # VDN supplies already restricted Q/K/V; never gather unrestricted
-                # sequence rows here. Global/anchor rows remain native and exact.
-                if kind != "local" or not square_aligned:
+            def vdn_provider_v1(native, q, k, v, *, kind, scale, square_aligned=False):
+                return vdn_provider_v2(
+                    native, q, k, v, kind=kind, scale=scale,
+                    square_aligned=square_aligned)
+
+            def vdn_provider_v2(native, q, k, v, *, kind, scale,
+                                square_aligned=False, square_q=None,
+                                query_positions=None, sink_rows=0):
+                if kind != "local":
                     record("vdn_" + kind + "_native", True)
                     return native()
-                qc, kc, vc = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+
+                expanded = square_q is not None
+                if expanded:
+                    if (query_positions is None or query_positions.ndim != 1
+                            or query_positions.shape[0] != q.shape[0]
+                            or query_positions.dtype.name if False else False):
+                        # dtype/device are checked below without relying on dtype string APIs.
+                        pass
+                    import torch
+                    if (not torch.is_tensor(query_positions) or query_positions.ndim != 1
+                            or query_positions.shape[0] != q.shape[0]
+                            or query_positions.dtype != torch.long
+                            or query_positions.device != q.device):
+                        record("vdn_square_mapping", True)
+                        return native()
+                    if (square_q.ndim != 3 or square_q.shape != k.shape
+                            or k.shape != v.shape or square_q.shape[1:] != q.shape[1:]):
+                        record("vdn_square_domain", True)
+                        return native()
+                    q_kernel = square_q
+                elif square_aligned and q.shape == k.shape == v.shape:
+                    q_kernel = q
+                    query_positions = None
+                else:
+                    record("vdn_local_native", True)
+                    return native()
+
+                qc, kc, vc = (t.transpose(0, 1).unsqueeze(0) for t in (q_kernel, k, v))
                 reason = _shape_reason(qc, kc, vc, q.shape[1], None, {"skip_reshape": True})
                 if scale != q.shape[-1] ** -0.5:
                     reason = "vdn_scale"
+                if not isinstance(sink_rows, int) or not 0 <= sink_rows <= q_kernel.shape[0]:
+                    reason = "vdn_sink_rows"
                 if reason:
                     record(reason, True)
                     return native()
@@ -231,16 +278,35 @@ class BlockPatch:
                     return native()
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(qc, kc, vc, 0, config, state)
+                    result = attention(
+                        qc, kc, vc, sink_rows, config, state,
+                        recompute_prefix_queries=False)
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
+                result = result.reshape(q_kernel.shape[0], q.shape[1], q.shape[2])
+                if expanded:
+                    state.vdn_square_expanded_calls += 1
+                    state.vdn_square_requested_rows += q.shape[0]
+                    state.vdn_square_kernel_rows += q_kernel.shape[0]
+                    result = result.index_select(0, query_positions)
                 state.vdn_local_sol_calls += 1
                 record("vdn_local_sol")
-                return result.reshape_as(q)
+                return result
+
+            def vdn_preprocess(q, k, v, *, heads, transformer_options):
+                # VDN exposes post-RoPE [T,H,D]. Comfy attention preprocessors use
+                # [B,H,T,D], so adapt only at this explicit full-domain boundary.
+                qc, kc, vc = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+                kw = {"transformer_options": transformer_options, "skip_reshape": True}
+                qc, kc, vc, _ = _preprocess_chain(previous, qc, kc, vc, heads, kw)
+                return tuple(t.squeeze(0).transpose(0, 1) for t in (qc, kc, vc))
 
             options["optimized_attention_override"] = override
-            options[VDN_KEY] = vdn_provider
+            options[VDN_KEY] = vdn_provider_v1
+            options[VDN_KEY_V2] = vdn_provider_v2
+            if hasattr(previous, "attention_preprocess_v1"):
+                options[VDN_PREPROCESS_KEY] = vdn_preprocess
 
         def original_block(call_args):
             block = model.blocks[self.index]
@@ -265,7 +331,17 @@ class BlockPatch:
         result = (original_block(forwarded) if self.previous is None else
                   self.previous(forwarded, {**extra, "original_block": original_block}))
         if config.backend == "sol" and len(routes) == route_start:
-            record("inherited_block_or_attention_owner", True)
+            attn_forward = getattr(getattr(model.blocks[self.index], "attn", None), "forward", None)
+            if getattr(attn_forward, "_vdn_forward", False):
+                api = getattr(attn_forward, "_vdn_softmax_provider_api", None)
+                if api is None:
+                    record("vdn_provider_contract_missing", True)
+                elif api < 2:
+                    record("vdn_provider_v1_not_consumed", True)
+                else:
+                    record("vdn_provider_not_consumed", True)
+            else:
+                record("inherited_block_or_attention_owner", True)
         return result
 
 
@@ -303,5 +379,13 @@ def install(model, config):
         for i in range(len(inner.blocks)):
             previous = replacements.get(("double_block", i))
             cloned.set_model_patch_replace(BlockPatch(i, config, previous), "dit", "double_block", i)
+    if config.backend == "sol":
+        apis = Counter()
+        for i in range(len(inner.blocks)):
+            patched = cloned.object_patches.get(f"diffusion_model.blocks.{i}.attn.forward")
+            if getattr(patched, "_vdn_forward", False):
+                apis[str(getattr(patched, "_vdn_softmax_provider_api", "missing"))] += 1
+        if apis:
+            log.info("Sol-H3 detected VDN object-patch provider APIs: %s", dict(apis))
     log.info("Sol-H3 active: %s; AdaLN precompute=%s", config.metadata(), adaln_status(inner))
     return cloned
