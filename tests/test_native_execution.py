@@ -123,3 +123,10 @@ def test_global_forward_hooks_rejected(native, kind):
 def test_exact_cuda_capability_error_is_explicit():
     with pytest.raises(RuntimeError, match="requires CUDA"):
         exact.affine(torch.ones(1, 2), torch.zeros(1, 2), torch.zeros(1, 2), [(0, 1, 0)], set())
+
+
+def test_native_windows_exact_fails_closed(monkeypatch):
+    monkeypatch.setattr(exact.sys, "platform", "win32")
+    assert exact.ineligible_reason(object(), {}) == "native_windows_unvalidated"
+    with pytest.raises(RuntimeError, match="not validated on native Windows"):
+        exact.execute_block(object(), {}, set())
