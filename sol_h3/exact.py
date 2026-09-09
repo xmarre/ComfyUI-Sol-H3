@@ -1,3 +1,5 @@
+import sys
+
 import torch
 
 
@@ -50,6 +52,12 @@ def affine(h, shift, scale, segments, verified):
 
 
 def ineligible_reason(block, args):
+    # The packaged Exact path relies on a Triton kernel and is production-tested
+    # only on Linux/WSL. Native-Windows third-party Triton builds plus ComfyUI's
+    # AIMDO malloc graph are not a validated execution contract, so fail closed
+    # to the untouched native H3 block rather than executing an unowned runtime.
+    if sys.platform == "win32":
+        return "native_windows_unvalidated"
     from comfy.ldm.minimax.model import DiTBlock
     from torch.nn.modules import module as hooks
     if type(block) is not DiTBlock or getattr(block.forward, "__func__", None) is not DiTBlock.forward:
@@ -68,6 +76,8 @@ def ineligible_reason(block, args):
 
 def execute_block(block, args, verified):
     # Keep native RMSNorm, AdaLN, attention, MLP and addcmul_ gate operations.
+    if sys.platform == "win32":
+        raise RuntimeError("Exact fusion is not validated on native Windows; use native H3 execution")
     from comfy.ldm.minimax.model import DiTBlock, _mod_gate
     from torch.nn.modules import module as module_hooks
 
