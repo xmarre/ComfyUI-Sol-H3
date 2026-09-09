@@ -108,6 +108,47 @@ compatibility_fallbacks              {}
 
 An earlier run also established 192 mixed calls / 8,360,640 requested and kernel rows 1:1. Malformed/stale/unknown contracts delegate locally to inherited attention; later native target-grid calls can resume SOL.
 
+### Mixed-Grid K/V attention-measure normalization
+
+Flow v0.3.3 can publish a second, independent contract alongside API 2:
+
+```text
+key  = h3_flow_mixed_grid_attention_measure_v1
+api  = 1
+mode = prefix_kv_stratified_subsample
+```
+
+This contract addresses unequal discrete spatial sampling density inside the mixed attention domain; it does not redefine the mixed sequence or VDN ownership. The validated geometry has `1064` protected-prefix rows/frame and `540` source-suffix rows/frame (`~1.97037x`).
+
+Sol-H3 validates the measure metadata against the current API-2 mixed contract and full Q/K/V row counts. Explicit preprocessing such as Untwist is applied to the original full mixed domain first. Then only K/V are gathered:
+
+- every Q row is preserved;
+- every row before target video is preserved;
+- every generated source-grid suffix K/V row is preserved exactly and in order;
+- each protected prefix frame keeps one K/V representative nearest every source-grid coordinate under MiniMax-H3's native area-normalized `_frame_grid` geometry.
+
+For the matched production geometry:
+
+```text
+Q:   56029 -> 56029
+K/V: 56029 -> 49741
+```
+
+`49741` equals the native low-carrier packed row count. The SM120 call is therefore rectangular in the ordinary kernel sense: query ownership remains the full mixed sequence while the softmax K/V integration measure is normalized to source-grid spatial density.
+
+The representative mapping is regression-tested against pinned native ComfyUI `_frame_grid` coordinates row-for-row. Contract mismatches fail closed rather than silently selecting a different K/V domain. The option remains off by default in Flow, but the v0.1.4/v0.3.3 coordinated path has passed matched real-SM120 decoded-media validation: the previous whole-frame shrink/top-edge reveal is absent, with no delayed framing pulse at the old join.
+
+Expected telemetry when active:
+
+```text
+external_mixed_measure_calls > 0
+external_mixed_measure_q_rows > 0
+external_mixed_measure_kv_rows_before > external_mixed_measure_kv_rows_after
+external_mixed_measure_removed_rows > 0
+```
+
+Matched `00324` execution produced 192 measure calls, Q `56029`, K/V `49741`, no compatibility fallback and final exact-prefix preservation.
+
 ## Untwist preprocessing
 
 VDN's full-domain preprocessing hook runs on complete post-RoPE packed Q/K/V before grouped gathering. This preserves packed-row coordinates for transforms such as Untwist.
@@ -116,17 +157,19 @@ For ordinary model-level attention Sol-H3 also consumes the inherited `attention
 
 ## Spectrum backend-history boundary
 
-Spectrum #104 tracks generic backend policy identity and actual receipts. It does not infer Sol/VDN/Flow ownership itself.
+Spectrum tracks generic backend policy identity and actual receipts. It does not infer Sol/VDN/Flow ownership itself.
 
-Sol-H3 therefore publishes a policy identity covering the rectangular kernel contract, current route geometry and audited replacement chain. Production history validation now includes:
+Sol-H3 therefore publishes a policy identity covering the rectangular kernel contract, current route geometry and audited replacement chain. Production history validation includes:
 
 - Diff-Aid activation-only wrappers only when Diff-Aid publishes its runtime declaration;
 - Flow's marked layout wrapper only when marker, closure, block, scope and previous-link invariants match;
 - Flow's mixed-grid wrapper only when captured geometry matches;
+- Flow attention-measure on/off state in the replacement identity;
+- `sol_external_mixed_measure` as an audited receipt route while unknown routes remain rejected;
 - unknown/malformed wrappers remain opaque/actual-only;
-- progressive high continuation consumes Flow's explicit continuation contract so the default single dense warmup is not repeated.
+- progressive high continuation consumes Flow's explicit continuation contract so the requested one-evaluation trajectory warmup is not spuriously restarted.
 
-The corrected production schedule is:
+With the conservative v0.1.3+ `dense_evaluations=1` default, matched Mixed-Grid validation reports:
 
 ```text
 18 logical
@@ -134,7 +177,7 @@ The corrected production schedule is:
 4 Spectrum forecasts
 ```
 
-The bypass control is 13 actual + 5 forecast. The one additional SOL actual is the intentional initial `dense -> sol` backend transition.
+The additional actual relative to a SOL-first schedule is the expected consequence of the real `dense -> sol` backend transition. The attention-measure path itself adds no transformer NFE.
 
 ## Zero-copy BTHD input layout
 
@@ -197,7 +240,7 @@ Rectangular repacking changes 64-row query groups compared with the historical s
 
 The K/V set available to each operation is unchanged. The approximation boundary is query grouping/routing, not VDN domain membership.
 
-The mixed route has an additional experimental boundary because mixed video rows are explicitly non-uniform. Sol-H3 relies on Flow's published contract rather than inventing a native-grid lattice.
+The mixed route has an additional explicit non-uniform-grid boundary. Sol-H3 relies on Flow's published contracts rather than inventing a native-grid lattice.
 
 ## Arithmetic gate
 
@@ -244,14 +287,16 @@ vdn_requested_q_rows == vdn_kernel_q_rows > 0
 vdn_square_expanded_calls = 0
 ```
 
-Mixed-grid success:
+Mixed-grid measure success:
 
 ```text
-external_mixed_sol_calls > 0
-external_mixed_q_rows == external_mixed_kernel_q_rows > 0
+external_mixed_measure_calls > 0
+external_mixed_measure_q_rows > 0
+external_mixed_measure_kv_rows_before > external_mixed_measure_kv_rows_after
+external_mixed_measure_removed_rows > 0
 ```
 
-Malformed/unsupported external layouts may instead report explicit `external_sequence_*` fallback. That is local delegation, not a reason to hard-fail the generation.
+Malformed/unsupported external layouts may instead report explicit `external_sequence_*` fallback. That is local delegation, not a reason to hard-fail generation.
 
 ## Performance boundary
 

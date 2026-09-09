@@ -146,6 +146,7 @@ def test_real_flow_mixed_grid_rebuilt_closures_are_forecast_provable():
         source_h=4,
         source_w=4,
         prefix_noise=torch.randn_like(prefix),
+        attention_measure=True,
     )
     video = torch.randn(1, 24, 4, 4, 4)
     audio = torch.randn(1, 32, 2, 3)

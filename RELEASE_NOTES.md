@@ -1,3 +1,64 @@
+# ComfyUI-Sol-H3 v0.1.4
+
+Coordinated companion release for MiniMax-H3 Flow-Aligned Regenerate v0.3.3. This release adds the real-SM120 K/V attention-measure path that fixes the smaller whole-frame shrink/top-edge reveal observed at some Mixed-Grid Continuum exact-prefix joins.
+
+## Flow Mixed-Grid attention measure
+
+Flow's mixed sequence keeps the protected prefix on the target spatial grid while the generated suffix remains on the lower source grid. In the validated production geometry, each protected-prefix frame contributes `28 x 38 = 1064` K/V rows while each source-grid suffix frame contributes `20 x 27 = 540` rows. Ordinary softmax therefore overweights the protected-prefix frame by about `1.97037x` in discrete K/V measure even though RoPE coordinates are continuous.
+
+Sol-H3 now consumes Flow's independent `h3_flow_mixed_grid_attention_measure_v1` contract after validating the existing VDN API-2 mixed sequence. It:
+
+- preserves every Q row;
+- preserves every non-video K/V row;
+- preserves every generated source-grid suffix K/V row exactly and in order;
+- applies explicit full-domain preprocessing such as Untwisting RoPE before reduction;
+- stratifies only protected-prefix K/V to the source-grid spatial measure using native MiniMax-H3 area-normalized `_frame_grid` coordinates;
+- sends the resulting rectangular Q/KV tensors through the same packaged Sana SM120 CuTe kernel;
+- fails closed on malformed or inconsistent measure metadata.
+
+Validated production accounting:
+
+```text
+Q:   56029 -> 56029
+K/V: 56029 -> 49741
+removed protected-prefix K/V rows: 6288 per call
+```
+
+VDN API 2 and its learned external-mode gate remain unchanged.
+
+## Spectrum history/receipt integration
+
+The audited route `sol_external_mixed_measure` is included in Sol-H3's backend-history receipt contract. Flow's replacement identity also includes whether the attention-measure path is active, so measure-on/off executions cannot silently share incompatible forecasting history. Unknown receipt routes and malformed state still fail closed.
+
+Matched run `00324` restored the expected schedule while keeping the measure path active:
+
+```text
+18 logical calls
+13 actual transformer NFE
+5 Spectrum forecasts
+
+low:   7 actual / 3 forecast
+high:  4 actual / 2 forecast
+probe: 2 actual
+```
+
+The real measure path executed 192 times with Q `56029`, K/V `49741`, no compatibility fallback and no numerical-backend transition.
+
+## Decoded-media acceptance
+
+The previously visible whole-frame shrink/top-edge reveal is absent in the matched decoded-media validation. The old problematic join remains approximately unit-scale in both the `dense_evaluations=0` validation output and the separate `dense_evaluations=1` quality follow-up, with no delayed framing pulse introduced by the K/V normalization.
+
+v0.1.4 does **not** change the SOL trajectory-warmup policy established by v0.1.3. `dense_evaluations=1` remains the conservative default and `dense_evaluations=0` remains the explicit maximum-speed mode. The framing correction is independent of that choice.
+
+## Compatibility
+
+- Linux/WSL SM120 remains the validated CuTe SOL execution target.
+- Native-Windows fail-closed behavior is unchanged.
+- Existing rectangular SOL, VDN provider, Spectrum, Untwist and Diff-Aid ownership semantics are preserved.
+- No extra H3 transformer NFE is introduced by the attention-measure operation itself.
+
+---
+
 # ComfyUI-Sol-H3 v0.1.3
 
 Patch release restoring the conservative one-evaluation dense SOL warmup after a controlled same-seed video comparison exposed a startup trajectory discontinuity when SOL approximation was enabled from the first sigma-1.0 denoiser evaluation.
@@ -125,7 +186,7 @@ That supports making zero the operational default for the tested stack, but it i
 
 ## Documentation and tests
 
-- Added `docs/DENSE_EVALUATIONS.md` with the backend-history rationale, timing evidence, quality boundary, migration behavior and the `dense_evaluations`/`dense_layers` distinction.
+- Added `docs/DENSE_EVALUATIONS.md` with the backend-history rationale, timing evidence, quality boundary, migration behavior, and the distinction between `dense_evaluations` and `dense_layers`.
 - Updated the README and changelog to distinguish historical v0.1.0/v0.1.1 warmup behavior from the v0.1.2 default.
 - Added regression coverage verifying that new SOL configs and the ComfyUI node default to `dense_evaluations=0`, while explicit one-evaluation warmup and Flow continuation handling remain supported.
 
