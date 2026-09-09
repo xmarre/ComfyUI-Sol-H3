@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.1.1 — 2026-09-09
+
+Patch release for native-Windows installation/provenance behavior reported in issue #4.
+
+### Fixed
+
+- Uses canonical POSIX manifest keys when verifying the vendored Sana source tree, fixing the Windows `Packaged Sana source file set mismatch` caused by `Path` backslash rendering.
+- Pins vendored source files to LF checkout and accepts only Git-style CRLF-to-LF normalization in addition to exact packaged bytes; arbitrary tampering still fails closed.
+- Adds Windows provenance CI for path semantics, CRLF normalization and tamper rejection.
+- Scopes the CuTe runtime toolchain dependencies to Linux, matching NVIDIA's supported CuTe DSL platforms.
+- Reports the Linux/WSL2 requirement explicitly when native Windows cannot provide the required `cute_sm120` backend.
+- Adds `docs/WINDOWS.md` with the supported-platform boundary and an AIMDO isolation procedure.
+
+### Scope and remaining boundary
+
+RTX 5090 is SM120 hardware, but NVIDIA's current CUTLASS CuTe DSL does not support native Windows. The real SOL `cute_sm120` kernel therefore still requires Linux/WSL2; v0.1.1 does not claim native-Windows SOL acceleration.
+
+The issue #4 request reached `sparse_calls=0` / `sol_backend=null` and later failed inside `comfy_aimdo.malloc_graph_pop`, while Exact Runtime had executed (`exact_blocks=600`). This release does not claim that the AIMDO access violation was caused by SOL or that it is fixed. Native-Windows Exact Runtime together with ComfyUI's AIMDO malloc-graph compiler remains unvalidated.
+
+The Linux/WSL SM120 production kernel contract and previously validated rectangular/VDN/Flow/Spectrum behavior are unchanged.
+
 ## v0.1.0 — 2026-09-09
 
 Initial production-validated release of ComfyUI-Sol-H3.
