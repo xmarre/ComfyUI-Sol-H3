@@ -1,3 +1,68 @@
+# ComfyUI-Sol-H3 v0.1.2
+
+Patch release changing the default SOL trajectory policy so new workflows start SOL on the first real denoiser evaluation instead of burning a full dense evaluation before switching numerical backends.
+
+## Default change
+
+`Sol-H3 SOL Attention (Experimental)` now defaults to:
+
+```text
+dense_evaluations = 0
+dense_layers      = 2
+```
+
+The previous `dense_evaluations=1` default created an initial `dense -> sol` numerical-backend transition. Spectrum correctly invalidates forecasting history across that transition, so the first would-be forecast became an additional actual transformer NFE solely to establish a SOL-side anchor.
+
+v0.1.2 does not weaken Spectrum's history/receipt safety. It removes that unnecessary transition from the default policy. Existing saved workflows retain their serialized `dense_evaluations` value, and `dense_evaluations=1` remains available as an explicit conservative trajectory warmup.
+
+`dense_layers=2` is unchanged. It keeps the first two H3 blocks dense inside each otherwise-SOL denoiser evaluation and does not add a full transformer NFE.
+
+## Controlled hot evidence
+
+Same seed, references, resolution, prompt, sampler, sampling settings and workflow structure; VDN disabled in all three runs:
+
+| Run | SOL | `dense_evaluations` | Logical | Actual | Forecast | H3 sampler | End-to-end |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `metrics_00321` | on | 1 | 40 | 26 | 14 | 353.36 s | 400.94 s |
+| `metrics_00322` | off | — | 40 | 25 | 15 | 374.84 s | 420.81 s |
+| `metrics_00323` | on | **0** | **40** | **25** | **15** | **332.56 s** | **380.57 s** |
+
+The new default therefore restores exact NFE/forecast topology parity with the no-SOL control:
+
+```text
+40 logical
+25 actual NFE
+15 Spectrum forecasts
+
+low:    15 actual / 9 forecast
+high:    8 actual / 6 forecast
+probe:   2 actual / 0 forecast
+```
+
+`metrics_00323` starts backend history directly in `phase=sol` and reports `numerical_backend_transitions=0`.
+
+Against the topology-matched no-SOL control, the tested SOL run is 42.28 s (11.3%) faster in H3 sampler wall time and 40.24 s (9.6%) faster end-to-end. This is a controlled measurement for this MiniMax-H3/RTX PRO 6000 deployment instance, not a universal Sol-Attn percentage.
+
+Against the previous `dense_evaluations=1` SOL run, sampler wall falls by 20.80 s (5.9%) and end-to-end wall by 20.37 s (5.1%). Arithmetic-gate/calibration time also varied between hot runs, so the defensible structural gain is the restored forecast replacing one full actual NFE; the entire wall-time delta should not be assigned to that NFE alone.
+
+## Quality boundary
+
+The same-seed `dense_evaluations=0` output is visibly different from the `dense_evaluations=1` output, which is expected when approximate SOL attention affects the trajectory from sigma 1.0. Manual inspection did not establish either video as better or worse.
+
+That supports making zero the operational default for the tested stack, but it is not statistical perceptual-equivalence evidence. Users who want the previous conservative policy can set `dense_evaluations=1` explicitly.
+
+## Documentation and tests
+
+- Added `docs/DENSE_EVALUATIONS.md` with the backend-history rationale, timing evidence, quality boundary, migration behavior and the `dense_evaluations`/`dense_layers` distinction.
+- Updated the README and changelog to distinguish historical v0.1.0/v0.1.1 warmup behavior from the v0.1.2 default.
+- Added regression coverage verifying that new SOL configs and the ComfyUI node default to `dense_evaluations=0`, while explicit one-evaluation warmup and Flow continuation handling remain supported.
+
+## Telemetry caveat
+
+The existing `dense_warmup` telemetry field counts attention calls kept dense by either `dense_evaluations` or `dense_layers`. It can therefore remain nonzero with `dense_evaluations=0`. Use the configured `dense_evaluations`, backend-history `phase`, `numerical_backend_transitions`, and actual/forecast topology to diagnose whole-evaluation warmup behavior.
+
+---
+
 # ComfyUI-Sol-H3 v0.1.1
 
 Patch release addressing the native-Windows failure reported in issue #4 without claiming unsupported native-Windows SOL kernel execution.
