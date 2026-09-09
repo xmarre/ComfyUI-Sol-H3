@@ -11,16 +11,27 @@ from sol_h3.runtime import Request
 HEAD_DIM = 128
 
 
-def _packed_component(rows, heads, component, *, device="cpu"):
+def _comfy_qkv_views(rows, heads, *, device="cpu"):
+    """Reproduce MiniMax-H3's qkv_proj(...).split(inner).view(T,H,D) layout.
+
+    Comfy's MiniMax-H3 attention projects one [T, 3*H*D] buffer, splits it
+    into whole-Q / whole-K / whole-V slabs, then views each slab as [T,H,D].
+    The resulting BTHD tensors therefore have a 3*H*D row stride but a normal
+    D head stride. This is the exact strided layout presented to the optimized
+    attention override after transpose(0,1).unsqueeze(0).
+    """
+    inner = heads * HEAD_DIM
     packed = torch.randn(
         1,
         rows,
-        heads,
-        3 * HEAD_DIM,
+        3 * inner,
         dtype=torch.bfloat16,
         device=device,
     )
-    return packed, packed.split(HEAD_DIM, dim=-1)[component]
+    return packed, tuple(
+        part.view(1, rows, heads, HEAD_DIM)
+        for part in packed.split(inner, dim=-1)
+    )
 
 
 def _dense_bthd(q, k, v):
@@ -31,13 +42,14 @@ def _dense_bthd(q, k, v):
     ).transpose(1, 2)
 
 
-def test_sparse_bridge_preserves_strided_views_and_calibrates_per_layout(monkeypatch):
-    """No-copy bridge identity follows the exact BTHD shape+stride contract."""
-    _, q_bthd = _packed_component(5, 2, 0)
-    kv_packed = torch.randn(1, 9, 2, 3 * HEAD_DIM, dtype=torch.bfloat16)
-    _, k_bthd, v_bthd = kv_packed.split(HEAD_DIM, dim=-1)
+def test_sparse_bridge_preserves_comfy_strided_views_and_calibrates_per_layout(monkeypatch):
+    """No-copy bridge identity follows the exact production BTHD shape+stride contract."""
+    _, (q_bthd, _, _) = _comfy_qkv_views(5, 2)
+    _, (_, k_bthd, v_bthd) = _comfy_qkv_views(9, 2)
     expected_ptrs = tuple(x.data_ptr() for x in (q_bthd, k_bthd, v_bthd))
     expected_strides = tuple(tuple(x.stride()) for x in (q_bthd, k_bthd, v_bthd))
+    assert expected_strides[0][1:] == (6 * HEAD_DIM, HEAD_DIM, 1)
+    assert expected_strides[1][1:] == (6 * HEAD_DIM, HEAD_DIM, 1)
     assert all(x.stride(-1) == 1 and not x.is_contiguous()
                for x in (q_bthd, k_bthd, v_bthd))
 
@@ -65,11 +77,14 @@ def test_sparse_bridge_preserves_strided_views_and_calibrates_per_layout(monkeyp
     state = Request(cfg)
     q, k, v = (x.transpose(1, 2) for x in (q_bthd, k_bthd, v_bthd))
 
-    # First layout calibrates once; the second identical call must reuse it.
+    # The first call contains calibration + execution. Both must receive the
+    # original Comfy storage pointers and strides; the second call must reuse
+    # that shape+stride gate rather than recalibrating.
     sparse.attention(q, k, v, 0, cfg, state, recompute_prefix_queries=False)
     sparse.attention(q, k, v, 0, cfg, state, recompute_prefix_queries=False)
     assert calls[0] == (expected_ptrs, expected_strides)
     assert calls[1] == (expected_ptrs, expected_strides)
+    assert calls[2] == (expected_ptrs, expected_strides)
     assert len(state.gates) == 1
 
     # Same shapes but contiguous BTHD storage are a different CuTe layout and
@@ -88,34 +103,35 @@ def test_sparse_bridge_preserves_strided_views_and_calibrates_per_layout(monkeyp
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("tq,tk", [(193, 193), (65, 449)])
-def test_real_sm120_sparse_bridge_accepts_exact_strided_bthd_views(tq, tk):
-    """Exercise the production transpose-view bridge on real SM120 CuTe."""
+def test_real_sm120_sparse_bridge_accepts_exact_comfy_strided_bthd_views(tq, tk):
+    """Exercise the production MiniMax-H3 transpose-view layout on real SM120 CuTe."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires real SM120")
 
     torch.manual_seed(91 + tq + tk)
-    q_packed = torch.randn(
-        1, tq, 2, 3 * HEAD_DIM, device="cuda", dtype=torch.bfloat16
-    )
+    _, qkv_q = _comfy_qkv_views(tq, 2, device="cuda")
     if tq == tk:
-        q_bthd, k_bthd, v_bthd = q_packed.split(HEAD_DIM, dim=-1)
+        q_bthd, k_bthd, v_bthd = qkv_q
     else:
-        q_bthd = q_packed.split(HEAD_DIM, dim=-1)[0]
-        kv_packed = torch.randn(
-            1, tk, 2, 3 * HEAD_DIM, device="cuda", dtype=torch.bfloat16
-        )
-        _, k_bthd, v_bthd = kv_packed.split(HEAD_DIM, dim=-1)
+        q_bthd = qkv_q[0]
+        _, qkv_kv = _comfy_qkv_views(tk, 2, device="cuda")
+        _, k_bthd, v_bthd = qkv_kv
 
+    expected_strides = [list(x.stride()) for x in (q_bthd, k_bthd, v_bthd)]
+    assert expected_strides[0][1:] == [6 * HEAD_DIM, HEAD_DIM, 1]
+    assert expected_strides[1][1:] == [6 * HEAD_DIM, HEAD_DIM, 1]
     assert all(x.stride(-1) == 1 and not x.is_contiguous()
                for x in (q_bthd, k_bthd, v_bthd))
-    expected_strides = [list(x.stride()) for x in (q_bthd, k_bthd, v_bthd)]
+
+    # This is exactly the BHTD form Comfy passes to optimized_attention with
+    # skip_reshape=True; sparse.attention's BTHD bridge transposes it back.
     q, k, v = (x.transpose(1, 2) for x in (q_bthd, k_bthd, v_bthd))
 
     cfg = Config(exact=False, backend="sol")
     state = Request(cfg)
     with torch.inference_mode():
         # Making every KV row a sink turns both the calibration and production
-        # call into an all-selected reference for this layout.
+        # call into an all-selected reference for this exact strided layout.
         got = sparse.attention(
             q,
             k,
