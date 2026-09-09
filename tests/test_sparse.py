@@ -127,8 +127,8 @@ def test_bridge_protects_prefix_and_uses_full_sink_gate(monkeypatch):
     assert all(c["sink_start"] == 0 for c in calls)
     assert dense_calls == [5]
     assert state.sparse_calls == 1
-    assert state.gates[0]["kernel_init_s"] >= 0.0
-    assert state.gates[0]["calibration_s"] >= 0.0
+    assert state.gates[0]["kernel_loader_s"] >= 0.0
+    assert state.gates[0]["gate_wall_s"] >= 0.0
     assert state.gates[0]["materialized_qkv_bytes"] == 3 * q.numel() * q.element_size()
     sparse.attention(q, k, v, 5, config, state, dense_attention=dense_attention)
     assert len(calls) == 3  # same-request shape gate reused
