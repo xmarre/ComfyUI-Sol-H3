@@ -149,7 +149,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         raise RuntimeError("Prefix query recomputation requires the original square packed sequence")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
-    kernel_init_s = 0.0
+    kernel_loader_s = 0.0
     if state.kernel is None:
         failure = getattr(state, "kernel_failure", None)
         if failure:
@@ -160,14 +160,14 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         except RuntimeError as exc:
             state.kernel_failure = str(exc)
             raise KernelUnavailable(str(exc)) from exc
-        kernel_init_s = time.perf_counter() - started
+        kernel_loader_s = time.perf_counter() - started
         state.kernel_device = q.device
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
 
     key = (q.device, q.dtype, tuple(q.shape), tuple(k.shape), tuple(v.shape))
     calibrating = key not in state.sparse_verified
-    calibration_started = time.perf_counter() if calibrating else None
+    gate_started = time.perf_counter() if calibrating else None
     # Retain the current materialized BTHD path for this diagnostic checkpoint.
     # The vendored SM120 API can accept innermost-contiguous strided views, but
     # changing that hot path is intentionally deferred until production timing
@@ -175,13 +175,15 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     qb, kb, vb = (x.transpose(1, 2).contiguous() for x in (q, k, v))
     if calibrating:
         # error_metrics() performs scalar reads and therefore synchronizes the
-        # calibration work already required by the correctness gate. Measuring
-        # the whole first-shape block adds no new steady-state synchronization.
+        # gate work already required by the correctness contract. The measured
+        # wall time starts before QKV materialisation, so it captures the whole
+        # first-shape tax (copies + CuTe specialization + all-selected kernel +
+        # dense reference + reductions) without a new steady-state sync.
         got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                            sink_start=0, sink_tokens=kb.shape[1])
         want = _dense_reference(q, k, v, None)
         metrics = error_metrics(got, want)
-        calibration_s = time.perf_counter() - calibration_started
+        gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(metrics):
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
         state.sparse_verified.add(key)
@@ -189,8 +191,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             "shape": list(q.shape),
             "kv_shape": list(k.shape),
             "backend": getattr(state.kernel, "backend_name", "test_substitute"),
-            "kernel_init_s": kernel_init_s,
-            "calibration_s": calibration_s,
+            "kernel_loader_s": kernel_loader_s,
+            "gate_wall_s": gate_wall_s,
             "materialized_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
             **metrics,
         })
