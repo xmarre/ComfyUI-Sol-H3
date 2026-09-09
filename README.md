@@ -12,7 +12,7 @@ The release has three parts:
 
 Unvalidated combinations are experimental telemetry rather than blanket errors. Hard failures are reserved for broken contracts, unsafe geometry/indexing, failed arithmetic verification or real execution failures.
 
-> **Native Windows:** RTX 5090 is SM120 hardware, but NVIDIA's current CUTLASS CuTe DSL does not support Windows. The real `cute_sm120` SOL kernel therefore requires Linux/WSL2. v0.1.1 fixed Windows provenance/install diagnostics, falls SOL back to inherited dense attention, and fails Exact Runtime closed to untouched native H3 before its Triton affine kernel can execute. It does not claim native-Windows SOL acceleration. See [Native Windows status](docs/WINDOWS.md).
+> **Native Windows:** the current custom SOL and Exact Runtime kernel paths are not supported execution targets. SOL delegates to inherited dense attention and Exact Runtime delegates to native H3, so the nodes can remain in a workflow but no Sol-H3 custom kernel executes. Use Linux/WSL2 on supported hardware for custom-kernel acceleration. See [Native Windows status](docs/WINDOWS.md).
 
 ## v0.1.3 default: one dense trajectory evaluation
 
@@ -296,7 +296,7 @@ python -m ruff check .
 python -m pytest -q
 ```
 
-GPU validation and production telemetry are documented in [VALIDATION](docs/VALIDATION.md). The v0.1.3 trajectory-warmup decision, historical timing evidence and startup-quality boundary are documented in [DENSE_EVALUATIONS](docs/DENSE_EVALUATIONS.md). Rectangular ownership, zero-copy layout behavior and approximation boundaries are documented in [RECTANGULAR](docs/RECTANGULAR.md). Source/interoperability provenance is in [AUDIT](docs/AUDIT.md). Native-Windows provenance and AIMDO isolation guidance is in [WINDOWS](docs/WINDOWS.md).
+GPU validation and production telemetry are documented in [VALIDATION](docs/VALIDATION.md). The v0.1.3 trajectory-warmup decision, historical timing evidence and startup-quality boundary are documented in [DENSE_EVALUATIONS](docs/DENSE_EVALUATIONS.md). Rectangular ownership, zero-copy layout behavior and approximation boundaries are documented in [RECTANGULAR](docs/RECTANGULAR.md). Source/interoperability provenance is in [AUDIT](docs/AUDIT.md). Native-Windows support, fallback behavior and troubleshooting are in [WINDOWS](docs/WINDOWS.md).
 
 Useful counters include:
 
