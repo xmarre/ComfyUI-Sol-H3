@@ -2,7 +2,7 @@
 
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
-**v0.1.1** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported SM120 Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
+**v0.1.2** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported SM120 Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
 
 The release has three parts:
 
@@ -12,13 +12,40 @@ The release has three parts:
 
 Unvalidated combinations are experimental telemetry rather than blanket errors. Hard failures are reserved for broken contracts, unsafe geometry/indexing, failed arithmetic verification or real execution failures.
 
-> **Native Windows:** RTX 5090 is SM120 hardware, but NVIDIA's current CUTLASS CuTe DSL does not support Windows. The real `cute_sm120` SOL kernel therefore requires Linux/WSL2. v0.1.1 fixes Windows provenance/install diagnostics, falls SOL back to inherited dense attention, and fails Exact Runtime closed to untouched native H3 before its Triton affine kernel can execute. It does not claim native-Windows SOL acceleration. See [Native Windows status](docs/WINDOWS.md).
+> **Native Windows:** RTX 5090 is SM120 hardware, but NVIDIA's current CUTLASS CuTe DSL does not support Windows. The real `cute_sm120` SOL kernel therefore requires Linux/WSL2. v0.1.1 fixed Windows provenance/install diagnostics, falls SOL back to inherited dense attention, and fails Exact Runtime closed to untouched native H3 before its Triton affine kernel can execute. It does not claim native-Windows SOL acceleration. See [Native Windows status](docs/WINDOWS.md).
+
+## v0.1.2 default: SOL from the first denoiser evaluation
+
+`Sol-H3 SOL Attention (Experimental)` now defaults to:
+
+```text
+dense_evaluations = 0
+dense_layers      = 2
+```
+
+The previous `dense_evaluations=1` default deliberately executed the first whole denoiser evaluation with inherited dense attention and then switched to SOL. With Spectrum, that `dense -> sol` numerical-backend transition invalidates the dense forecasting anchor, so the would-be first forecast becomes an additional actual transformer NFE.
+
+The default is now `0`: the first actual denoiser evaluation is already a SOL-side anchor, so Spectrum does not need an extra NFE solely to cross that backend boundary. Spectrum's backend-history invariant is unchanged; real numerical-route changes still invalidate incompatible forecasting history.
+
+`dense_layers=2` is unchanged. It keeps the first two H3 blocks dense inside each otherwise-SOL evaluation and does **not** add a full transformer NFE.
+
+Controlled no-VDN hot evidence with the same seed, references, resolution, prompt, sampler and workflow:
+
+| Run | SOL | `dense_evaluations` | Logical | Actual | Forecast | H3 sampler | End-to-end |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `metrics_00321` | on | 1 | 40 | 26 | 14 | 353.36 s | 400.94 s |
+| `metrics_00322` | off | — | 40 | 25 | 15 | 374.84 s | 420.81 s |
+| `metrics_00323` | on | **0** | **40** | **25** | **15** | **332.56 s** | **380.57 s** |
+
+`metrics_00323` therefore has exact NFE/forecast topology parity with the no-SOL control while remaining 42.28 s (11.3%) faster in H3 sampler wall time and 40.24 s (9.6%) faster end-to-end in that controlled hot pair. This is one deployment-instance measurement, not a universal SOL percentage. The same-seed video changed visibly, as expected for approximate attention acting from sigma 1.0, but manual inspection did not establish either output as better or worse. That is not a statistical perceptual-equivalence result.
+
+Existing saved workflows keep their serialized `dense_evaluations` value. Set `dense_evaluations=1` explicitly to retain the previous conservative trajectory warmup. See [SOL trajectory warmup](docs/DENSE_EVALUATIONS.md) for the scheduling rationale, timing breakdown, telemetry caveat and quality boundary.
 
 ## v0.1.0 production status
 
-The full production stack has been exercised on an **NVIDIA RTX PRO 6000 Blackwell Workstation Edition (SM120)** with PyTorch `2.10.0+cu130`.
+The original full production stack was exercised on an **NVIDIA RTX PRO 6000 Blackwell Workstation Edition (SM120)** with PyTorch `2.10.0+cu130`.
 
-The final validated stack preserves the expected Spectrum schedule:
+The v0.1.0 validation used the older one-evaluation dense warmup and produced:
 
 ```text
 sampler_logical_calls       18
@@ -30,13 +57,15 @@ high:   4 actual / 2 forecast
 probe:  2 actual / 0 forecast
 ```
 
-The SOL-bypassed control executes `13 actual + 5 forecast`; the one additional SOL actual is the deliberate first low-stage `dense -> sol` numerical-backend transition and remains a safety anchor.
+The SOL-bypassed control executed `13 actual + 5 forecast`; that historical extra SOL actual was the first low-stage `dense -> sol` numerical-backend transition. v0.1.2 removes that transition from the default policy rather than weakening Spectrum's history gate.
 
-The real packaged kernel, VDN API-v3 rectangular route, Flow mixed-grid route, Spectrum receipts/history, Untwist preprocessing and zero-copy BTHD bridge all passed production execution. See [Validation](docs/VALIDATION.md) for the full evidence matrix.
+The real packaged kernel, VDN API-v3 rectangular route, Flow mixed-grid route, Spectrum receipts/history, Untwist preprocessing and zero-copy BTHD bridge all passed production execution. See [Validation](docs/VALIDATION.md) for the original evidence matrix and [SOL trajectory warmup](docs/DENSE_EVALUATIONS.md) for the v0.1.2 default change.
 
 ## Nodes and composition
 
 Apply MODEL patches and then apply **Sol-H3 SOL Attention (Experimental)** before sampling. `exact_fusion=true` also requests Exact Runtime. A later **Sol-H3 Exact Runtime** node merges with the same lifecycle rather than installing a second one.
+
+The SOL node defaults to `tau=1.0`, `dense_evaluations=0`, and `dense_layers=2`. `dense_evaluations` is an explicit trajectory-level dense warmup; `dense_layers` is a per-evaluation leading-layer dense policy. They are not interchangeable.
 
 On native Windows, the node can remain in the workflow but both custom-kernel paths fail closed: SOL delegates to inherited dense attention because CuTe is unavailable, and Exact Runtime records `exact:native_windows_unvalidated` then executes the untouched native H3 block. Linux/WSL2 behavior is unchanged.
 
@@ -44,7 +73,7 @@ Supported composition includes Exact -> SOL, SOL -> Exact and repeated identical
 
 SOL wraps existing block replacements. Every attention call either executes SOL or delegates to the inherited owner with an explicit route/fallback receipt. A valid run may legitimately contain zero sparse calls.
 
-Generic `optimized_attention_override` providers such as KJ Sage remain the dense owner for warmup/dense-required rows when usable. Loader-level `ImportError`/`OSError` failures are request-locally demoted to original Comfy attention with telemetry; arbitrary CUDA/runtime compute failures are not swallowed.
+Generic `optimized_attention_override` providers such as KJ Sage remain the dense owner for explicit dense-evaluation warmup, dense leading layers and other dense-required rows when usable. Loader-level `ImportError`/`OSError` failures are request-locally demoted to original Comfy attention with telemetry; arbitrary CUDA/runtime compute failures are not swallowed.
 
 ## Interoperability companions
 
@@ -96,7 +125,7 @@ Representative native production stages:
 | Native high | 1,056 | 4,972,800 | 4,972,800 | 0 |
 | Later native high | 1,248 | 5,967,360 | 5,967,360 | 0 |
 
-The historical v2 compatibility bridge expanded Q work by roughly **4.4–5.4x** in the affected stages. v3 removes that kernel-row expansion while leaving VDN's K/V domain semantics intact.
+The historical v2 compatibility bridge expanded Q work by roughly **4.4–5.4x** in the affected native stages. v3 removes that kernel-row expansion while leaving VDN's K/V domain semantics intact.
 
 Global/anchor calls remain VDN-native. Masked Flex remains VDN-native; its existing grouped fallback can use v3.
 
@@ -131,10 +160,10 @@ Production-only history issues found during validation were fixed narrowly:
 
 - audited Diff-Aid activation wrappers are transparent only when Diff-Aid publishes its runtime declaration;
 - Flow's marked layout wrapper and mixed-grid wrapper are recognized only when exact marker/closure/geometry invariants agree;
-- progressive high stages consume Flow's explicit continuation contract so the default one-evaluation dense warmup is not spuriously restarted;
+- progressive high stages consume Flow's explicit continuation contract so an explicitly requested one-evaluation trajectory warmup is not spuriously restarted;
 - unknown/malformed wrappers remain opaque and force an actual call rather than weakening the gate.
 
-Untwist preprocessing remains exactly once. Receipt/provider transitions still reset incompatible history.
+Untwist preprocessing remains exactly once. Receipt/provider transitions still reset incompatible history. With the v0.1.2 default `dense_evaluations=0`, the first backend-history phase is already `sol`, so no default trajectory-level `dense -> sol` reset is created.
 
 ## SOL kernel contract
 
@@ -199,18 +228,29 @@ Historical matched production A/B:
 
 This is Exact-only evidence, not a SOL speed claim.
 
-### SOL whole-workflow timing
+### Controlled SOL-first A/B
 
-A pre-zero-copy same-process hot SOL run with the final 14/4 Spectrum schedule measured:
+The v0.1.2 `dense_evaluations=0` run (`metrics_00323`) and the no-SOL control (`metrics_00322`) both executed `40 logical / 25 actual / 15 forecast` calls. That removes the old NFE-topology confound:
+
+```text
+SOL, dense_evaluations=0:  332.56 s sampler / 380.57 s end-to-end
+SOL disabled:              374.84 s sampler / 420.81 s end-to-end
+```
+
+In this controlled hot pair, SOL reduces H3 sampler wall by 42.28 s (11.3%) and end-to-end wall by 40.24 s (9.6%). Arithmetic-gate and general hot-run variance still exist, so this remains deployment-specific evidence rather than a universal percentage.
+
+### Historical SOL whole-workflow timing
+
+A pre-zero-copy same-process hot SOL run with the old 14/4 Spectrum schedule measured:
 
 ```text
 end-to-end prompt       274.87 s
 H3ContinuumSamplerV34   229.13 s
 ```
 
-That run was faster than the SOL-bypassed control (`287.51 s` end-to-end / `240.55 s` sampler) despite executing one extra actual transformer NFE, but this is **not** claimed as a clean SOL speed percentage because routing/content/cache state were not a controlled A/B.
+That run was faster than the SOL-bypassed control (`287.51 s` end-to-end / `240.55 s` sampler) despite executing one extra actual transformer NFE, but this is **not** a clean SOL speed percentage because routing/content/cache state and NFE topology differed.
 
-Subsequent zero-copy workflow runs varied materially (`287.29/239.10 s` and `298.59/247.63 s` end-to-end/sampler) while preserving the same 14/4 schedule. Arithmetic-gate/caching cost also varied. Therefore the release makes no large whole-workflow zero-copy claim; the isolated kernel/layout A/B above is the authoritative zero-copy result.
+Subsequent zero-copy workflow runs varied materially (`287.29/239.10 s` and `298.59/247.63 s` end-to-end/sampler) while preserving the old 14/4 schedule. Arithmetic-gate/caching cost also varied. Therefore the isolated kernel/layout A/B remains the authoritative zero-copy result.
 
 ## Installation
 
@@ -254,7 +294,7 @@ python -m ruff check .
 python -m pytest -q
 ```
 
-GPU validation and production telemetry are documented in [VALIDATION](docs/VALIDATION.md). Rectangular ownership, zero-copy layout behavior and approximation boundaries are documented in [RECTANGULAR](docs/RECTANGULAR.md). Source/interoperability provenance is in [AUDIT](docs/AUDIT.md). Native-Windows provenance and AIMDO isolation guidance is in [WINDOWS](docs/WINDOWS.md).
+GPU validation and production telemetry are documented in [VALIDATION](docs/VALIDATION.md). The v0.1.2 trajectory-warmup decision and controlled hot evidence are documented in [DENSE_EVALUATIONS](docs/DENSE_EVALUATIONS.md). Rectangular ownership, zero-copy layout behavior and approximation boundaries are documented in [RECTANGULAR](docs/RECTANGULAR.md). Source/interoperability provenance is in [AUDIT](docs/AUDIT.md). Native-Windows provenance and AIMDO isolation guidance is in [WINDOWS](docs/WINDOWS.md).
 
 Useful counters include:
 
@@ -281,11 +321,13 @@ numerical_backend_transitions
 compatibility_fallbacks
 ```
 
+The legacy `dense_warmup` telemetry value counts attention calls kept dense by either `dense_evaluations` or `dense_layers`; it is not a count of full dense denoiser evaluations. With the v0.1.2 defaults it can therefore remain nonzero even though `dense_evaluations=0` and backend history starts in `phase=sol`.
+
 A successful run with zero sparse calls is valid execution telemetry but is not evidence of SOL acceleration.
 
 ## Release notes
 
-See [CHANGELOG.md](CHANGELOG.md) for the v0.1.1 release summary and validation boundaries.
+See [CHANGELOG.md](CHANGELOG.md) for the v0.1.2 release summary and validation boundaries.
 
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 
