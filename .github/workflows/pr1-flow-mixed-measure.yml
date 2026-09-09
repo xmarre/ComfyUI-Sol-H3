@@ -27,6 +27,7 @@ jobs:
           python -m pip install -e '.[test]' build
       - name: Focused validation
         run: |
+          ruff format sol_h3/mixed_measure.py sol_h3/runtime.py sol_h3/sparse.py tests/test_mixed_measure.py tests/test_external_mixed.py tests/test_attention_guard.py
           ruff check sol_h3/mixed_measure.py sol_h3/runtime.py sol_h3/sparse.py tests/test_mixed_measure.py tests/test_external_mixed.py tests/test_attention_guard.py
           ruff format --check sol_h3/mixed_measure.py sol_h3/runtime.py sol_h3/sparse.py tests/test_mixed_measure.py tests/test_external_mixed.py tests/test_attention_guard.py
           pytest -q tests/test_mixed_measure.py tests/test_external_mixed.py tests/test_attention_guard.py tests/test_interop.py
