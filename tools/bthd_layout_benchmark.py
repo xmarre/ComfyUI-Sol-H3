@@ -24,12 +24,20 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 
-from sol_h3 import sparse
+# Direct execution (``python tools/bthd_layout_benchmark.py``) puts ``tools/``
+# at sys.path[0], not the repository root. Bootstrap the checkout explicitly so
+# the documented command works without requiring an editable package install.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sol_h3 import sparse  # noqa: E402
 
 
 HEAD_DIM = 128
