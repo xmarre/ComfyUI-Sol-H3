@@ -2,7 +2,7 @@
 
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
-**v0.1.0** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On SM120 it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
+**v0.1.1** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported SM120 Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
 
 The release has three parts:
 
@@ -11,6 +11,8 @@ The release has three parts:
 - **Composable interoperability** — inherited dense providers, VDN grouped attention, Spectrum backend history, Untwist preprocessing, Diff-Aid and Flow mixed-grid routing can coexist when their ownership contracts are coherent.
 
 Unvalidated combinations are experimental telemetry rather than blanket errors. Hard failures are reserved for broken contracts, unsafe geometry/indexing, failed arithmetic verification or real execution failures.
+
+> **Native Windows:** RTX 5090 is SM120 hardware, but NVIDIA's current CUTLASS CuTe DSL does not support Windows. The real `cute_sm120` SOL kernel therefore requires Linux/WSL2. v0.1.1 fixes Windows provenance/install diagnostics; it does not claim native-Windows SOL acceleration. See [Native Windows status](docs/WINDOWS.md).
 
 ## v0.1.0 production status
 
@@ -229,9 +231,9 @@ git pull
 python -m pip install -r requirements.txt
 ```
 
-Dependencies are PyTorch, Triton `>=3.6,<4` on Linux, NVIDIA CUTLASS DSL with the CUDA 13 extra, CUDA Python and Apache TVM FFI. No Sana checkout, `SOL_ROOT`, special `PYTHONPATH`, runtime source download or linker override is required.
+On Linux/WSL2, dependencies include PyTorch, Triton `>=3.6,<4`, NVIDIA CUTLASS DSL with the CUDA 13 extra, CUDA Python and Apache TVM FFI. No Sana checkout, `SOL_ROOT`, special `PYTHONPATH`, runtime source download or linker override is required. The CuTe runtime dependencies are intentionally not installed on native Windows.
 
-The validated production target is **Linux/WSL on SM120**. Native Windows kernel execution remains unvalidated.
+The validated and supported SOL-kernel target is **Linux/WSL2 on SM120**. Native Windows cannot currently execute the required NVIDIA CuTe DSL backend; it falls back locally to inherited dense attention. See [Native Windows status](docs/WINDOWS.md).
 
 ## SageAttention on Blackwell
 
@@ -250,7 +252,7 @@ python -m ruff check .
 python -m pytest -q
 ```
 
-GPU validation and production telemetry are documented in [VALIDATION](docs/VALIDATION.md). Rectangular ownership, zero-copy layout behavior and approximation boundaries are documented in [RECTANGULAR](docs/RECTANGULAR.md). Source/interoperability provenance is in [AUDIT](docs/AUDIT.md).
+GPU validation and production telemetry are documented in [VALIDATION](docs/VALIDATION.md). Rectangular ownership, zero-copy layout behavior and approximation boundaries are documented in [RECTANGULAR](docs/RECTANGULAR.md). Source/interoperability provenance is in [AUDIT](docs/AUDIT.md). Native-Windows provenance and AIMDO isolation guidance is in [WINDOWS](docs/WINDOWS.md).
 
 Useful counters include:
 
@@ -281,7 +283,7 @@ A successful run with zero sparse calls is valid execution telemetry but is not 
 
 ## Release notes
 
-See [CHANGELOG.md](CHANGELOG.md) for the v0.1.0 release summary and validation boundaries.
+See [CHANGELOG.md](CHANGELOG.md) for the v0.1.1 release summary and validation boundaries.
 
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 
