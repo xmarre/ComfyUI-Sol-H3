@@ -137,19 +137,6 @@ def _dense_reference(q, k, v, dense_attention):
     return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
 
 
-def _bthd_view(x):
-    """Expose BHSD attention tensors as zero-copy BTHD views for Sana CuTe.
-
-    The vendored SM120 interface intentionally accepts arbitrary outer strides
-    as long as the head dimension is contiguous. Keeping the transpose as a
-    view avoids materialising Q/K/V on every sparse-attention invocation.
-    """
-    out = x.transpose(1, 2)
-    if out.stride(-1) != 1:
-        raise RuntimeError("SOL requires an innermost-contiguous head dimension")
-    return out
-
-
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
@@ -178,22 +165,18 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
 
-    qb, kb, vb = (_bthd_view(x) for x in (q, k, v))
-    layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (qb, kb, vb))
-    key = (
-        q.device,
-        q.dtype,
-        tuple(q.shape),
-        tuple(k.shape),
-        tuple(v.shape),
-        layout_key,
-    )
-    if key not in state.sparse_verified:
+    key = (q.device, q.dtype, tuple(q.shape), tuple(k.shape), tuple(v.shape))
+    calibrating = key not in state.sparse_verified
+    calibration_started = time.perf_counter() if calibrating else None
+    # Retain the current materialized BTHD path for this diagnostic checkpoint.
+    # The vendored SM120 API can accept innermost-contiguous strided views, but
+    # changing that hot path is intentionally deferred until production timing
+    # separates first-shape compile/calibration cost from steady-state copies.
+    qb, kb, vb = (x.transpose(1, 2).contiguous() for x in (q, k, v))
+    if calibrating:
         # error_metrics() performs scalar reads and therefore synchronizes the
         # calibration work already required by the correctness gate. Measuring
-        # this whole block adds no extra steady-state synchronization and makes
-        # cold CuTe compile/calibration cost visible in production telemetry.
-        calibration_started = time.perf_counter()
+        # the whole first-shape block adds no new steady-state synchronization.
         got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                            sink_start=0, sink_tokens=kb.shape[1])
         want = _dense_reference(q, k, v, None)
@@ -205,11 +188,10 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         state.gates.append({
             "shape": list(q.shape),
             "kv_shape": list(k.shape),
-            "bthd_strides": [list(s) for s in layout_key],
-            "zero_copy_bthd": True,
+            "backend": getattr(state.kernel, "backend_name", "test_substitute"),
             "kernel_init_s": kernel_init_s,
             "calibration_s": calibration_s,
-            "backend": getattr(state.kernel, "backend_name", "test_substitute"),
+            "materialized_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
             **metrics,
         })
         del got, want
