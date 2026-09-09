@@ -13,7 +13,7 @@ class Config:
     exact: bool = True
     backend: str = "inherit"
     tau: float = 1.0
-    dense_evaluations: int = 1
+    dense_evaluations: int = 0
     dense_layers: int = 2
 
     def __post_init__(self):
