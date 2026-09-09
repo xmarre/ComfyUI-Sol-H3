@@ -93,3 +93,16 @@ def test_sparse_rectangular_prefix_recompute_uses_reduced_kv(monkeypatch):
     out = sparse.attention(q, k, v, 3, cfg, state, dense_attention=dense)
     assert out.shape == (1, 9, 128)
     assert observed == [(3, 7, 7)]
+
+
+
+def test_history_policy_accepts_external_mixed_measure_receipts():
+    from sol_h3.interop import HistoryPolicy
+
+    policy = HistoryPolicy(object())
+    assert policy.accept_receipts([("sol_h3", 0, "sol_external_mixed_measure")])
+    assert policy.accept_receipts([
+        ("sol_h3", 0, "dense_warmup"),
+        ("sol_h3", 1, "sol_external_mixed_measure"),
+    ])
+    assert not policy.accept_receipts([("sol_h3", 0, "unknown_measure_route")])
