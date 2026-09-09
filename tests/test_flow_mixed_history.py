@@ -236,6 +236,9 @@ def test_real_flow_high_continuation_does_not_restart_dense_evaluation_warmup():
             high_identity = HistoryPolicy(cfg)(layout=_native_layout(), options=high, model=model)
             assert high_identity is not None and high_identity[1] == "sol"
             assert not dense_evaluation_warmup(cfg, 0, high)
+            # Larger explicit warmups are not guessed across the split lifecycle.
+            long_warmup = Config(exact=False, backend="sol", dense_evaluations=2, dense_layers=0)
+            assert dense_evaluation_warmup(long_warmup, 0, high)
 
         # The one-call handoff probe deliberately remains a dense exact anchor.
         with _flow_stage_contract(guider, "probe"), _high_stage_contract(guider):
