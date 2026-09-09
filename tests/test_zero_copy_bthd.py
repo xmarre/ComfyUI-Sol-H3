@@ -13,26 +13,29 @@ PRODUCTION_HEADS = 56
 
 
 def _comfy_qkv_views(rows, heads, *, device="cpu"):
-    """Reproduce MiniMax-H3's qkv_proj(...).split(inner).view(T,H,D) layout.
+    """Reproduce MiniMax-H3's exact optimized-attention BTHD layout.
 
     Comfy's MiniMax-H3 attention projects one [T, 3*H*D] buffer, splits it
-    into whole-Q / whole-K / whole-V slabs, then views each slab as [T,H,D].
-    The resulting BTHD tensors therefore have a 3*H*D row stride but a normal
-    D head stride. This is the exact strided layout presented to the optimized
-    attention override after transpose(0,1).unsqueeze(0).
+    into whole-Q / whole-K / whole-V slabs, views each slab as [T,H,D], then
+    executes ``transpose(0, 1).unsqueeze(0)`` before optimized_attention.
+    Reversing optimized_attention's BHTD presentation back to BTHD therefore
+    yields the production stride tuple ``[H*D, 3*H*D, D, 1]``. The leading
+    size-one batch stride matters to CuTe's exact specialization key even
+    though it does not change addressing within the batch.
     """
     inner = heads * HEAD_DIM
     packed = torch.randn(
-        1,
         rows,
         3 * inner,
         dtype=torch.bfloat16,
         device=device,
     )
-    return packed, tuple(
-        part.view(1, rows, heads, HEAD_DIM)
-        for part in packed.split(inner, dim=-1)
-    )
+    bthd = []
+    for part in packed.split(inner, dim=-1):
+        thd = part.view(rows, heads, HEAD_DIM)
+        bhtd = thd.transpose(0, 1).unsqueeze(0)
+        bthd.append(bhtd.transpose(1, 2))
+    return packed, tuple(bthd)
 
 
 def _dense_bthd(q, k, v):
@@ -49,8 +52,8 @@ def test_sparse_bridge_preserves_comfy_strided_views_and_calibrates_per_layout(m
     _, (_, k_bthd, v_bthd) = _comfy_qkv_views(9, 2)
     expected_ptrs = tuple(x.data_ptr() for x in (q_bthd, k_bthd, v_bthd))
     expected_strides = tuple(tuple(x.stride()) for x in (q_bthd, k_bthd, v_bthd))
-    assert expected_strides[0][1:] == (6 * HEAD_DIM, HEAD_DIM, 1)
-    assert expected_strides[1][1:] == (6 * HEAD_DIM, HEAD_DIM, 1)
+    expected_stride = (2 * HEAD_DIM, 6 * HEAD_DIM, HEAD_DIM, 1)
+    assert expected_strides == (expected_stride, expected_stride, expected_stride)
     assert all(x.stride(-1) == 1 and not x.is_contiguous()
                for x in (q_bthd, k_bthd, v_bthd))
 
@@ -120,9 +123,8 @@ def test_real_sm120_sparse_bridge_accepts_exact_comfy_strided_bthd_views(tq, tk)
         _, k_bthd, v_bthd = qkv_kv
 
     expected_strides = [list(x.stride()) for x in (q_bthd, k_bthd, v_bthd)]
-    expected_inner_stride = 3 * heads * HEAD_DIM
-    assert expected_strides[0][1:] == [expected_inner_stride, HEAD_DIM, 1]
-    assert expected_strides[1][1:] == [expected_inner_stride, HEAD_DIM, 1]
+    expected_stride = [heads * HEAD_DIM, 3 * heads * HEAD_DIM, HEAD_DIM, 1]
+    assert expected_strides == [expected_stride, expected_stride, expected_stride]
     assert all(x.stride(-1) == 1 and not x.is_contiguous()
                for x in (q_bthd, k_bthd, v_bthd))
 
