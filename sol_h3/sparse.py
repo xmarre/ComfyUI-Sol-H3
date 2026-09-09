@@ -137,6 +137,11 @@ def _dense_reference(q, k, v, dense_attention):
     return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
 
 
+def _bthd_layout_key(*tensors):
+    """Describe the exact BTHD layouts consumed by CuTe for calibration identity."""
+    return tuple((tuple(x.shape), tuple(x.stride())) for x in tensors)
+
+
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
@@ -165,20 +170,20 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
 
-    key = (q.device, q.dtype, tuple(q.shape), tuple(k.shape), tuple(v.shape))
+    # CuTe accepts innermost-contiguous strided BTHD tensors. Preserve the exact
+    # transposed views instead of materialising Q/K/V copies on every SOL call.
+    qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
+    if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
+        raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
+
+    layout_key = _bthd_layout_key(qb, kb, vb)
+    key = (q.device, q.dtype, layout_key)
     calibrating = key not in state.sparse_verified
     gate_started = time.perf_counter() if calibrating else None
-    # Retain the current materialized BTHD path for this diagnostic checkpoint.
-    # The vendored SM120 API can accept innermost-contiguous strided views, but
-    # changing that hot path is intentionally deferred until production timing
-    # separates first-shape compile/calibration cost from steady-state copies.
-    qb, kb, vb = (x.transpose(1, 2).contiguous() for x in (q, k, v))
     if calibrating:
-        # error_metrics() performs scalar reads and therefore synchronizes the
-        # gate work already required by the correctness contract. The measured
-        # wall time starts before QKV materialisation, so it captures the whole
-        # first-shape tax (copies + CuTe specialization + all-selected kernel +
-        # dense reference + reductions) without a new steady-state sync.
+        # The all-selected gate now validates the exact strided layout that the
+        # hot path will reuse. error_metrics() already performs scalar reads, so
+        # this adds no new steady-state synchronization point.
         got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                            sink_start=0, sink_tokens=kb.shape[1])
         want = _dense_reference(q, k, v, None)
@@ -193,7 +198,9 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             "backend": getattr(state.kernel, "backend_name", "test_substitute"),
             "kernel_loader_s": kernel_loader_s,
             "gate_wall_s": gate_wall_s,
-            "materialized_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
+            "materialized_qkv_bytes": 0,
+            "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
+            "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
             **metrics,
         })
         del got, want
