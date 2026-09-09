@@ -2,7 +2,7 @@
 
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
-**v0.1.0** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On SM120 it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
+**v0.1.1** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported SM120 Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
 
 The release has three parts:
 
@@ -11,6 +11,8 @@ The release has three parts:
 - **Composable interoperability** — inherited dense providers, VDN grouped attention, Spectrum backend history, Untwist preprocessing, Diff-Aid and Flow mixed-grid routing can coexist when their ownership contracts are coherent.
 
 Unvalidated combinations are experimental telemetry rather than blanket errors. Hard failures are reserved for broken contracts, unsafe geometry/indexing, failed arithmetic verification or real execution failures.
+
+> **Native Windows:** RTX 5090 is SM120 hardware, but NVIDIA's current CUTLASS CuTe DSL does not support Windows. The real `cute_sm120` SOL kernel therefore requires Linux/WSL2. v0.1.1 fixes Windows provenance/install diagnostics, falls SOL back to inherited dense attention, and fails Exact Runtime closed to untouched native H3 before its Triton affine kernel can execute. It does not claim native-Windows SOL acceleration. See [Native Windows status](docs/WINDOWS.md).
 
 ## v0.1.0 production status
 
@@ -35,6 +37,8 @@ The real packaged kernel, VDN API-v3 rectangular route, Flow mixed-grid route, S
 ## Nodes and composition
 
 Apply MODEL patches and then apply **Sol-H3 SOL Attention (Experimental)** before sampling. `exact_fusion=true` also requests Exact Runtime. A later **Sol-H3 Exact Runtime** node merges with the same lifecycle rather than installing a second one.
+
+On native Windows, the node can remain in the workflow but both custom-kernel paths fail closed: SOL delegates to inherited dense attention because CuTe is unavailable, and Exact Runtime records `exact:native_windows_unvalidated` then executes the untouched native H3 block. Linux/WSL2 behavior is unchanged.
 
 Supported composition includes Exact -> SOL, SOL -> Exact and repeated identical applications. Different SOL policies on the same MODEL branch are ambiguous and require separate branches.
 
@@ -177,7 +181,7 @@ Interpretation:
 
 - strided CuTe execution is effectively parity with pre-contiguous CuTe (`-0.37%` CUDA / `-0.09%` wall);
 - the old copies add about `0.786 ms` CUDA / `0.761 ms` host wall per representative mixed call;
-- the zero-copy path is about `2.01%` faster than old copy+kernel in CUDA timing and `1.85%` faster in host-wall timing for this isolated call;
+- the zero-copy path is about `2.01%` faster than old copy+kernel in CUDA timing and `1.85%` faster than old copy+kernel in host-wall timing for this isolated call;
 - the old bridge materialized `1,248,522,240` bytes per mixed call. Across 144 representative mixed calls, zero-copy avoids about **167.44 GiB** of redundant Q/V materialization and about **0.11 s** of direct copy overhead.
 
 This is intentionally a **micro-optimization** claim. It does not explain multi-second whole-workflow variance.
@@ -229,9 +233,9 @@ git pull
 python -m pip install -r requirements.txt
 ```
 
-Dependencies are PyTorch, Triton `>=3.6,<4` on Linux, NVIDIA CUTLASS DSL with the CUDA 13 extra, CUDA Python and Apache TVM FFI. No Sana checkout, `SOL_ROOT`, special `PYTHONPATH`, runtime source download or linker override is required.
+On Linux/WSL2, dependencies include PyTorch, Triton `>=3.6,<4`, NVIDIA CUTLASS DSL with the CUDA 13 extra, CUDA Python and Apache TVM FFI. No Sana checkout, `SOL_ROOT`, special `PYTHONPATH`, runtime source download or linker override is required. The custom-kernel runtime dependencies are intentionally not installed on native Windows.
 
-The validated production target is **Linux/WSL on SM120**. Native Windows kernel execution remains unvalidated.
+The validated and supported SOL/Exact custom-kernel target is **Linux/WSL2 on SM120**. Native Windows cannot currently execute the required NVIDIA CuTe DSL backend; SOL falls back locally to inherited dense attention and Exact Runtime delegates to native H3. See [Native Windows status](docs/WINDOWS.md).
 
 ## SageAttention on Blackwell
 
@@ -250,7 +254,7 @@ python -m ruff check .
 python -m pytest -q
 ```
 
-GPU validation and production telemetry are documented in [VALIDATION](docs/VALIDATION.md). Rectangular ownership, zero-copy layout behavior and approximation boundaries are documented in [RECTANGULAR](docs/RECTANGULAR.md). Source/interoperability provenance is in [AUDIT](docs/AUDIT.md).
+GPU validation and production telemetry are documented in [VALIDATION](docs/VALIDATION.md). Rectangular ownership, zero-copy layout behavior and approximation boundaries are documented in [RECTANGULAR](docs/RECTANGULAR.md). Source/interoperability provenance is in [AUDIT](docs/AUDIT.md). Native-Windows provenance and AIMDO isolation guidance is in [WINDOWS](docs/WINDOWS.md).
 
 Useful counters include:
 
@@ -281,7 +285,7 @@ A successful run with zero sparse calls is valid execution telemetry but is not 
 
 ## Release notes
 
-See [CHANGELOG.md](CHANGELOG.md) for the v0.1.0 release summary and validation boundaries.
+See [CHANGELOG.md](CHANGELOG.md) for the v0.1.1 release summary and validation boundaries.
 
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 

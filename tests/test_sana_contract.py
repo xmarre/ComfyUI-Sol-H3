@@ -3,7 +3,7 @@ import ast
 import hashlib
 import inspect
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 
@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from sol_h3._vendor.sol_attn import interface
-from sol_h3.provenance import verify_source, REVISION
+from sol_h3.provenance import _manifest_name, verify_source, REVISION
 from tools.vendor_sol_attn import package_sources
 
 
@@ -43,6 +43,12 @@ def test_provenance_and_node_local_imports():
     assert 'BSD 3-Clause' in (root / 'sm100/LICENSE.flash-attention').read_text()
     assert 'Apache License' in (root.parent / 'LICENSE.Apache-2.0').read_text()
     assert 'NVIDIA' in (root / 'THIRD_PARTY_NOTICES.md').read_text()
+
+
+def test_manifest_names_are_platform_independent():
+    source = PureWindowsPath(r'C:\ComfyUI\custom_nodes\ComfyUI-Sol-H3\sol_h3\_vendor\sol_attn')
+    path = source / '_vendor' / 'flash_attn' / 'cute' / 'softmax.py'
+    assert _manifest_name(path, source) == '_vendor/flash_attn/cute/softmax.py'
 
 
 def test_public_api():
@@ -117,17 +123,38 @@ def test_import_without_global_checkout_or_pythonpath(tmp_path):
                    cwd=tmp_path, env=env, check=True)
 
 
-def test_tampered_source_cannot_claim_verified(tmp_path, monkeypatch):
+def _copy_provenance_tree(tmp_path, monkeypatch):
     import shutil
     from sol_h3 import provenance
     source = Path(provenance.__file__).parent
     shutil.copytree(source / '_vendor', tmp_path / '_vendor')
     shutil.copyfile(source / 'sol_manifest.json', tmp_path / 'sol_manifest.json')
     monkeypatch.setattr(provenance, '__file__', str(tmp_path / 'provenance.py'))
+    return provenance
+
+
+def test_git_crlf_checkout_preserves_provenance(tmp_path, monkeypatch):
+    provenance = _copy_provenance_tree(tmp_path, monkeypatch)
+    target = tmp_path / '_vendor/sol_attn/interface.py'
+    target.write_bytes(target.read_bytes().replace(b'\n', b'\r\n'))
+    assert provenance.verify_source()['revision'] == REVISION
+
+
+def test_tampered_source_cannot_claim_verified(tmp_path, monkeypatch):
+    provenance = _copy_provenance_tree(tmp_path, monkeypatch)
     target = tmp_path / '_vendor/sol_attn/interface.py'
     target.write_text(target.read_text() + '\n# corrupt\n')
     with pytest.raises(RuntimeError, match='hash mismatch: interface.py'):
         provenance.verify_source()
+
+
+def test_native_windows_missing_cute_reports_supported_path(monkeypatch):
+    from sol_h3 import sparse
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device=None: (12, 0))
+    monkeypatch.setattr(interface, '_cute_runtime_available', lambda: False)
+    monkeypatch.setattr(sparse.sys, 'platform', 'win32')
+    with pytest.raises(RuntimeError, match=r'native Windows.*Linux/WSL2'):
+        sparse.load_kernel(torch.device('cuda'))
 
 
 def test_missing_cute_counts_no_sparse_and_caches_reason(monkeypatch):

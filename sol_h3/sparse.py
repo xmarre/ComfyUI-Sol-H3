@@ -1,5 +1,6 @@
 """Native attention bridge to the packaged Sana Sol-H3 implementation."""
 import math
+import sys
 import time
 
 import torch
@@ -49,6 +50,11 @@ def load_kernel(device):
         from ._vendor.sol_attn import get_sol_attn_backend, sol_attn
         backend = get_sol_attn_backend(device)
         if backend != "cute_sm120":
+            if sys.platform == "win32":
+                raise RuntimeError(
+                    "native Windows cannot execute the required NVIDIA CUTLASS CuTe DSL backend; "
+                    "SM120 SOL attention currently requires Linux/WSL2"
+                )
             raise RuntimeError(
                 f"Sana selected {backend}; SM120 requires CuTe (cutlass.cute and cuda.bindings.driver)"
             )
