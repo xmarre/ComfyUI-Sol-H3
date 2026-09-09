@@ -7,7 +7,7 @@ import logging
 from .contracts import KEY, Config, adaln_status, prefix_length
 from .interop import (
     HISTORY_KEY, VDN_KEY, VDN_KEY_V2, VDN_KEY_V3, VDN_PREPROCESS_KEY,
-    HistoryPolicy, provider_name, receipt,
+    HistoryPolicy, dense_evaluation_warmup, provider_name, receipt,
 )
 
 log = logging.getLogger("comfy.sol_h3")
@@ -262,7 +262,8 @@ class BlockPatch:
 
         if config.backend == "sol":
             previous = options.get("optimized_attention_override")
-            warmup = evaluation < config.dense_evaluations or self.index < config.dense_layers
+            warmup = (dense_evaluation_warmup(config, evaluation, options)
+                      or self.index < config.dense_layers)
 
             def override(original, q, k, v, heads, mask=None, **kw):
                 dense_provider = previous
