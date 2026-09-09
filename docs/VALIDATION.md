@@ -103,8 +103,6 @@ Progressive high stages are separate sampling lifetimes. Sol-H3 consumes Flow's 
 
 ### Final production schedule
 
-The corrected production stack consistently reaches:
-
 ```text
 sampler_logical_calls       18
 transformer_actual_nfe      14
@@ -130,7 +128,7 @@ requested/kernel Q rows = 1:1
 square expansion         = 0
 ```
 
-The exact mixed production layout is:
+Exact mixed production layout:
 
 ```text
 shape      [1, 43545, 56, 128]
@@ -140,14 +138,6 @@ K stride   [7168,  7168, 128, 1]
 
 ### Isolated A/B benchmark
 
-The benchmark feeds identical Q/K/V values to three paths:
-
-```text
-strided              current zero-copy path
-contiguous_kernel    kernel-only on pre-materialized contiguous BTHD
-copy_plus_kernel     historical per-call .contiguous() bridge + kernel
-```
-
 Seven-run medians on the production RTX PRO 6000:
 
 | Path | CUDA median | Host-wall median |
@@ -156,7 +146,7 @@ Seven-run medians on the production RTX PRO 6000:
 | contiguous kernel | 46.941 ms | 42.376 ms |
 | old copy + kernel | 47.727 ms | 43.136 ms |
 
-The timing clocks are interpreted internally, not against each other. Both agree on the decision:
+Interpret within each timing clock:
 
 - strided vs pre-contiguous kernel: effective parity (`-0.37%` CUDA / `-0.09%` wall);
 - old materialization overhead: about `0.786 ms` CUDA / `0.761 ms` wall per representative mixed call;
@@ -198,18 +188,15 @@ H3ContinuumSamplerV34   240.55 s
 schedule                 13 actual / 5 forecast
 ```
 
-The SOL run was faster despite one additional actual NFE, but the release does **not** convert that into a percentage SOL speed claim because the runs are not a controlled routing/content/cache A/B.
+The SOL run was faster despite one additional actual NFE, but v0.1.0 does **not** convert that into a percentage SOL speed claim because the runs are not a controlled routing/content/cache A/B.
 
 Later zero-copy workflow runs measured `287.29/239.10 s` and `298.59/247.63 s` end-to-end/sampler while retaining 14/4. Arithmetic-gate/caching time itself varied materially between those runs. The isolated BTHD benchmark is therefore the authoritative zero-copy measurement.
 
 ## Current CI gate
 
-The release candidate remains one implementation commit over neutral Sol `main` while development occurs on mirrors/checkpoints.
+Final pre-release validation covers:
 
-Final pre-release validation includes:
-
-- `pip check`;
-- Ruff;
+- `pip check` and Ruff;
 - full Sol-H3 CPU suite;
 - pinned Sana source reproduction;
 - real Comfy ModelPatcher integration;
@@ -223,15 +210,15 @@ Final pre-release validation includes:
 - direct BTHD benchmark invocation regression;
 - zero-copy stride/materialization contracts.
 
-The final release-polish mirror and the final PR head must both pass the CPU-contract and pinned native-interop lanes before merge.
+The release-polish mirror and final PR head must both pass the CPU-contract and pinned native-interop lanes before merge.
 
 ## Validation commands
 
-From an installed checkout:
+Set the ComfyUI root explicitly and run from the installed node checkout:
 
 ```bash
-conda activate comfy312
-cd /home/toor/ComfyUI/custom_nodes/comfyui-sol-h3
+export COMFYUI_ROOT=/path/to/ComfyUI
+cd "$COMFYUI_ROOT/custom_nodes/ComfyUI-Sol-H3"
 
 python -m pip install -r requirements.txt
 python -m pip check
