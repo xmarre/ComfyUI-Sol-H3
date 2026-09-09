@@ -15,6 +15,8 @@ test = ["pytest>=8", "ruff"]
 
 [project.urls]
 Repository = "https://github.com/xmarre/ComfyUI-Sol-H3"
+Documentation = "https://github.com/xmarre/ComfyUI-Sol-H3#readme"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-Sol-H3/issues"
 
 [tool.setuptools.packages.find]
 include = ["sol_h3*"]
@@ -37,3 +39,4 @@ select = ["E4", "E7", "E9", "F"]
 [tool.comfy]
 PublisherId = "xmarre"
 DisplayName = "ComfyUI Sol-H3"
+Icon = ""
