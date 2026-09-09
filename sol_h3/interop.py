@@ -49,10 +49,21 @@ def _flow_progressive_high_continuation(options):
 
 
 def dense_evaluation_warmup(config, evaluation, options):
-    """Return whether the current evaluation is in Sol's trajectory warmup."""
+    """Return whether the current evaluation is in Sol's trajectory warmup.
+
+    The audited Flow continuation can suppress only the default single dense
+    evaluation: its low stage necessarily consumed that trajectory-start anchor
+    before the high continuation begins. Larger user-requested warmups remain
+    request-local because Sol cannot prove how many of those evaluations were
+    consumed before an arbitrary handoff.
+    """
+    continuation_consumed_default = bool(
+        config.dense_evaluations == 1
+        and _flow_progressive_high_continuation(options)
+    )
     return bool(
         evaluation < config.dense_evaluations
-        and not _flow_progressive_high_continuation(options)
+        and not continuation_consumed_default
     )
 
 
