@@ -108,6 +108,45 @@ compatibility_fallbacks              {}
 
 An earlier run also established 192 mixed calls / 8,360,640 requested and kernel rows 1:1. Malformed/stale/unknown contracts delegate locally to inherited attention; later native target-grid calls can resume SOL.
 
+### Experimental K/V attention-measure normalization
+
+Flow PR #24 can publish a second, independent contract alongside API 2:
+
+```text
+key  = h3_flow_mixed_grid_attention_measure_v1
+api  = 1
+mode = prefix_kv_stratified_subsample
+```
+
+This contract addresses unequal discrete spatial sampling density inside the mixed attention domain; it does not redefine the mixed sequence or VDN ownership. The motivating geometry has `1064` protected-prefix rows/frame and `540` source-suffix rows/frame (`~1.97037x`).
+
+Sol-H3 validates the measure metadata against the current API-2 mixed contract and full Q/K/V row counts. Explicit preprocessing such as Untwist is applied to the original full mixed domain first. Then only K/V are gathered:
+
+- every Q row is preserved;
+- every row before target video is preserved;
+- every generated source-grid suffix K/V row is preserved exactly and in order;
+- each protected prefix frame keeps one K/V representative nearest every source-grid coordinate under MiniMax-H3's native area-normalized `_frame_grid` geometry.
+
+For the matched production geometry:
+
+```text
+Q:   56029 -> 56029
+K/V: 56029 -> 49741
+```
+
+`49741` equals the native low-carrier packed row count. The SM120 call is therefore rectangular in the ordinary kernel sense: query ownership remains the full mixed sequence while the softmax K/V integration measure is normalized to source-grid spatial density.
+
+The representative mapping is regression-tested against pinned native ComfyUI `_frame_grid` coordinates row-for-row. Contract mismatches fail closed rather than silently selecting a different K/V domain. The experiment remains off by default in Flow and requires decoded-media validation before promotion.
+
+Expected telemetry when active:
+
+```text
+external_mixed_measure_calls > 0
+external_mixed_measure_q_rows > 0
+external_mixed_measure_kv_rows_before > external_mixed_measure_kv_rows_after
+external_mixed_measure_removed_rows > 0
+```
+
 ## Untwist preprocessing
 
 VDN's full-domain preprocessing hook runs on complete post-RoPE packed Q/K/V before grouped gathering. This preserves packed-row coordinates for transforms such as Untwist.

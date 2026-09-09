@@ -156,8 +156,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             or q.shape[2] == 0 or k.shape[2] == 0):
         raise RuntimeError("SOL requires Q [1, heads, Tq, 128], KV [1, heads, Tkv, 128]")
     _sink_blocks(0, prefix, k.shape[2])
-    if recompute_prefix_queries and q.shape != k.shape:
-        raise RuntimeError("Prefix query recomputation requires the original square packed sequence")
+    if recompute_prefix_queries and prefix > q.shape[2]:
+        raise RuntimeError("Prefix query recomputation exceeds the available Q rows")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
     kernel_loader_s = 0.0
