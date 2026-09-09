@@ -8,6 +8,8 @@ VDN_KEY_V2 = "vdn_softmax_provider_v2"
 VDN_KEY_V3 = "vdn_softmax_provider_v3"
 VDN_PREPROCESS_KEY = "vdn_attention_preprocess_v1"
 SPECTRUM_EXTERNAL_RUNTIME_KEY = "spectrum_h3_external_patch_runtime"
+FLOW_STAGE_KEY = "h3_flow_stage"
+FLOW_REFINEMENT_KEY = "h3_refinement"
 
 
 def provider_name(provider):
@@ -20,6 +22,38 @@ def receipt(options, block, route):
     sink = options.get(RECEIPTS_KEY)
     if sink is not None:
         sink.append(("sol_h3", block, route))
+
+
+def _flow_progressive_high_continuation(options):
+    """Recognize Flow's explicit later-stage continuation contract.
+
+    Flow splits one progressive trajectory into low/probe/high OUTER_SAMPLE
+    lifetimes so Spectrum can own history independently in each lifetime. Its
+    high-stage contract nevertheless states that this is a continuation at the
+    handoff sigma, not a fresh diffusion trajectory, and separately requires an
+    actual first high-stage model evaluation. Dense Sol-Attn warmup is a
+    trajectory-start policy, so it must not restart solely because Flow opened
+    this later sampler lifetime.
+    """
+    if options.get(FLOW_STAGE_KEY) != "high":
+        return False
+    refinement = options.get(FLOW_REFINEMENT_KEY)
+    return bool(
+        isinstance(refinement, dict)
+        and refinement.get("api") == 1
+        and refinement.get("active") is True
+        and refinement.get("source") == "h3_flow_progressive_handoff"
+        and refinement.get("min_actual_prefix_steps") == 1
+        and refinement.get("sigma_reference") == 1.0
+    )
+
+
+def dense_evaluation_warmup(config, evaluation, options):
+    """Return whether the current evaluation is in Sol's trajectory warmup."""
+    return bool(
+        evaluation < config.dense_evaluations
+        and not _flow_progressive_high_continuation(options)
+    )
 
 
 def _freeze_history_value(value):
@@ -350,7 +384,9 @@ class HistoryPolicy:
                     return None
                 vdn.append(identity)
         signature = getattr(layout, "signature", None)
-        phase = "dense" if state.evaluations < self.config.dense_evaluations else "sol"
+        phase = "dense" if dense_evaluation_warmup(
+            self.config, state.evaluations, options
+        ) else "sol"
         return (self.config.metadata()["fingerprint"], phase, repr(signature),
                 getattr(layout, "seq_len", None), tuple(getattr(layout, "segments", ())),
                 str(getattr(model, "dtype", None)), tuple(replacement_identity),
