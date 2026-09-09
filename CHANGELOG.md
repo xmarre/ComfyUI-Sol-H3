@@ -1,0 +1,112 @@
+# Changelog
+
+## v0.1.0 — 2026-09-09
+
+Initial production-validated release of ComfyUI-Sol-H3.
+
+### Highlights
+
+- Packages Sana Sol-Attn from pinned `xmarre/Sana` revision `2936c47637380842aaa4a4488fac5006cc542b70` and executes the real CuTe `cute_sm120` backend on SM120.
+- Adds rectangular attention support with independent Q and K/V lengths: `Q [B,Tq,H,128]`, `K/V [B,Tkv,H,128]`.
+- Adds exact MiniMax-H3 affine/runtime optimization.
+- Adds composable attention ownership/fallback semantics instead of blanket incompatibility gates.
+- Integrates with VDN provider API v3, Spectrum numerical-backend history, Untwist preprocessing, Diff-Aid and Flow's explicit mixed-grid API-2 contract.
+- Preserves VDN's restricted K/V domain, learned softmax gate, linear complement, output projection and global/anchor ownership.
+- Adds real-SM120 arithmetic calibration and fail-closed routing/history behavior.
+- Adds zero-copy BTHD input handling for suitable innermost-contiguous strided layouts.
+
+### Production routing results
+
+Final validated Spectrum schedule:
+
+```text
+sampler_logical_calls       18
+transformer_actual_nfe      14
+spectrum_forecast_calls      4
+
+low:    8 actual / 2 forecast
+high:   4 actual / 2 forecast
+probe:  2 actual / 0 forecast
+```
+
+The SOL-bypassed control is `13 actual + 5 forecast`; the extra SOL actual is the intentional first low-stage `dense -> sol` backend transition.
+
+Representative native VDN API-v3 stages:
+
+| Stage | Rectangular SOL calls | Requested Q rows | Kernel Q rows | Square expansion |
+|---|---:|---:|---:|---:|
+| Native low | 1,584 | 3,744,000 | 3,744,000 | 0 |
+| Native high | 1,056 | 4,972,800 | 4,972,800 | 0 |
+| Later native high | 1,248 | 5,967,360 | 5,967,360 | 0 |
+
+Representative Flow mixed-grid route:
+
+```text
+external_mixed_sol_calls           144
+external_mixed_q_rows         6,270,480
+external_mixed_kernel_q_rows  6,270,480
+compatibility_fallbacks              {}
+```
+
+The historical VDN v2 square compatibility bridge expanded Q kernel work by roughly `4.4x–5.4x` in affected stages. API v3 removes that expansion.
+
+### Zero-copy BTHD result
+
+Exact mixed production layout:
+
+```text
+shape      [1, 43545, 56, 128]
+Q/V stride [7168, 21504, 128, 1]
+K stride   [7168,  7168, 128, 1]
+```
+
+Seven-run isolated real-SM120 medians:
+
+| Path | CUDA median | Host-wall median |
+|---|---:|---:|
+| strided zero-copy | **46.768 ms** | **42.338 ms** |
+| pre-contiguous kernel | 46.941 ms | 42.376 ms |
+| old copy + kernel | 47.727 ms | 43.136 ms |
+
+The strided kernel is effectively parity with pre-contiguous execution while removing the old materialization cost. The old bridge materialized `1,248,522,240` bytes per representative mixed call; across 144 calls the zero-copy path avoids about **167.44 GiB** of redundant Q/V materialization and approximately **0.11 s** of direct copy overhead.
+
+This is intentionally a micro-optimization claim, not an end-to-end speedup claim.
+
+### Timing evidence
+
+Historical Exact-only matched A/B:
+
+| Exact Runtime | Sampler | End-to-end | Peak VRAM |
+|---|---:|---:|---:|
+| off | 263.56 s | 312.57 s | 17.18 GB |
+| on | **247.30 s** | **298.69 s** | 17.18 GB |
+
+A same-process hot SOL run with the final 14/4 schedule measured `274.87 s` end-to-end / `229.13 s` sampler. The SOL-bypassed control measured `287.51 s` / `240.55 s` with a different 13/5 schedule. Because routing/content/cache state and NFE count are not a controlled A/B, v0.1.0 does **not** claim a large whole-workflow SOL percentage from those numbers.
+
+### Validation
+
+Validated on NVIDIA RTX PRO 6000 Blackwell Workstation Edition (SM120), PyTorch `2.10.0+cu130`, CUDA 13.0.
+
+CPU/native CI covers package/source provenance, real Comfy ModelPatcher integration, KJ behavior, Spectrum history/receipts, VDN #8 -> #11 composition, provider API v3/lazy v2 fallback, Diff-Aid wrapper orders, Flow marked-layout and mixed-grid history, mixed -> native resumption, direct benchmark invocation and zero-copy layout contracts.
+
+### Companion pins
+
+```text
+Spectrum #104  9c682c07f4c5ea9de601cda234755a1561b59f59
+Untwist #9     cf428e204f42354ce9a9582dd956906f75a52974
+VDN #8         b6f0755c4172ec5c17386c56998f454e78b2a2d4
+VDN #11        5b63dc670229d419a6350b64f7ceda609dbc8194
+Flow v0.3.2    fe0ef8752b92081b5a85bc9b39ad8e2a7037d591
+Diff-Aid       ba9d9efbcf7e64c755e068cb76547d8cc85481eb
+Sana           2936c47637380842aaa4a4488fac5006cc542b70
+```
+
+VDN #11 remains tied to the still-unreleased VDN #8 overlay and is therefore documented as a pinned companion rather than a mainline VDN release.
+
+### Known boundaries
+
+- Production GPU validation is Linux/WSL SM120. Native Windows kernel execution is not yet validated.
+- Arbitrary mixed/external layouts are not inferred; only the explicit validated Flow API-2 contract can use the mixed SOL route.
+- Unknown replacement/history topology fails closed to actual/inherited attention rather than being broadly allowlisted.
+- Sparse routing success is not itself a decoded-media quality or end-to-end speed claim.
+- Optional SageAttention remains an inherited dense provider and is not bundled by Sol-H3.
