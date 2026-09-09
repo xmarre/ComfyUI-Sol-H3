@@ -127,53 +127,12 @@ def test_bridge_protects_prefix_and_uses_full_sink_gate(monkeypatch):
     assert all(c["sink_start"] == 0 for c in calls)
     assert dense_calls == [5]
     assert state.sparse_calls == 1
-    assert state.gates[0]["zero_copy_bthd"] is True
+    assert state.gates[0]["kernel_init_s"] >= 0.0
     assert state.gates[0]["calibration_s"] >= 0.0
+    assert state.gates[0]["materialized_qkv_bytes"] == 3 * q.numel() * q.element_size()
     sparse.attention(q, k, v, 5, config, state, dense_attention=dense_attention)
-    assert len(calls) == 3  # same-request shape/layout gate reused
+    assert len(calls) == 3  # same-request shape gate reused
     assert dense_calls == [5, 5]
-
-
-def test_bridge_passes_zero_copy_views_and_verifies_each_layout(monkeypatch):
-    seen = []
-    expected_storage = []
-
-    def kernel(q, k, v, **kw):
-        index = len(seen)
-        seen.append({
-            "strides": tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v)),
-            "storage": tuple(x.untyped_storage().data_ptr() for x in (q, k, v)),
-            "contiguous": tuple(x.is_contiguous() for x in (q, k, v)),
-        })
-        assert seen[index]["storage"] == expected_storage[index // 2]
-        return F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        ).transpose(1, 2)
-
-    monkeypatch.setattr(sparse, "load_kernel", lambda device: kernel)
-    state = Request(Config(exact=False, backend="sol"))
-
-    # Ordinary independent BHSD tensors become non-contiguous BTHD views.
-    ordinary = tuple(torch.randn(1, 2, 7, 128, dtype=torch.bfloat16) for _ in range(3))
-    expected_storage.append(tuple(x.untyped_storage().data_ptr() for x in ordinary))
-    sparse.attention(*ordinary, 0, state.config, state)
-
-    # Match the packed Ulysses layout: Q/K/V are views into one [..., Q|K|V]
-    # allocation. The BHSD bridge inputs have the same shapes but different
-    # strides, so correctness calibration must not reuse the prior layout gate.
-    packed = torch.randn(1, 7, 2, 3 * 128, dtype=torch.bfloat16)
-    packed_bthd = packed.split(128, dim=-1)
-    packed_bhsd = tuple(x.transpose(1, 2) for x in packed_bthd)
-    expected_storage.append(tuple(x.untyped_storage().data_ptr() for x in packed_bhsd))
-    sparse.attention(*packed_bhsd, 0, state.config, state)
-
-    assert len(seen) == 4  # calibration + sparse execution for each layout
-    assert all(not all(call["contiguous"]) for call in seen)
-    assert seen[0]["strides"] != seen[2]["strides"]
-    assert len(state.sparse_verified) == 2
-    assert len(state.gates) == 2
-    assert state.gates[0]["bthd_strides"] != state.gates[1]["bthd_strides"]
-    assert all(gate["zero_copy_bthd"] is True for gate in state.gates)
 
 
 def test_failed_arithmetic_never_counts_sparse(monkeypatch):
