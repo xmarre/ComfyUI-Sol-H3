@@ -1,4 +1,5 @@
 """Native attention bridge to the packaged Sana Sol-H3 implementation."""
+
 import math
 import time
 
@@ -42,28 +43,35 @@ def _sink_blocks(start, tokens, rows):
 def load_kernel(device):
     """Load the verified node-local public API; SM120 requires its CuTe backend."""
     from .provenance import verify_source
+
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("This experimental SOL integration currently targets single-GPU SM120 only")
     try:
         verify_source()
         from ._vendor.sol_attn import get_sol_attn_backend, sol_attn
+
         backend = get_sol_attn_backend(device)
         if backend != "cute_sm120":
-            raise RuntimeError(
-                f"Sana selected {backend}; SM120 requires CuTe (cutlass.cute and cuda.bindings.driver)"
-            )
+            raise RuntimeError(f"Sana selected {backend}; SM120 requires CuTe (cutlass.cute and cuda.bindings.driver)")
         # Import lazy dependencies before returning a usable kernel. No compilation here.
         from ._vendor.sol_attn import preprocess  # noqa: F401
         from ._vendor.sol_attn.sm120 import make_kernel  # noqa: F401
     except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
         raise RuntimeError(f"Sana Sol-Attn initialization failed: {exc}") from exc
 
-    def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
-               sink_start=0, sink_tokens=0):
+    def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1, sink_start=0, sink_tokens=0):
         _sink_blocks(sink_start, sink_tokens, k.shape[1])  # validate prefix geometry
-        return sol_attn(q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
-                        thresh_type=thresh_type, kv_splits=kv_splits,
-                        sink_start=sink_start, sink_tokens=sink_tokens)
+        return sol_attn(
+            q,
+            k,
+            v,
+            scale=q.shape[-1] ** -0.5,
+            tau=float(tau),
+            thresh_type=thresh_type,
+            kv_splits=kv_splits,
+            sink_start=sink_start,
+            sink_tokens=sink_tokens,
+        )
 
     kernel.backend_name = backend
     kernel.source_tree_verified = True
@@ -85,9 +93,11 @@ def error_metrics(got, want):
     want_f = want.float()
     delta = got_f - want_f
     abs_delta = delta.abs()
-    finite = bool(torch.isfinite(got_f).all().item() and
-                  torch.isfinite(want_f).all().item() and
-                  torch.isfinite(delta).all().item())
+    finite = bool(
+        torch.isfinite(got_f).all().item()
+        and torch.isfinite(want_f).all().item()
+        and torch.isfinite(delta).all().item()
+    )
     if not finite:
         return {
             "finite": False,
@@ -101,8 +111,7 @@ def error_metrics(got, want):
     reference_peak_abs = float(want_f.abs().max().item())
     max_abs = float(abs_delta.max().item())
     mean_abs = float(abs_delta.mean().item())
-    rel_l2 = float((torch.linalg.vector_norm(delta) /
-                    torch.linalg.vector_norm(want_f).clamp_min(1e-12)).item())
+    rel_l2 = float((torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(want_f).clamp_min(1e-12)).item())
     catastrophic_limit = max(
         ARITH_CATASTROPHIC_MAX_FLOOR,
         ARITH_CATASTROPHIC_REFERENCE_PEAK_MULTIPLIER * reference_peak_abs,
@@ -142,16 +151,21 @@ def _bthd_layout_key(*tensors):
     return tuple((tuple(x.shape), tuple(x.stride())) for x in tensors)
 
 
-def attention(q, k, v, prefix, config, state, dense_attention=None,
-              recompute_prefix_queries=True):
-    if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
-            or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
-            or q.shape[0] != 1 or q.shape[-1] != 128
-            or q.shape[2] == 0 or k.shape[2] == 0):
+def attention(q, k, v, prefix, config, state, dense_attention=None, recompute_prefix_queries=True):
+    if (
+        any(x.ndim != 4 for x in (q, k, v))
+        or k.shape != v.shape
+        or q.shape[:2] != k.shape[:2]
+        or q.shape[-1] != k.shape[-1]
+        or q.shape[0] != 1
+        or q.shape[-1] != 128
+        or q.shape[2] == 0
+        or k.shape[2] == 0
+    ):
         raise RuntimeError("SOL requires Q [1, heads, Tq, 128], KV [1, heads, Tkv, 128]")
     _sink_blocks(0, prefix, k.shape[2])
-    if recompute_prefix_queries and q.shape != k.shape:
-        raise RuntimeError("Prefix query recomputation requires the original square packed sequence")
+    if recompute_prefix_queries and prefix > q.shape[2]:
+        raise RuntimeError("Prefix query recomputation exceeds the available Q rows")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
     kernel_loader_s = 0.0
@@ -184,28 +198,30 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         # The all-selected gate now validates the exact strided layout that the
         # hot path will reuse. error_metrics() already performs scalar reads, so
         # this adds no new steady-state synchronization point.
-        got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-                           sink_start=0, sink_tokens=kb.shape[1])
+        got = state.kernel(
+            qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1, sink_start=0, sink_tokens=kb.shape[1]
+        )
         want = _dense_reference(q, k, v, None)
         metrics = error_metrics(got, want)
         gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(metrics):
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
         state.sparse_verified.add(key)
-        state.gates.append({
-            "shape": list(q.shape),
-            "kv_shape": list(k.shape),
-            "backend": getattr(state.kernel, "backend_name", "test_substitute"),
-            "kernel_loader_s": kernel_loader_s,
-            "gate_wall_s": gate_wall_s,
-            "materialized_qkv_bytes": 0,
-            "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
-            "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
-            **metrics,
-        })
+        state.gates.append(
+            {
+                "shape": list(q.shape),
+                "kv_shape": list(k.shape),
+                "backend": getattr(state.kernel, "backend_name", "test_substitute"),
+                "kernel_loader_s": kernel_loader_s,
+                "gate_wall_s": gate_wall_s,
+                "materialized_qkv_bytes": 0,
+                "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
+                "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
+                **metrics,
+            }
+        )
         del got, want
-    out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-                       sink_start=0, sink_tokens=prefix)
+    out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1, sink_start=0, sink_tokens=prefix)
     # Normal H3 replaces non-video query rows with the inherited dense provider.
     # VDN local Q contains only requested rows; sink_rows describes K/V only.
     if prefix and recompute_prefix_queries:

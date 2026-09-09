@@ -11,6 +11,7 @@ rows are preserved byte-for-byte and in order. Only the denser target-prefix
 K/V rows are stratified by nearest native MiniMax-H3 area-normalized spatial
 coordinate.
 """
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -93,7 +94,14 @@ def validate_measure_contract(measure, external, *, q_rows: int, kv_rows: int) -
     if measure.get("exact_prefix_queries_preserved") is not True or measure.get("suffix_kv_unchanged") is not True:
         raise RuntimeError("Flow mixed-grid attention-measure preservation contract is incomplete")
 
-    for name in ("video_start", "sequence_rows", "temporal", "prefix_t", "source_rows_per_frame", "prefix_rows_per_frame"):
+    for name in (
+        "video_start",
+        "sequence_rows",
+        "temporal",
+        "prefix_t",
+        "source_rows_per_frame",
+        "prefix_rows_per_frame",
+    ):
         if measure[name] != external.get(name):
             raise RuntimeError(f"Flow mixed-grid attention-measure {name} disagrees with external sequence")
 
@@ -167,8 +175,12 @@ def reduce_kv(k: torch.Tensor, v: torch.Tensor, validated: dict):
     expected = validated["expected_kv_rows"]
     if reduced_k.shape[2] != expected or reduced_v.shape[2] != expected:
         raise RuntimeError("Flow mixed-grid attention-measure reduction returned wrong K/V row count")
-    return reduced_k, reduced_v, {
-        "kv_rows_before": int(k.shape[2]),
-        "kv_rows_after": int(expected),
-        "kv_rows_removed": int(k.shape[2] - expected),
-    }
+    return (
+        reduced_k,
+        reduced_v,
+        {
+            "kv_rows_before": int(k.shape[2]),
+            "kv_rows_after": int(expected),
+            "kv_rows_removed": int(k.shape[2] - expected),
+        },
+    )
