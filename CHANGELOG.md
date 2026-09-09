@@ -64,7 +64,7 @@ See `docs/DENSE_EVALUATIONS.md` for the scheduling rationale, timing interpretat
 
 ## v0.1.1 — 2026-09-09
 
-Patch release for native-Windows installation/provenance behavior reported in issue #4.
+Patch release correcting native-Windows installation/provenance behavior and defining the supported fallback boundary for custom kernels.
 
 ### Fixed
 
@@ -74,13 +74,11 @@ Patch release for native-Windows installation/provenance behavior reported in is
 - Scopes the CuTe/Triton runtime toolchain dependencies to Linux, matching the supported/validated custom-kernel platforms.
 - Reports the Linux/WSL2 requirement explicitly when native Windows cannot provide the required `cute_sm120` backend.
 - Fails Exact Runtime closed on native Windows before importing/executing the Triton affine kernel and delegates to the untouched native H3 block (`exact:native_windows_unvalidated`).
-- Adds `docs/WINDOWS.md` with the supported-platform boundary and AIMDO isolation procedure.
+- Adds `docs/WINDOWS.md` with standalone native-Windows support, fallback and troubleshooting guidance.
 
-### Scope and remaining boundary
+### Platform boundary
 
-RTX 5090 is SM120 hardware, but NVIDIA's current CUTLASS CuTe DSL does not support native Windows. The real SOL `cute_sm120` kernel therefore still requires Linux/WSL2; v0.1.1 does not claim native-Windows SOL acceleration.
-
-The issue #4 v0.1.0 request reached `sparse_calls=0` / `sol_backend=null` and later failed inside `comfy_aimdo.malloc_graph_pop`, while Exact Runtime had executed (`exact_blocks=600`). v0.1.1 does not claim that Sol-H3 caused the AIMDO access violation. Instead, native Windows now automatically runs neither Sol-H3 custom kernel path: SOL falls back dense because CuTe is unavailable and Exact Runtime delegates to native H3. A remaining AIMDO crash after upgrading is therefore separable from Sol-H3 kernel execution.
+The real SOL `cute_sm120` kernel requires Linux/WSL2 because NVIDIA's current CUTLASS CuTe DSL does not support native Windows. On native Windows, SOL delegates to inherited dense attention and Exact Runtime delegates to native H3, so no Sol-H3 custom kernel executes there.
 
 The Linux/WSL SM120 production kernel contract and previously validated rectangular/VDN/Flow/Spectrum behavior are unchanged.
 
