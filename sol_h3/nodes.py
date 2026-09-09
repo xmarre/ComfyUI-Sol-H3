@@ -22,15 +22,15 @@ class SolH3Experimental:
         return {"required": {"model": ("MODEL",),
                 "exact_fusion": ("BOOLEAN", {"default": True}),
                 "tau": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1}),
-                "dense_evaluations": ("INT", {"default": 0, "min": 0, "max": 100}),
+                "dense_evaluations": ("INT", {"default": 1, "min": 0, "max": 100}),
                 "dense_layers": ("INT", {"default": 2, "min": 0, "max": 100})}}
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
     CATEGORY = "model/optimizations/Sol-H3/experimental"
-    DESCRIPTION = "Approximate Sol-Attn through the packaged Sana CuTe kernel on eligible SM120 H3/VDN calls. The default starts SOL on the first denoiser evaluation; set dense_evaluations > 0 only for an explicit trajectory-level dense warmup. SOL kernel execution requires Linux/WSL2; unsupported calls fall back locally."
+    DESCRIPTION = "Approximate Sol-Attn through the packaged Sana CuTe kernel on eligible SM120 H3/VDN calls. The default keeps the first full denoiser evaluation dense for conservative startup trajectory stability. dense_evaluations=0 is an aggressive speed opt-in: with Spectrum it can avoid one actual NFE, but it may cause visible startup temporal discontinuities. SOL kernel execution requires Linux/WSL2; unsupported calls fall back locally."
 
-    def apply(self, model, exact_fusion=True, tau=1.0, dense_evaluations=0, dense_layers=2):
+    def apply(self, model, exact_fusion=True, tau=1.0, dense_evaluations=1, dense_layers=2):
         from .runtime import install
         return (install(model, Config(exact_fusion, "sol", tau, dense_evaluations, dense_layers)),)
 

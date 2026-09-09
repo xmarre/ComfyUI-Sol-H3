@@ -1,3 +1,75 @@
+# ComfyUI-Sol-H3 v0.1.3
+
+Patch release restoring the conservative one-evaluation dense SOL warmup after a controlled same-seed video comparison exposed a startup trajectory discontinuity when SOL approximation was enabled from the first sigma-1.0 denoiser evaluation.
+
+## Default restored
+
+`Sol-H3 SOL Attention (Experimental)` now defaults to:
+
+```text
+dense_evaluations = 1
+dense_layers      = 2
+```
+
+`dense_evaluations=1` keeps the first complete denoiser evaluation on inherited dense attention before switching to SOL. `dense_layers=2` remains a separate per-evaluation leading-layer policy and does not add a transformer NFE.
+
+`dense_evaluations=0` remains supported as an explicit maximum-speed mode. This release changes the default because of a demonstrated quality risk; it does not remove the SOL-first path.
+
+## Startup quality evidence
+
+A subsequent controlled same-seed video comparison established a concrete failure mode for `dense_evaluations=0`:
+
+- SOL from the first denoiser evaluation produced an abrupt opening pose/orientation change with heavy early motion smearing before settling into the opposite heading.
+- One initial dense evaluation preserved a continuous opening turn in the corresponding comparison.
+
+This demonstrates that SOL-first execution **can** destabilize the initial trajectory when approximate attention acts from sigma 1.0. The available pair does not establish the frequency of the artifact across seeds, prompts, references, resolutions or model variants, so the release does not claim that every `dense_evaluations=0` run is affected.
+
+## Spectrum and NFE trade-off
+
+The v0.1.2 scheduling analysis remains correct. A one-evaluation dense warmup creates a real numerical-backend transition:
+
+```text
+first actual evaluation: dense
+next numerical route:    SOL
+```
+
+Spectrum correctly invalidates incompatible forecasting history across that `dense -> sol` boundary. The first would-be forecast can therefore become an additional actual transformer NFE to establish a SOL-side anchor.
+
+The previous controlled hot evidence remains the measured performance trade-off:
+
+| Run | SOL | `dense_evaluations` | Logical | Actual | Forecast | H3 sampler | End-to-end |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `metrics_00321` | on | 1 | 40 | 26 | 14 | 353.36 s | 400.94 s |
+| `metrics_00322` | off | — | 40 | 25 | 15 | 374.84 s | 420.81 s |
+| `metrics_00323` | on | **0** | **40** | **25** | **15** | **332.56 s** | **380.57 s** |
+
+`dense_evaluations=0` avoids the initial backend-history transition and restored `25 actual / 15 forecast` topology parity with the no-SOL control in that test. Relative to the otherwise-matched `dense_evaluations=1` SOL run, it removed one actual NFE and measured 20.80 s (5.9%) lower H3 sampler wall time and 20.37 s (5.1%) lower end-to-end wall time. Arithmetic-gate/calibration time also varied, so the structural result is the removed NFE; the entire wall-time delta must not be assigned to that NFE alone.
+
+Do not weaken Spectrum's history/receipt safety to recover the NFE while retaining a dense-to-SOL transition. The extra actual call is the correct safety consequence of changing numerical attention backends mid-trajectory.
+
+## Migration
+
+Existing saved workflows keep their serialized `dense_evaluations` value. Workflows created or saved under v0.1.2 can therefore remain at `0` after upgrading until the node value is changed explicitly.
+
+Recommended policy:
+
+```text
+dense_evaluations = 1   # default: conservative startup trajectory
+
+dense_evaluations = 0   # opt-in: maximum-speed SOL-first path
+                         # may save one Spectrum actual NFE
+                         # may cause visible startup discontinuity
+```
+
+## Documentation and tests
+
+- Restored `Config(backend="sol")` and the ComfyUI node default to `dense_evaluations=1`.
+- Added regression coverage for the restored default, the SOL-first opt-in and Flow continuation semantics.
+- Reworked `docs/DENSE_EVALUATIONS.md` around the speed/quality trade-off and saved-workflow migration behavior.
+- Updated README and changelog to keep the v0.1.2 timing result as historical performance evidence rather than a quality-equivalence claim.
+
+---
+
 # ComfyUI-Sol-H3 v0.1.2
 
 Patch release changing the default SOL trajectory policy so new workflows start SOL on the first real denoiser evaluation instead of burning a full dense evaluation before switching numerical backends.

@@ -2,35 +2,42 @@
 
 ## Current default
 
-Starting with **v0.1.2**, `Sol-H3 SOL Attention (Experimental)` defaults to:
+Starting with **v0.1.3**, `Sol-H3 SOL Attention (Experimental)` defaults to:
 
 ```text
-dense_evaluations = 0
+dense_evaluations = 1
 dense_layers      = 2
 ```
 
-`dense_evaluations=0` means SOL is the numerical attention backend from the first real denoiser evaluation. `dense_layers=2` is unchanged: the first two H3 blocks of each otherwise-SOL evaluation remain dense. That per-layer policy does **not** add a transformer NFE.
+`dense_evaluations=1` keeps the first complete denoiser evaluation on the inherited dense attention backend and enables SOL afterward. `dense_layers=2` is separate: the first two H3 blocks of each otherwise-SOL evaluation remain dense. The per-layer policy does **not** add a transformer NFE.
 
-Existing saved workflows keep their serialized `dense_evaluations` value. The default change affects newly created nodes and programmatic `Config(backend="sol")` users.
+Existing saved workflows keep their serialized `dense_evaluations` value. In particular, workflows created or saved with the v0.1.2 default can remain at `0` after upgrading until the value is changed explicitly. The v0.1.3 default affects newly created nodes and programmatic `Config(backend="sol")` users.
 
-## Why the default changed
+## Why v0.1.3 restores one dense evaluation
 
-The v0.1.0/v0.1.1 default was `dense_evaluations=1`. With Spectrum enabled, that creates a real numerical-backend boundary:
+v0.1.2 changed the default from `1` to `0` after controlled timing showed a real Spectrum interaction:
 
 ```text
+dense_evaluations=1:
 first actual evaluation: dense
 next numerical route:    SOL
+
+Spectrum action:
+invalidate incompatible dense history
+establish a SOL-side actual anchor
 ```
 
-Spectrum correctly treats `dense -> sol` as incompatible forecasting history. The would-be first forecast therefore becomes an additional actual transformer evaluation so that Spectrum can establish a SOL-side anchor. The extra NFE is a consequence of the configured transition; it is not an intrinsic requirement of Sol-Attn.
+That `dense -> sol` numerical-backend transition can convert the first would-be Spectrum forecast into an additional actual transformer NFE. With `dense_evaluations=0`, backend history starts directly in `phase=sol`, so that extra actual NFE is avoided.
 
-The fix is **not** to weaken Spectrum's backend-history invariant. It is to avoid creating the unnecessary trajectory-level backend transition by default.
+The scheduling result remains valid. The default is being restored for **quality**, not because the NFE analysis was wrong.
 
-With `dense_evaluations=0`, backend history starts directly in `phase=sol`, so the first actual evaluation is already a valid SOL anchor and the normal Spectrum forecast topology is retained.
+A subsequent controlled same-seed video comparison exposed a concrete startup failure mode when approximate SOL attention acts from the first sigma-1.0 evaluation. With `dense_evaluations=0`, the generated subject showed an abrupt early pose/orientation transition and heavy motion smearing before settling into the opposite heading. With `dense_evaluations=1`, the corresponding opening motion was a continuous turn.
 
-## Controlled MiniMax-H3 evidence
+This pair establishes that `dense_evaluations=0` **can** destabilize the initial trajectory. It does not establish how frequently the artifact occurs across seeds, prompts, references, resolutions or model variants. Because the failure is visible and occurs at the trajectory start, v0.1.3 uses the conservative one-evaluation warmup as the default.
 
-The default change was evaluated in a same-seed, same-reference, same-resolution, same-prompt, same-sampler, same-workflow hot comparison with VDN disabled. Only the named component/policy changed.
+## Speed / quality trade-off
+
+The v0.1.2 controlled hot timing remains useful evidence for the aggressive mode. Same seed, references, resolution, prompt, sampler, sampling settings and workflow structure; VDN disabled:
 
 | Run | SOL | `dense_evaluations` | Logical | Actual NFE | Forecasts | H3 sampler | End-to-end |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -38,7 +45,7 @@ The default change was evaluated in a same-seed, same-reference, same-resolution
 | `metrics_00322` | off | — | 40 | 25 | 15 | 374.84 s | 420.81 s |
 | `metrics_00323` | on | **0** | **40** | **25** | **15** | **332.56 s** | **380.57 s** |
 
-`metrics_00323` therefore restores exact NFE/forecast topology parity with the no-SOL control:
+`metrics_00323` restored exact NFE/forecast topology parity with the no-SOL control:
 
 ```text
 40 logical
@@ -50,45 +57,39 @@ high:    8 actual / 6 forecast
 probe:   2 actual / 0 forecast
 ```
 
-The run also reports `phase=sol` from the first backend-history diagnostic and `numerical_backend_transitions=0`.
+It also started backend history directly in `phase=sol` and reported `numerical_backend_transitions=0`.
 
-Relative to the otherwise-matched `dense_evaluations=1` SOL run (`metrics_00321`), the H3 sampler decreased by 20.80 s (5.9%) and end-to-end wall time by 20.37 s (5.1%). The first progressive chunk fell from 149.13 s to 130.61 s. Not all of that wall-time delta should be assigned to the removed NFE because arithmetic-gate/calibration time also varied materially between hot runs; the topology change itself is the defensible structural gain.
+Relative to `metrics_00321`, the SOL-first run removed one actual NFE and measured 20.80 s (5.9%) lower H3 sampler wall time and 20.37 s (5.1%) lower end-to-end time. Arithmetic-gate/calibration time also varied, so the structural result is the removed NFE; the entire wall-time delta must not be attributed to that NFE alone.
 
-The topology-matched SOL-vs-no-SOL comparison is cleaner:
+Against the topology-matched no-SOL control, the tested `dense_evaluations=0` SOL run measured 42.28 s (11.3%) lower sampler wall and 40.24 s (9.6%) lower end-to-end wall. That remains deployment-specific timing evidence, not a universal Sol-Attn percentage and not a quality-equivalence claim.
 
-```text
-metrics_00323 SOL, 25A/15F:     332.56 s sampler / 380.57 s end-to-end
-metrics_00322 no SOL, 25A/15F:  374.84 s sampler / 420.81 s end-to-end
-```
-
-That is a 42.28 s (11.3%) sampler reduction and a 40.24 s (9.6%) end-to-end reduction in this controlled hot pair. It remains one deployment-instance measurement, not a universal SOL percentage.
-
-## Quality boundary
-
-The same-seed `dense_evaluations=0` video was visibly different from the `dense_evaluations=1` output, as expected when approximate SOL attention is allowed to affect the trajectory from sigma 1.0. Manual inspection did **not** establish either output as better or worse.
-
-That is evidence against an obvious regression in this tested case, but it is not a statistical perceptual-equivalence result. Users who prefer the older conservative trajectory warmup can set:
+The supported choices are therefore:
 
 ```text
-dense_evaluations = 1
+dense_evaluations = 1   # default: conservative startup trajectory
+
+dense_evaluations = 0   # opt-in: maximum-speed SOL-first trajectory
+                         # may save one Spectrum actual NFE
+                         # may cause visible startup discontinuity
 ```
 
-and retain the previous behavior, including the Spectrum history boundary and possible extra actual NFE.
+Do not weaken Spectrum's backend-history invalidation to recover the NFE while keeping a dense-to-SOL transition. The additional actual call is the correct safety consequence of changing numerical attention backends mid-trajectory.
 
 ## `dense_layers` is separate
 
 `dense_evaluations` and `dense_layers` control different things:
 
-- `dense_evaluations`: whole denoiser evaluations that stay on the inherited dense attention backend before SOL is allowed.
+- `dense_evaluations`: complete denoiser evaluations that stay on inherited dense attention before SOL is allowed.
 - `dense_layers`: leading H3 blocks that remain dense inside every otherwise-SOL denoiser evaluation.
 
-v0.1.2 changes only the first default. `dense_layers=2` remains unchanged.
+v0.1.3 changes only the first default. `dense_layers=2` remains unchanged.
 
-The legacy `dense_warmup` telemetry field currently counts dense attention calls caused by either policy, so it can remain nonzero with `dense_evaluations=0`. For trajectory-history diagnosis, use the configured `dense_evaluations`, backend-history `phase`, `numerical_backend_transitions`, and the actual/forecast topology rather than interpreting `dense_warmup` as a count of full dense denoiser evaluations.
+The legacy `dense_warmup` telemetry field counts dense attention calls caused by either policy, so it cannot be interpreted as a count of full dense denoiser evaluations. For trajectory-history diagnosis, use the configured `dense_evaluations`, backend-history `phase`, `numerical_backend_transitions`, and actual/forecast topology.
 
 ## Compatibility and safety
 
 - Spectrum's numerical-backend history/receipt checks remain unchanged and fail closed across real route changes.
-- `dense_evaluations > 0` remains supported as an explicit user policy.
-- Flow progressive high-stage continuation handling for an explicit one-evaluation warmup remains supported; it prevents a trajectory-start warmup from being spuriously restarted at a known continuation boundary.
-- Unknown/malformed routing still executes actual/inherited attention rather than forecasting across an unproven numerical route.
+- `dense_evaluations=0` remains fully supported as an explicit performance policy; this release changes the default and documents its quality risk rather than banning the mode.
+- Flow progressive high-stage continuation handling remains supported and prevents a trajectory-start one-evaluation warmup from being spuriously restarted at a known continuation boundary.
+- Unknown or malformed routing still executes actual/inherited attention rather than forecasting across an unproven numerical route.
+- Saved workflows are not rewritten on upgrade. Audit the serialized node value if a workflow was created under v0.1.2 and startup continuity matters.
