@@ -70,7 +70,7 @@ def _policy_identity(cfg, options, *, blocks=2, layout=None):
         _REQUEST.reset(token)
 
 
-def _flow_mixed_wrapper(previous, layer, *, source_rows=4, target_rows=16):
+def _flow_mixed_wrapper(previous, layer, *, source_rows=4, target_rows=16, attention_measure=False):
     prefix_t = 2
     temporal = 4
     va = 3
@@ -86,6 +86,7 @@ def _flow_mixed_wrapper(previous, layer, *, source_rows=4, target_rows=16):
         prefix_rows=prefix_rows,
         mixed_rows=mixed_rows,
         target_hw=(8, 8),
+        attention_measure=attention_measure,
     )
     layout = SimpleNamespace(
         seq_len=vb,
@@ -193,6 +194,27 @@ def test_flow_mixed_grid_geometry_change_changes_history_identity():
         cfg, {"patches_replace": {"dit": changed}}, blocks=2, layout=changed_layout
     )
     assert base_id is not None and changed_id is not None and changed_id != base_id
+
+
+def test_flow_mixed_grid_attention_measure_change_changes_history_identity():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    plain = {}
+    measured = {}
+    plain_layout = measured_layout = None
+    for layer in range(2):
+        plain_wrap, plain_layout = _flow_mixed_wrapper(BlockPatch(layer, cfg), layer)
+        measured_wrap, measured_layout = _flow_mixed_wrapper(
+            BlockPatch(layer, cfg), layer, attention_measure=True
+        )
+        plain[("double_block", layer)] = plain_wrap
+        measured[("double_block", layer)] = measured_wrap
+    plain_id = _policy_identity(
+        cfg, {"patches_replace": {"dit": plain}}, blocks=2, layout=plain_layout
+    )
+    measured_id = _policy_identity(
+        cfg, {"patches_replace": {"dit": measured}}, blocks=2, layout=measured_layout
+    )
+    assert plain_id is not None and measured_id is not None and measured_id != plain_id
 
 
 def test_malformed_flow_mixed_grid_closure_remains_opaque():

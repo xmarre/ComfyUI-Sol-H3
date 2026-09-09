@@ -5,9 +5,17 @@ import json
 import logging
 
 from .contracts import KEY, Config, adaln_status, prefix_length
+from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from .interop import (
-    HISTORY_KEY, VDN_KEY, VDN_KEY_V2, VDN_KEY_V3, VDN_PREPROCESS_KEY,
-    HistoryPolicy, dense_evaluation_warmup, provider_name, receipt,
+    HISTORY_KEY,
+    VDN_KEY,
+    VDN_KEY_V2,
+    VDN_KEY_V3,
+    VDN_PREPROCESS_KEY,
+    HistoryPolicy,
+    dense_evaluation_warmup,
+    provider_name,
+    receipt,
 )
 
 log = logging.getLogger("comfy.sol_h3")
@@ -25,6 +33,11 @@ class Request:
     external_mixed_sol_calls: int = 0
     external_mixed_q_rows: int = 0
     external_mixed_kernel_q_rows: int = 0
+    external_mixed_measure_calls: int = 0
+    external_mixed_measure_q_rows: int = 0
+    external_mixed_measure_kv_rows_before: int = 0
+    external_mixed_measure_kv_rows_after: int = 0
+    external_mixed_measure_removed_rows: int = 0
     vdn_local_sol_calls: int = 0
     vdn_rectangular_sol_calls: int = 0
     vdn_requested_q_rows: int = 0
@@ -62,27 +75,42 @@ class SamplingWrapper:
             return result
         finally:
             _REQUEST.reset(token)
-            log.info("Sol-H3 %s", json.dumps({"success": success, **self.config.metadata(),
-                     "actual_evaluations": state.evaluations, "sol_eligible_calls": state.eligible_calls,
-                     "sol_backend": getattr(state.kernel, "backend_name", None),
-                     "sol_source_tree_verified": getattr(state.kernel, "source_tree_verified", False),
-                     "sparse_calls": state.sparse_calls, "dense_warmup": state.dense_calls,
-                     "external_mixed_sol_calls": state.external_mixed_sol_calls,
-                     "external_mixed_q_rows": state.external_mixed_q_rows,
-                     "external_mixed_kernel_q_rows": state.external_mixed_kernel_q_rows,
-                     "compatibility_fallbacks": dict(state.fallbacks),
-                     "dense_provider_failures": dict(state.dense_provider_failures),
-                     "vdn_local_sol_calls": state.vdn_local_sol_calls,
-                     "vdn_rectangular_sol_calls": state.vdn_rectangular_sol_calls,
-                     "vdn_requested_q_rows": state.vdn_requested_q_rows,
-                     "vdn_kernel_q_rows": state.vdn_kernel_q_rows,
-                     "vdn_square_expanded_calls": state.vdn_square_expanded_calls,
-                     "vdn_square_requested_rows": state.vdn_square_requested_rows,
-                     "vdn_square_kernel_rows": state.vdn_square_kernel_rows,
-                     "numerical_backend_transitions": state.backend_transitions,
-                     "exact_blocks": state.exact_blocks,
-                     "inherited_dense_backends": sorted(state.dense_attention_backends),
-                     "arithmetic_gates": state.gates}))
+            log.info(
+                "Sol-H3 %s",
+                json.dumps(
+                    {
+                        "success": success,
+                        **self.config.metadata(),
+                        "actual_evaluations": state.evaluations,
+                        "sol_eligible_calls": state.eligible_calls,
+                        "sol_backend": getattr(state.kernel, "backend_name", None),
+                        "sol_source_tree_verified": getattr(state.kernel, "source_tree_verified", False),
+                        "sparse_calls": state.sparse_calls,
+                        "dense_warmup": state.dense_calls,
+                        "external_mixed_sol_calls": state.external_mixed_sol_calls,
+                        "external_mixed_q_rows": state.external_mixed_q_rows,
+                        "external_mixed_kernel_q_rows": state.external_mixed_kernel_q_rows,
+                        "external_mixed_measure_calls": state.external_mixed_measure_calls,
+                        "external_mixed_measure_q_rows": state.external_mixed_measure_q_rows,
+                        "external_mixed_measure_kv_rows_before": state.external_mixed_measure_kv_rows_before,
+                        "external_mixed_measure_kv_rows_after": state.external_mixed_measure_kv_rows_after,
+                        "external_mixed_measure_removed_rows": state.external_mixed_measure_removed_rows,
+                        "compatibility_fallbacks": dict(state.fallbacks),
+                        "dense_provider_failures": dict(state.dense_provider_failures),
+                        "vdn_local_sol_calls": state.vdn_local_sol_calls,
+                        "vdn_rectangular_sol_calls": state.vdn_rectangular_sol_calls,
+                        "vdn_requested_q_rows": state.vdn_requested_q_rows,
+                        "vdn_kernel_q_rows": state.vdn_kernel_q_rows,
+                        "vdn_square_expanded_calls": state.vdn_square_expanded_calls,
+                        "vdn_square_requested_rows": state.vdn_square_requested_rows,
+                        "vdn_square_kernel_rows": state.vdn_square_kernel_rows,
+                        "numerical_backend_transitions": state.backend_transitions,
+                        "exact_blocks": state.exact_blocks,
+                        "inherited_dense_backends": sorted(state.dense_attention_backends),
+                        "arithmetic_gates": state.gates,
+                    }
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -114,17 +142,22 @@ class DiffusionWrapper:
 
 def _shape_reason(q, k, v, heads, mask, kw, *, rectangular=False):
     import torch
+
     if mask is not None:
         return "attention_mask"
     if not kw.get("skip_reshape") or kw.get("skip_output_reshape"):
         return "attention_layout_flags"
-    allowed = {"skip_reshape", "skip_output_reshape", "transformer_options",
-               "_inside_attn_wrapper", "attn_precision"}
+    allowed = {"skip_reshape", "skip_output_reshape", "transformer_options", "_inside_attn_wrapper", "attn_precision"}
     if set(kw) - allowed or kw.get("attn_precision") is not None:
         return "attention_arguments"
-    if (any(t.ndim != 4 for t in (q, k, v)) or k.shape != v.shape
-            or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
-            or q.shape[0] != 1 or min(q.shape[2], k.shape[2]) == 0):
+    if (
+        any(t.ndim != 4 for t in (q, k, v))
+        or k.shape != v.shape
+        or q.shape[:2] != k.shape[:2]
+        or q.shape[-1] != k.shape[-1]
+        or q.shape[0] != 1
+        or min(q.shape[2], k.shape[2]) == 0
+    ):
         return "qkv_geometry"
     if not rectangular and q.shape != k.shape:
         return "non_square_qkv"
@@ -187,22 +220,28 @@ def _external_sequence_prefix(contract, layout, rows):
     """Validate Flow mixed-grid API 2 and return its exact global-prefix sink rows."""
     if not isinstance(contract, dict) or contract.get("api") != 2:
         return None, "external_sequence_native"
-    if (contract.get("mode") != "dense_gate_no_linear"
-            or contract.get("topology") != "mixed_grid_low_suffix"):
+    if contract.get("mode") != "dense_gate_no_linear" or contract.get("topology") != "mixed_grid_low_suffix":
         return None, "external_sequence_native"
     names = (
-        "native_sequence_rows", "sequence_rows", "video_start", "temporal",
-        "prefix_t", "source_rows_per_frame", "prefix_rows_per_frame",
+        "native_sequence_rows",
+        "sequence_rows",
+        "video_start",
+        "temporal",
+        "prefix_t",
+        "source_rows_per_frame",
+        "prefix_rows_per_frame",
     )
     if any(type(contract.get(name)) is not int for name in names):
         return None, "external_sequence_contract"
-    native, actual, start, temporal, prefix_t, source_rows, prefix_rows = (
-        contract[name] for name in names
-    )
-    if (actual != rows or not 0 < start < actual or not 0 < prefix_t < temporal
-            or not 0 < source_rows < prefix_rows
-            or native != start + temporal * source_rows
-            or actual != start + prefix_t * prefix_rows + (temporal - prefix_t) * source_rows):
+    native, actual, start, temporal, prefix_t, source_rows, prefix_rows = (contract[name] for name in names)
+    if (
+        actual != rows
+        or not 0 < start < actual
+        or not 0 < prefix_t < temporal
+        or not 0 < source_rows < prefix_rows
+        or native != start + temporal * source_rows
+        or actual != start + prefix_t * prefix_rows + (temporal - prefix_t) * source_rows
+    ):
         return None, "external_sequence_contract"
 
     # Flow's mixed-grid wrapper deliberately keeps the native low-grid carrier
@@ -262,8 +301,7 @@ class BlockPatch:
 
         if config.backend == "sol":
             previous = options.get("optimized_attention_override")
-            warmup = (dense_evaluation_warmup(config, evaluation, options)
-                      or self.index < config.dense_layers)
+            warmup = dense_evaluation_warmup(config, evaluation, options) or self.index < config.dense_layers
 
             def override(original, q, k, v, heads, mask=None, **kw):
                 dense_provider = previous
@@ -287,10 +325,7 @@ class BlockPatch:
 
                     if provider is not None:
                         try:
-                            out = provider(
-                                original, q_call, k_call, v_call, heads,
-                                mask=mask, **dense_kw
-                            )
+                            out = provider(original, q_call, k_call, v_call, heads, mask=mask, **dense_kw)
                         except (ImportError, OSError) as exc:
                             reason = _provider_unavailable_reason(exc)
                             if reason is None:
@@ -305,7 +340,9 @@ class BlockPatch:
                                 log.warning(
                                     "Sol-H3 inherited dense provider %s unavailable (%s); "
                                     "demoting it to the original Comfy attention for this request: %s",
-                                    name, reason, exc,
+                                    name,
+                                    reason,
+                                    exc,
                                 )
                         else:
                             state.dense_attention_backends.add(provider_name(leaf))
@@ -315,45 +352,73 @@ class BlockPatch:
                         raise RuntimeError(
                             "Inherited dense provider is unavailable and no original attention fallback was supplied"
                         )
-                    out = original(
-                        q_call, k_call, v_call, heads, mask=mask, **dense_kw
-                    )
+                    out = original(q_call, k_call, v_call, heads, mask=mask, **dense_kw)
                     state.dense_attention_backends.add(provider_name(original))
                     return out
 
                 current_options = kw.get("transformer_options") or options
                 reason = _shape_reason(q, k, v, heads, mask, kw)
-                if (current_options.get("minimax_h3_untwist_rope", {}).get("enabled")
-                        and not hasattr(previous, "attention_preprocess_v1")):
+                if current_options.get("minimax_h3_untwist_rope", {}).get("enabled") and not hasattr(
+                    previous, "attention_preprocess_v1"
+                ):
                     reason = "inherited_key_transform"
                 consumer = current_options.get("spectrum_h3_runtime")
                 if consumer is not None and not callable(getattr(consumer, "prepare_backend_history", None)):
                     reason = "forecast_consumer_no_history_contract"
                 layout = current_options.get("minimax_h3_layout", args.get("layout"))
                 external_contract = current_options.get("vdn_h3_external_sequence_v1")
+                measure_contract = current_options.get(FLOW_MIXED_MEASURE_KEY)
                 external_mixed = False
                 prefix = 0
                 if reason is None and external_contract is not None:
-                    prefix, reason = _external_sequence_prefix(
-                        external_contract, layout, q.shape[2]
-                    )
+                    prefix, reason = _external_sequence_prefix(external_contract, layout, q.shape[2])
                     external_mixed = reason is None
                 elif reason is None:
                     try:
                         prefix = prefix_length(layout, q.shape[2])
                     except RuntimeError:
                         reason = "packed_layout_not_representable"
+
+                # The independent Flow measure contract is meaningful only on a
+                # fully validated external mixed stream. Never silently drop or
+                # reinterpret a malformed measure request as the old square path.
+                if measure_contract is not None and (reason is not None or not external_mixed):
+                    raise RuntimeError(
+                        "Flow mixed-grid attention-measure contract requires a valid external mixed sequence"
+                    )
                 if reason is not None:
                     record(reason, True)
                     return dense()
-                state.eligible_calls += 1
-                if warmup:
-                    state.dense_calls += 1
-                    record("dense_warmup")
-                    return dense()
 
-                q, k, v, dense_provider = _preprocess_chain(
-                    dense_provider, q, k, v, heads, kw)
+                measure_validated = None
+                measure_stats = None
+                if measure_contract is not None:
+                    measure_validated = validate_measure_contract(
+                        measure_contract,
+                        external_contract,
+                        q_rows=int(q.shape[2]),
+                        kv_rows=int(k.shape[2]),
+                    )
+
+                state.eligible_calls += 1
+                if measure_validated is not None:
+                    # Full-domain preprocessing (notably Untwist) must execute
+                    # before K/V selection because its metadata uses original
+                    # packed-row coordinates. Rebinding dense_provider to the leaf
+                    # also prevents the dense warmup/reference from preprocessing
+                    # the already-reduced rectangular domain a second time.
+                    q, k, v, dense_provider = _preprocess_chain(dense_provider, q, k, v, heads, kw)
+                    k, v, measure_stats = reduce_kv(k, v, measure_validated)
+                    if warmup:
+                        state.dense_calls += 1
+                        record("dense_warmup")
+                        return dense(q, k, v)
+                else:
+                    if warmup:
+                        state.dense_calls += 1
+                        record("dense_warmup")
+                        return dense()
+                    q, k, v, dense_provider = _preprocess_chain(dense_provider, q, k, v, heads, kw)
 
                 def dense_attention(qd, kd, vd):
                     out = dense(qd, kd, vd, output_heads=True)
@@ -362,6 +427,7 @@ class BlockPatch:
                     return out.transpose(1, 2)
 
                 from .sparse import attention, KernelUnavailable
+
                 try:
                     result = attention(q, k, v, prefix, config, state, dense_attention=dense_attention)
                 except KernelUnavailable as exc:
@@ -372,7 +438,17 @@ class BlockPatch:
                     state.external_mixed_sol_calls += 1
                     state.external_mixed_q_rows += q.shape[2]
                     state.external_mixed_kernel_q_rows += q.shape[2]
-                    record("sol_external_mixed")
+                    if measure_validated is not None:
+                        if measure_stats is None:
+                            raise RuntimeError("Flow mixed-grid attention-measure telemetry was not produced")
+                        state.external_mixed_measure_calls += 1
+                        state.external_mixed_measure_q_rows += q.shape[2]
+                        state.external_mixed_measure_kv_rows_before += measure_stats["kv_rows_before"]
+                        state.external_mixed_measure_kv_rows_after += measure_stats["kv_rows_after"]
+                        state.external_mixed_measure_removed_rows += measure_stats["kv_rows_removed"]
+                        record("sol_external_mixed_measure")
+                    else:
+                        record("sol_external_mixed")
                 else:
                     record("sol")
                 return result
@@ -381,13 +457,11 @@ class BlockPatch:
                 if not square_aligned or q.shape != k.shape or q.shape != v.shape:
                     record("vdn_" + kind + "_native", True)
                     return native()
-                return vdn_provider_v2(
-                    native, q, k, v, kind=kind, scale=scale,
-                    square_aligned=square_aligned)
+                return vdn_provider_v2(native, q, k, v, kind=kind, scale=scale, square_aligned=square_aligned)
 
-            def vdn_provider_v2(native, q, k, v, *, kind, scale,
-                                square_aligned=False, square_q=None,
-                                query_positions=None, sink_rows=0):
+            def vdn_provider_v2(
+                native, q, k, v, *, kind, scale, square_aligned=False, square_q=None, query_positions=None, sink_rows=0
+            ):
                 if kind != "local":
                     record("vdn_" + kind + "_native", True)
                     return native()
@@ -395,13 +469,11 @@ class BlockPatch:
                 # API v2 owns gathering and supplies the exact restricted KV domain.
                 # square_q/query_positions remain accepted for existing VDN #11 callers;
                 # neither is needed to evaluate the requested Q rows directly.
-                if (any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape
-                        or q.shape[1:] != k.shape[1:]):
+                if any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape or q.shape[1:] != k.shape[1:]:
                     record("vdn_local_domain", True)
                     return native()
                 qc, kc, vc = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
-                reason = _shape_reason(qc, kc, vc, q.shape[1], None,
-                                       {"skip_reshape": True}, rectangular=True)
+                reason = _shape_reason(qc, kc, vc, q.shape[1], None, {"skip_reshape": True}, rectangular=True)
                 if scale != q.shape[-1] ** -0.5:
                     reason = "vdn_scale"
                 if not isinstance(sink_rows, int) or not 0 <= sink_rows <= k.shape[0]:
@@ -415,10 +487,9 @@ class BlockPatch:
                     record("vdn_dense_warmup")
                     return native()
                 from .sparse import attention, KernelUnavailable
+
                 try:
-                    result = attention(
-                        qc, kc, vc, sink_rows, config, state,
-                        recompute_prefix_queries=False)
+                    result = attention(qc, kc, vc, sink_rows, config, state, recompute_prefix_queries=False)
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
@@ -431,11 +502,16 @@ class BlockPatch:
                 record("vdn_local_sol")
                 return result
 
-            def vdn_provider_v3(native, q, k, v, *, kind, scale,
-                                square_aligned=False, sink_rows=0):
+            def vdn_provider_v3(native, q, k, v, *, kind, scale, square_aligned=False, sink_rows=0):
                 return vdn_provider_v2(
-                    native, q, k, v, kind=kind, scale=scale,
-                    square_aligned=square_aligned, sink_rows=sink_rows,
+                    native,
+                    q,
+                    k,
+                    v,
+                    kind=kind,
+                    scale=scale,
+                    square_aligned=square_aligned,
+                    sink_rows=sink_rows,
                 )
 
             def vdn_preprocess(q, k, v, *, heads, transformer_options):
@@ -457,9 +533,11 @@ class BlockPatch:
             block = model.blocks[self.index]
             if config.exact:
                 from .exact import execute_block, ineligible_reason
+
                 reason = ineligible_reason(block, call_args)
                 if reason is None and not state.native_verified and state.native_reason is None:
                     from .native_contract import verify_native
+
                     try:
                         verify_native()
                         state.native_verified = True
@@ -473,8 +551,11 @@ class BlockPatch:
                 state.fallbacks["exact:" + reason] += 1
             return extra["original_block"](call_args)
 
-        result = (original_block(forwarded) if self.previous is None else
-                  self.previous(forwarded, {**extra, "original_block": original_block}))
+        result = (
+            original_block(forwarded)
+            if self.previous is None
+            else self.previous(forwarded, {**extra, "original_block": original_block})
+        )
         if config.backend == "sol" and len(routes) == route_start:
             attn_forward = getattr(getattr(model.blocks[self.index], "attn", None), "forward", None)
             if getattr(attn_forward, "_vdn_forward", False):
@@ -501,6 +582,7 @@ def merge_config(old, new):
 def install(model, config):
     from comfy.ldm.minimax.model import MiniMaxH3Model
     from comfy.patcher_extension import WrappersMP
+
     inner = model.get_model_object("diffusion_model")
     if not isinstance(inner, MiniMaxH3Model) or not len(inner.blocks):
         raise RuntimeError("Sol-H3 requires a native ComfyUI MiniMaxH3 MODEL")
@@ -514,8 +596,10 @@ def install(model, config):
     to[KEY] = config.metadata()
     if config.backend == "sol":
         to[HISTORY_KEY] = {**to.get(HISTORY_KEY, {}), "sol_h3": HistoryPolicy(config)}
-    for kind, wrapper in ((WrappersMP.OUTER_SAMPLE, SamplingWrapper(config)),
-                          (WrappersMP.DIFFUSION_MODEL, DiffusionWrapper(config))):
+    for kind, wrapper in (
+        (WrappersMP.OUTER_SAMPLE, SamplingWrapper(config)),
+        (WrappersMP.DIFFUSION_MODEL, DiffusionWrapper(config)),
+    ):
         if reapplied:
             cloned.remove_wrappers_with_key(kind, KEY)
         cloned.add_wrapper_with_key(kind, KEY, wrapper)
@@ -526,13 +610,15 @@ def install(model, config):
             cloned.set_model_patch_replace(BlockPatch(i, config, previous), "dit", "double_block", i)
     if config.backend == "sol":
         vdn_patches = sum(
-            bool(getattr(cloned.object_patches.get(
-                f"diffusion_model.blocks.{i}.attn.forward"), "_vdn_forward", False))
+            bool(getattr(cloned.object_patches.get(f"diffusion_model.blocks.{i}.attn.forward"), "_vdn_forward", False))
             for i in range(len(inner.blocks))
         )
         if vdn_patches:
             api = _vdn_provider_api()
-            log.info("Sol-H3 detected VDN object patches=%d; softmax-provider module API=%s",
-                     vdn_patches, api if api is not None else "missing")
+            log.info(
+                "Sol-H3 detected VDN object patches=%d; softmax-provider module API=%s",
+                vdn_patches,
+                api if api is not None else "missing",
+            )
     log.info("Sol-H3 active: %s; AdaLN precompute=%s", config.metadata(), adaln_status(inner))
     return cloned
