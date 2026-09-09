@@ -9,6 +9,7 @@ from sol_h3.runtime import Request
 
 
 HEAD_DIM = 128
+PRODUCTION_HEADS = 56
 
 
 def _comfy_qkv_views(rows, heads, *, device="cpu"):
@@ -104,22 +105,24 @@ def test_sparse_bridge_preserves_comfy_strided_views_and_calibrates_per_layout(m
 @pytest.mark.gpu
 @pytest.mark.parametrize("tq,tk", [(193, 193), (65, 449)])
 def test_real_sm120_sparse_bridge_accepts_exact_comfy_strided_bthd_views(tq, tk):
-    """Exercise the production MiniMax-H3 transpose-view layout on real SM120 CuTe."""
+    """Exercise the production 56-head MiniMax-H3 transpose layout on real SM120 CuTe."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires real SM120")
 
+    heads = PRODUCTION_HEADS
     torch.manual_seed(91 + tq + tk)
-    _, qkv_q = _comfy_qkv_views(tq, 2, device="cuda")
+    _, qkv_q = _comfy_qkv_views(tq, heads, device="cuda")
     if tq == tk:
         q_bthd, k_bthd, v_bthd = qkv_q
     else:
         q_bthd = qkv_q[0]
-        _, qkv_kv = _comfy_qkv_views(tk, 2, device="cuda")
+        _, qkv_kv = _comfy_qkv_views(tk, heads, device="cuda")
         _, k_bthd, v_bthd = qkv_kv
 
     expected_strides = [list(x.stride()) for x in (q_bthd, k_bthd, v_bthd)]
-    assert expected_strides[0][1:] == [6 * HEAD_DIM, HEAD_DIM, 1]
-    assert expected_strides[1][1:] == [6 * HEAD_DIM, HEAD_DIM, 1]
+    expected_inner_stride = 3 * heads * HEAD_DIM
+    assert expected_strides[0][1:] == [expected_inner_stride, HEAD_DIM, 1]
+    assert expected_strides[1][1:] == [expected_inner_stride, HEAD_DIM, 1]
     assert all(x.stride(-1) == 1 and not x.is_contiguous()
                for x in (q_bthd, k_bthd, v_bthd))
 
@@ -140,7 +143,7 @@ def test_real_sm120_sparse_bridge_accepts_exact_comfy_strided_bthd_views(tq, tk)
             cfg,
             state,
             recompute_prefix_queries=False,
-        ).reshape(1, tq, 2, HEAD_DIM)
+        ).reshape(1, tq, heads, HEAD_DIM)
         want = _dense_bthd(q_bthd, k_bthd, v_bthd)
         metrics = sparse.error_metrics(got, want)
 
