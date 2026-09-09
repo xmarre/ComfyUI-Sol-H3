@@ -1,0 +1,60 @@
+name: PR2 Mixed-Grid measure docs
+
+on:
+  push:
+    branches:
+      - mirror/pr2-mixed-measure-doc-sync
+
+permissions:
+  contents: write
+
+jobs:
+  docs:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Update documentation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          readme = Path('README.md')
+          text = readme.read_text()
+          anchor = '''Unknown/stale/malformed external contracts delegate locally to inherited attention. Later target-grid stages resume native rectangular SOL.\n\n### Spectrum history and receipts'''
+          replacement = '''Unknown/stale/malformed external contracts delegate locally to inherited attention. Later target-grid stages resume native rectangular SOL.\n\n#### Experimental Mixed-Grid attention measure\n\nFlow PR #24 can additionally publish an independent `h3_flow_mixed_grid_attention_measure_v1` contract for the off-by-default framing-seam experiment. This does **not** change VDN API 2 or its released learned gate.\n\nFor the matched geometry that motivated the experiment, protected target-grid prefix frames contain `28 x 38 = 1064` video K/V rows while genuine source-grid suffix frames contain `20 x 27 = 540`. Sol-H3 validates the independent measure metadata against the already validated API-2 stream, preprocesses the full mixed Q/K/V domain first, then keeps every Q row while selecting one protected-prefix K/V representative nearest each source-grid MiniMax-H3 `_frame_grid` coordinate. Non-video K/V and all suffix K/V rows remain unchanged and ordered.\n\nRepresentative accounting:\n\n```text\nQ:   56029 -> 56029\nK/V: 56029 -> 49741\nremoved protected-prefix K/V rows: 6288\n```\n\nThe resulting rectangular call uses the same Sana SM120 path. Malformed/inconsistent measure contracts fail closed. If the measure contract is absent, released v0.1.0 mixed-route behavior is unchanged. Decoded-media validation remains the acceptance gate; this is not yet a released perceptual fix.\n\n### Spectrum history and receipts'''
+          if anchor not in text:
+              raise SystemExit('README Flow anchor not found')
+          text = text.replace(anchor, replacement, 1)
+          counters = '''external_mixed_kernel_q_rows\nvdn_local_sol_calls'''
+          counter_replacement = '''external_mixed_kernel_q_rows\nexternal_mixed_measure_calls\nexternal_mixed_measure_q_rows\nexternal_mixed_measure_kv_rows_before\nexternal_mixed_measure_kv_rows_after\nexternal_mixed_measure_removed_rows\nvdn_local_sol_calls'''
+          if counters not in text:
+              raise SystemExit('README counter anchor not found')
+          readme.write_text(text.replace(counters, counter_replacement, 1))
+
+          rectangular = Path('docs/RECTANGULAR.md')
+          text = rectangular.read_text()
+          anchor = '''An earlier run also established 192 mixed calls / 8,360,640 requested and kernel rows 1:1. Malformed/stale/unknown contracts delegate locally to inherited attention; later native target-grid calls can resume SOL.\n\n## Untwist preprocessing'''
+          replacement = '''An earlier run also established 192 mixed calls / 8,360,640 requested and kernel rows 1:1. Malformed/stale/unknown contracts delegate locally to inherited attention; later native target-grid calls can resume SOL.\n\n### Experimental K/V attention-measure normalization\n\nFlow PR #24 can publish a second, independent contract alongside API 2:\n\n```text\nkey  = h3_flow_mixed_grid_attention_measure_v1\napi  = 1\nmode = prefix_kv_stratified_subsample\n```\n\nThis contract addresses unequal discrete spatial sampling density inside the mixed attention domain; it does not redefine the mixed sequence or VDN ownership. The motivating geometry has `1064` protected-prefix rows/frame and `540` source-suffix rows/frame (`~1.97037x`).\n\nSol-H3 validates the measure metadata against the current API-2 mixed contract and full Q/K/V row counts. Explicit preprocessing such as Untwist is applied to the original full mixed domain first. Then only K/V are gathered:\n\n- every Q row is preserved;\n- every row before target video is preserved;\n- every generated source-grid suffix K/V row is preserved exactly and in order;\n- each protected prefix frame keeps one K/V representative nearest every source-grid coordinate under MiniMax-H3's native area-normalized `_frame_grid` geometry.\n\nFor the matched production geometry:\n\n```text\nQ:   56029 -> 56029\nK/V: 56029 -> 49741\n```\n\n`49741` equals the native low-carrier packed row count. The SM120 call is therefore rectangular in the ordinary kernel sense: query ownership remains the full mixed sequence while the softmax K/V integration measure is normalized to source-grid spatial density.\n\nThe representative mapping is regression-tested against pinned native ComfyUI `_frame_grid` coordinates row-for-row. Contract mismatches fail closed rather than silently selecting a different K/V domain. The experiment remains off by default in Flow and requires decoded-media validation before promotion.\n\nExpected telemetry when active:\n\n```text\nexternal_mixed_measure_calls > 0\nexternal_mixed_measure_q_rows > 0\nexternal_mixed_measure_kv_rows_before > external_mixed_measure_kv_rows_after\nexternal_mixed_measure_removed_rows > 0\n```\n\n## Untwist preprocessing'''
+          if anchor not in text:
+              raise SystemExit('RECTANGULAR Flow anchor not found')
+          rectangular.write_text(text.replace(anchor, replacement, 1))
+          PY
+          git diff --check
+      - name: Validate
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m ruff check .
+          python -m pytest -q tests/test_mixed_measure.py tests/test_external_mixed.py tests/test_attention_guard.py tests/test_interop.py
+      - name: Commit and remove temporary workflow
+        run: |
+          rm .github/workflows/pr2-doc-sync.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --check --cached
+          git commit -m 'Document Mixed-Grid attention-measure normalization'
+          git push
