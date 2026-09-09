@@ -1,0 +1,39 @@
+name: Publish to Comfy registry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  publish-node:
+    name: Publish Custom Node to registry
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'xmarre' }}
+    env:
+      REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Publish Custom Node
+        if: ${{ env.REGISTRY_ACCESS_TOKEN != '' }}
+        uses: Comfy-Org/publish-node-action@0eb6cd742945443bee7f79eeddd4f732780029a1 # v1
+        with:
+          personal_access_token: ${{ env.REGISTRY_ACCESS_TOKEN }}
+
+      - name: Registry token unavailable
+        if: ${{ env.REGISTRY_ACCESS_TOKEN == '' }}
+        shell: bash
+        run: |
+          echo "::warning::REGISTRY_ACCESS_TOKEN is not configured for this repository; skipping Comfy Registry publication."
