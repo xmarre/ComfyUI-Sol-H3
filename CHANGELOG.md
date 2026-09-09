@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.4 — 2026-09-09
+
+Coordinated companion release for Flow v0.3.3's Mixed-Grid Continuum framing-seam fix.
+
+### Added
+
+- Adds Flow's independent `h3_flow_mixed_grid_attention_measure_v1` consumer for validated API-2 Mixed-Grid sequences.
+- Preserves every Q row, all non-video K/V and every generated source-grid suffix K/V row while stratifying only the denser protected-prefix K/V to the source-grid spatial measure.
+- Uses native MiniMax-H3 area-normalized `_frame_grid` coordinates for the deterministic protected-prefix representative map.
+- Adds production telemetry for measure calls and K/V row accounting.
+- Adds regression coverage for native-coordinate mapping, malformed-contract fail-closed behavior, preprocessing order, full-Q preservation and exact suffix/non-video K/V preservation.
+
+### Spectrum history
+
+- Adds the audited `sol_external_mixed_measure` receipt route without broadening acceptance of unknown routes.
+- Includes Flow's `attention_measure` boolean in the replacement/history identity so measure-on/off executions cannot silently share incompatible forecast history.
+- Matched `00324` validation restored `18 logical / 13 actual / 5 forecast` while the real SM120 measure path remained active.
+
+### Decoded-media result
+
+- The previous whole-frame shrink/top-edge reveal at the Mixed-Grid exact-prefix join is absent in matched decoded-media validation.
+- The same seam remains clean in the separate `dense_evaluations=1` quality follow-up.
+- v0.1.4 does not change the v0.1.3 warmup policy: `dense_evaluations=1` remains the conservative default and `0` remains the explicit maximum-speed mode.
+
 ## v0.1.3 — 2026-09-09
 
 Restores the conservative one-evaluation dense SOL warmup after a controlled same-seed video comparison exposed a startup trajectory discontinuity when SOL approximation was enabled from the first sigma-1.0 evaluation.
