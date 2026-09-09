@@ -210,10 +210,11 @@ Subsequent zero-copy workflow runs varied materially (`287.29/239.10 s` and `298
 
 ## Installation
 
-Run in the same Python environment as ComfyUI:
+Set your ComfyUI root once and install in the same Python environment as ComfyUI:
 
 ```bash
-cd /home/toor/ComfyUI/custom_nodes
+export COMFYUI_ROOT=/path/to/ComfyUI
+cd "$COMFYUI_ROOT/custom_nodes"
 git clone https://github.com/xmarre/ComfyUI-Sol-H3.git
 cd ComfyUI-Sol-H3
 python -m pip install -r requirements.txt
@@ -222,7 +223,8 @@ python -m pip install -r requirements.txt
 For an existing checkout:
 
 ```bash
-cd /home/toor/ComfyUI/custom_nodes/comfyui-sol-h3
+export COMFYUI_ROOT=/path/to/ComfyUI
+cd "$COMFYUI_ROOT/custom_nodes/ComfyUI-Sol-H3"
 git pull
 python -m pip install -r requirements.txt
 ```
@@ -238,6 +240,8 @@ SageAttention is optional and is not installed by Sol-H3. On SM120 use KJNodes *
 If Sage fails with a binary ABI error such as `GLIBCXX_3.4.32 not found`, rebuild the official package against the same ComfyUI Python/compiler/CUDA toolkit. Do not repair it with `LD_LIBRARY_PATH`, `LD_PRELOAD` or runtime preloading. See [SageAttention installation and repair](docs/SAGEATTENTION.md).
 
 ## Validation and diagnostics
+
+From the node checkout:
 
 ```bash
 python -m pip install -e '.[test]'
