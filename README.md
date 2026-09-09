@@ -119,6 +119,22 @@ compatibility_fallbacks              {}
 
 Unknown/stale/malformed external contracts delegate locally to inherited attention. Later target-grid stages resume native rectangular SOL.
 
+#### Experimental Mixed-Grid attention measure
+
+Flow PR #24 can additionally publish an independent `h3_flow_mixed_grid_attention_measure_v1` contract for the off-by-default framing-seam experiment. This does **not** change VDN API 2 or its released learned gate.
+
+For the matched geometry that motivated the experiment, protected target-grid prefix frames contain `28 x 38 = 1064` video K/V rows while genuine source-grid suffix frames contain `20 x 27 = 540`. Sol-H3 validates the independent measure metadata against the already validated API-2 stream, preprocesses the full mixed Q/K/V domain first, then keeps every Q row while selecting one protected-prefix K/V representative nearest each source-grid MiniMax-H3 `_frame_grid` coordinate. Non-video K/V and all suffix K/V rows remain unchanged and ordered.
+
+Representative accounting:
+
+```text
+Q:   56029 -> 56029
+K/V: 56029 -> 49741
+removed protected-prefix K/V rows: 6288
+```
+
+The resulting rectangular call uses the same Sana SM120 path. Malformed/inconsistent measure contracts fail closed. If the measure contract is absent, released v0.1.0 mixed-route behavior is unchanged. Decoded-media validation remains the acceptance gate; this is not yet a released perceptual fix.
+
 ### Spectrum history and receipts
 
 Spectrum preflights numerical backend policy and observes actual route receipts before retaining forecasting history. Sol-H3 provides a stable identity for the actual attention ownership chain; Spectrum remains provider-generic.
@@ -265,6 +281,11 @@ sparse_calls
 external_mixed_sol_calls
 external_mixed_q_rows
 external_mixed_kernel_q_rows
+external_mixed_measure_calls
+external_mixed_measure_q_rows
+external_mixed_measure_kv_rows_before
+external_mixed_measure_kv_rows_after
+external_mixed_measure_removed_rows
 vdn_local_sol_calls
 vdn_rectangular_sol_calls
 vdn_requested_q_rows
