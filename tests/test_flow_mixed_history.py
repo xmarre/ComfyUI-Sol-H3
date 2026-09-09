@@ -200,3 +200,48 @@ def test_real_flow_mixed_grid_rebuilt_closures_are_forecast_provable():
     # block 0 retains Flow's generic marked layout wrapper underneath it. The full
     # production replacement chain must remain semantic/stable across rebuilds.
     assert len(identities) == 2 and identities[0] == identities[1]
+
+
+def test_real_flow_high_continuation_does_not_restart_dense_evaluation_warmup():
+    sys.path.insert(0, os.environ["COMFYUI_PATH"])
+    sys.path.insert(0, os.environ["FLOW_PATH"])
+
+    import comfy.cli_args
+
+    comfy.cli_args.args.cpu = True
+    from h3_flow_regenerate.runtime import _flow_stage_contract, _high_stage_contract
+    from sol_h3.contracts import Config
+    from sol_h3.interop import HistoryPolicy, dense_evaluation_warmup
+    from sol_h3.runtime import BlockPatch, Request, _REQUEST
+
+    cfg = Config(exact=False, backend="sol", dense_evaluations=1, dense_layers=0)
+    model = _model()
+    replacements = {
+        ("double_block", index): BlockPatch(index, cfg)
+        for index in range(len(model.blocks))
+    }
+    guider = SimpleNamespace(model_options={
+        "transformer_options": {"patches_replace": {"dit": replacements}}
+    })
+    request = Request(cfg)
+    token = _REQUEST.set(request)
+    try:
+        ordinary = guider.model_options["transformer_options"]
+        ordinary_identity = HistoryPolicy(cfg)(layout=_native_layout(), options=ordinary, model=model)
+        assert ordinary_identity is not None and ordinary_identity[1] == "dense"
+        assert dense_evaluation_warmup(cfg, 0, ordinary)
+
+        with _flow_stage_contract(guider, "high"), _high_stage_contract(guider):
+            high = guider.model_options["transformer_options"]
+            high_identity = HistoryPolicy(cfg)(layout=_native_layout(), options=high, model=model)
+            assert high_identity is not None and high_identity[1] == "sol"
+            assert not dense_evaluation_warmup(cfg, 0, high)
+
+        # The one-call handoff probe deliberately remains a dense exact anchor.
+        with _flow_stage_contract(guider, "probe"), _high_stage_contract(guider):
+            probe = guider.model_options["transformer_options"]
+            probe_identity = HistoryPolicy(cfg)(layout=_native_layout(), options=probe, model=model)
+            assert probe_identity is not None and probe_identity[1] == "dense"
+            assert dense_evaluation_warmup(cfg, 0, probe)
+    finally:
+        _REQUEST.reset(token)
