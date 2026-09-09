@@ -148,6 +148,15 @@ def test_tampered_source_cannot_claim_verified(tmp_path, monkeypatch):
         provenance.verify_source()
 
 
+def test_native_windows_missing_cute_reports_supported_path(monkeypatch):
+    from sol_h3 import sparse
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device=None: (12, 0))
+    monkeypatch.setattr(interface, '_cute_runtime_available', lambda: False)
+    monkeypatch.setattr(sparse.sys, 'platform', 'win32')
+    with pytest.raises(RuntimeError, match=r'native Windows.*Linux/WSL2'):
+        sparse.load_kernel(torch.device('cuda'))
+
+
 def test_missing_cute_counts_no_sparse_and_caches_reason(monkeypatch):
     from sol_h3 import sparse
     from sol_h3.contracts import Config
