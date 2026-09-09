@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
-          ref: fe0ef8752b92081b5a85bc9b39ad8e2a7037d591
+          ref: ea7ea8f22c6eec077de7a4cccb6476df5fcf031a
           path: _deps/Flow
           persist-credentials: false
       - uses: actions/checkout@v4
@@ -84,7 +84,7 @@ jobs:
       - run: pip install torch==2.10.0+cpu torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
       - run: pip install -r _deps/ComfyUI/requirements.txt
       - run: pip install -e '.[test]'
-      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py tests/test_real_diffaid_stack.py tests/test_flow_mixed_history.py
+      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py tests/test_real_diffaid_stack.py tests/test_flow_mixed_history.py tests/test_flow_mixed_measure_contract.py
         env:
           COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
           KJNODES_PATH: ${{ github.workspace }}/_deps/KJNodes
