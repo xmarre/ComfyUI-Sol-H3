@@ -1,5 +1,6 @@
 """Native attention bridge to the packaged Sana Sol-H3 implementation."""
 import math
+import time
 
 import torch
 import torch.nn.functional as F
@@ -136,6 +137,19 @@ def _dense_reference(q, k, v, dense_attention):
     return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
 
 
+def _bthd_view(x):
+    """Expose BHSD attention tensors as zero-copy BTHD views for Sana CuTe.
+
+    The vendored SM120 interface intentionally accepts arbitrary outer strides
+    as long as the head dimension is contiguous. Keeping the transpose as a
+    view avoids materialising Q/K/V on every sparse-attention invocation.
+    """
+    out = x.transpose(1, 2)
+    if out.stride(-1) != 1:
+        raise RuntimeError("SOL requires an innermost-contiguous head dimension")
+    return out
+
+
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
@@ -148,29 +162,56 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         raise RuntimeError("Prefix query recomputation requires the original square packed sequence")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
+    kernel_init_s = 0.0
     if state.kernel is None:
         failure = getattr(state, "kernel_failure", None)
         if failure:
             raise KernelUnavailable(failure)
+        started = time.perf_counter()
         try:
             state.kernel = load_kernel(q.device)
         except RuntimeError as exc:
             state.kernel_failure = str(exc)
             raise KernelUnavailable(str(exc)) from exc
+        kernel_init_s = time.perf_counter() - started
         state.kernel_device = q.device
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
-    qb, kb, vb = (x.transpose(1, 2).contiguous() for x in (q, k, v))
-    key = (q.device, q.dtype, tuple(q.shape), tuple(k.shape), tuple(v.shape))
+
+    qb, kb, vb = (_bthd_view(x) for x in (q, k, v))
+    layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (qb, kb, vb))
+    key = (
+        q.device,
+        q.dtype,
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        layout_key,
+    )
     if key not in state.sparse_verified:
+        # error_metrics() performs scalar reads and therefore synchronizes the
+        # calibration work already required by the correctness gate. Measuring
+        # this whole block adds no extra steady-state synchronization and makes
+        # cold CuTe compile/calibration cost visible in production telemetry.
+        calibration_started = time.perf_counter()
         got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                            sink_start=0, sink_tokens=kb.shape[1])
         want = _dense_reference(q, k, v, None)
         metrics = error_metrics(got, want)
+        calibration_s = time.perf_counter() - calibration_started
         if not arithmetic_gate_passes(metrics):
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
         state.sparse_verified.add(key)
-        state.gates.append({"shape": list(q.shape), "kv_shape": list(k.shape), "backend": getattr(state.kernel, "backend_name", "test_substitute"), **metrics})
+        state.gates.append({
+            "shape": list(q.shape),
+            "kv_shape": list(k.shape),
+            "bthd_strides": [list(s) for s in layout_key],
+            "zero_copy_bthd": True,
+            "kernel_init_s": kernel_init_s,
+            "calibration_s": calibration_s,
+            "backend": getattr(state.kernel, "backend_name", "test_substitute"),
+            **metrics,
+        })
         del got, want
     out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
                        sink_start=0, sink_tokens=prefix)
