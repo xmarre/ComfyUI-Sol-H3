@@ -9,7 +9,7 @@ class SolH3Exact:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
     CATEGORY = "model/optimizations/Sol-H3"
-    DESCRIPTION = "Fuse native H3 affine modulation with intermediate rounding preserved. CUDA required; GPU validation pending."
+    DESCRIPTION = "Fuse native H3 affine modulation with intermediate rounding preserved on validated Linux/WSL CUDA. Native Windows delegates to untouched native H3."
 
     def apply(self, model):
         from .runtime import install
