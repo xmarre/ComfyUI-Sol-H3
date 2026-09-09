@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.1.3 — 2026-09-09
+
+Restores the conservative one-evaluation dense SOL warmup after a controlled same-seed video comparison exposed a startup trajectory discontinuity when SOL approximation was enabled from the first sigma-1.0 evaluation.
+
+### Changed
+
+- `Sol-H3 SOL Attention (Experimental)` defaults `dense_evaluations` back to `1`.
+- Programmatic `Config(backend="sol")` uses the same `dense_evaluations=1` default.
+- `dense_evaluations=0` remains supported as an explicit maximum-speed mode. With Spectrum it can avoid one actual transformer NFE by eliminating the initial `dense -> sol` history boundary.
+- `dense_layers=2` remains unchanged.
+- Existing saved workflows keep their serialized value; workflows created or saved under v0.1.2 can therefore remain at `0` until changed explicitly.
+
+### Quality evidence
+
+A subsequent controlled same-seed comparison established a concrete failure mode for the SOL-first policy. With `dense_evaluations=0`, the opening motion showed an abrupt pose/orientation change with heavy early smearing before settling into the opposite heading. With `dense_evaluations=1`, the corresponding opening motion remained a continuous turn.
+
+This is evidence that SOL from the first denoiser evaluation **can** destabilize the initial trajectory. It does not establish the frequency of the artifact across seeds, prompts, references, resolutions or model variants. The default is restored to `1` on quality-risk grounds.
+
+### Spectrum / performance boundary
+
+The v0.1.2 scheduling analysis remains valid: `dense_evaluations=1` creates a real `dense -> sol` numerical-backend transition, and Spectrum correctly invalidates incompatible forecasting history across it. The first would-be forecast can therefore become an additional actual transformer NFE to establish a SOL-side anchor.
+
+The previous controlled hot evidence remains the measured speed trade-off:
+
+| Run | SOL | `dense_evaluations` | Logical | Actual | Forecast | H3 sampler | End-to-end |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `metrics_00321` | on | 1 | 40 | 26 | 14 | 353.36 s | 400.94 s |
+| `metrics_00322` | off | — | 40 | 25 | 15 | 374.84 s | 420.81 s |
+| `metrics_00323` | on | **0** | **40** | **25** | **15** | **332.56 s** | **380.57 s** |
+
+Do not weaken Spectrum's history/receipt invariant to recover that NFE while retaining a dense-to-SOL transition. The extra actual evaluation is the correct consequence of crossing numerical attention backends mid-trajectory.
+
+See `docs/DENSE_EVALUATIONS.md` for the current default, migration behavior, speed/quality trade-off and telemetry guidance.
+
 ## v0.1.2 — 2026-09-09
 
 Changes the default SOL trajectory policy from one full dense denoiser evaluation to SOL from the first real denoiser evaluation.
