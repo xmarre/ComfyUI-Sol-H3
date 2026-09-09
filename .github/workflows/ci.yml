@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
-          ref: ea7ea8f22c6eec077de7a4cccb6476df5fcf031a
+          ref: c43bf60a5b5454fcb5da82f93a6c322095f22ff9
           path: _deps/Flow
           persist-credentials: false
       - uses: actions/checkout@v4
