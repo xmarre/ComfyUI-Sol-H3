@@ -8,8 +8,9 @@ Patch release addressing the native-Windows failure reported in issue #4 without
 - Pinned the vendored source snapshot to LF checkout via `.gitattributes`.
 - Provenance hashing now accepts only Git-style CRLF-to-LF transport normalization in addition to exact bytes; any other content change still fails closed.
 - Added `windows-latest` provenance CI covering Windows path semantics, CRLF normalization and tamper rejection.
-- Scoped CuTe runtime dependencies (`nvidia-cutlass-dsl`, `cuda-python`, `apache-tvm-ffi`) to Linux, matching the platform actually supported by NVIDIA's current CuTe DSL runtime.
+- Scoped CuTe/Triton runtime dependencies to Linux, matching the platform actually supported by the packaged kernel path.
 - Native Windows now reports an explicit `Linux/WSL2` requirement when the SM120 CuTe backend is unavailable instead of presenting the fallback as a generic backend-selection problem.
+- Exact Runtime now fails closed on native Windows before importing or executing its Triton affine kernel and delegates to the untouched native H3 block. This removes the unvalidated Sol-H3 Exact/Triton path from ComfyUI's native-Windows AIMDO malloc-graph lifecycle.
 
 ## Native Windows boundary
 
@@ -24,9 +25,9 @@ See `docs/WINDOWS.md` for the exact boundary and troubleshooting procedure.
 
 ## Issue #4 allocator crash
 
-The attached failing request reported `sol_backend=null`, `sol_source_tree_verified=false` and `sparse_calls=0`, so no SOL sparse kernel executed before the later `comfy_aimdo` `malloc_graph_pop` access violation. The same request had `exact_fusion=true` and `exact_blocks=600`.
+The attached failing request reported `sol_backend=null`, `sol_source_tree_verified=false` and `sparse_calls=0`, so no SOL sparse kernel executed before the later `comfy_aimdo` `malloc_graph_pop` access violation. The same v0.1.0 request had `exact_fusion=true` and `exact_blocks=600`, so Exact Runtime was the only Sol-H3 custom kernel path that actually executed.
 
-This patch therefore does not misattribute or claim to fix the AIMDO failure. Native-Windows Exact Runtime plus ComfyUI's AIMDO malloc-graph compiler remains unvalidated. For isolation, rerun on native Windows with `exact_fusion=false`; if the AIMDO failure persists, it is outside the SOL sparse-kernel path.
+v0.1.1 does not claim that Sol-H3 caused the AIMDO failure. Instead, native Windows now automatically delegates Exact Runtime to native H3, while SOL remains a dense fallback because CuTe is unavailable. If `comfy_aimdo` still fails after upgrading to v0.1.1, the failure is reproducible with both Sol-H3 custom kernel paths absent and should be investigated in the ComfyUI/AIMDO path separately.
 
 ## Regression scope
 
