@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.1.2 — 2026-09-09
+
+Changes the default SOL trajectory policy from one full dense denoiser evaluation to SOL from the first real denoiser evaluation.
+
+### Changed
+
+- `Sol-H3 SOL Attention (Experimental)` now defaults `dense_evaluations` to `0` instead of `1`.
+- Programmatic `Config(backend="sol")` uses the same `dense_evaluations=0` default.
+- `dense_layers=2` is unchanged; the first two H3 blocks remain dense inside each otherwise-SOL denoiser evaluation.
+- Existing saved workflows keep their serialized `dense_evaluations` value. Users can set `dense_evaluations=1` explicitly to retain the previous conservative trajectory warmup.
+- Spectrum backend-history safety is unchanged. Real numerical-route changes still invalidate incompatible history; the new default simply avoids creating the initial `dense -> sol` transition.
+
+### Controlled evidence
+
+Same-seed, same-reference, same-resolution, same-prompt, same-sampler, same-workflow hot runs with VDN disabled:
+
+| Run | SOL | `dense_evaluations` | Logical | Actual | Forecast | H3 sampler | End-to-end |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `metrics_00321` | on | 1 | 40 | 26 | 14 | 353.36 s | 400.94 s |
+| `metrics_00322` | off | — | 40 | 25 | 15 | 374.84 s | 420.81 s |
+| `metrics_00323` | on | **0** | **40** | **25** | **15** | **332.56 s** | **380.57 s** |
+
+`metrics_00323` restores exact 25A/15F topology parity with the no-SOL control and reports backend history in `phase=sol` from the first call with `numerical_backend_transitions=0`. In this controlled hot pair, SOL is 42.28 s (11.3%) faster in H3 sampler wall time and 40.24 s (9.6%) faster end-to-end. These are deployment-specific measurements, not universal SOL percentages.
+
+The `dense_evaluations=0` output is visibly different from the `dense_evaluations=1` same-seed video, as expected for approximate attention affecting the trajectory from sigma 1.0, but manual inspection did not establish either as better or worse. This is not statistical perceptual-equivalence evidence.
+
+See `docs/DENSE_EVALUATIONS.md` for the scheduling rationale, timing interpretation, migration behavior, and the distinction between `dense_evaluations` and `dense_layers`.
+
 ## v0.1.1 — 2026-09-09
 
 Patch release for native-Windows installation/provenance behavior reported in issue #4.
