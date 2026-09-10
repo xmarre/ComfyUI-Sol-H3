@@ -1,9 +1,10 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry and exact-path key measure; see tools/rectangular_sm120.patch.
 """Public Sol-Attn interface."""
 
 from __future__ import annotations
 
 import functools
+import math
 
 import torch
 
@@ -59,6 +60,29 @@ def _validate_inputs(
         if sink_start + sink_tokens > k.shape[1]:
             raise ValueError("sink_start + sink_tokens must be <= Tkv")
     return tuple(torch.cuda.get_device_capability(q.device))
+
+
+def _validate_key_bias(k, key_bias, key_bias_range, sink_start, sink_tokens):
+    if key_bias is None:
+        if key_bias_range is not None:
+            raise ValueError("key_bias_range requires key_bias")
+        return None, None
+    if not torch.is_tensor(key_bias) or key_bias.ndim != 1 or key_bias.shape[0] != k.shape[1]:
+        raise ValueError("key_bias must have shape [Tkv]")
+    if not key_bias.dtype.is_floating_point:
+        raise TypeError("key_bias must be floating point natural-log measure")
+    if key_bias.device != k.device:
+        raise ValueError("key_bias must be on the K/V CUDA device")
+    if not isinstance(key_bias_range, (tuple, list)) or len(key_bias_range) != 2:
+        raise ValueError("weighted Sol-Attn requires key_bias_range=(start, stop)")
+    start, stop = key_bias_range
+    if type(start) is not int or type(stop) is not int or not 0 <= start < stop <= k.shape[1]:
+        raise ValueError("key_bias_range must be a nonempty interval within Tkv")
+    sink_blocks = _sink_block_range(k.shape[1], sink_start, sink_tokens)
+    bias_blocks = (start // BLOCK_SIZE, (stop + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    if sink_blocks[0] > bias_blocks[0] or sink_blocks[1] < bias_blocks[1]:
+        raise ValueError("every active key-bias block must be exact-covered by the sink range")
+    return key_bias.to(dtype=torch.float32).contiguous(), (start, stop)
 
 
 @functools.lru_cache(maxsize=1)
@@ -199,13 +223,16 @@ def _compile_sm120(
     scale,
     sink_start_block,
     sink_end_block,
+    key_bias_start,
+    key_bias_stop,
+    use_key_bias,
     stream,
 ):
     import cutlass.cute as cute
 
     from .sm120 import make_kernel
 
-    operator = make_kernel()
+    operator = make_kernel(use_key_bias=use_key_bias)
     args = _to_cute_tensors(tensors)
     compiled = cute.compile(
         operator,
@@ -213,6 +240,8 @@ def _compile_sm120(
         scale,
         sink_start_block,
         sink_end_block,
+        key_bias_start,
+        key_bias_stop,
         stream=stream,
         options="--enable-tvm-ffi",
     )
@@ -232,6 +261,8 @@ def _sol_attn_cute(
     kv_splits,
     sink_tokens,
     sink_start,
+    key_bias=None,
+    key_bias_range=None,
     valid_tokens=None,
 ):
     from .preprocess import prepare
@@ -259,11 +290,26 @@ def _sol_attn_cute(
             dtype=torch.float32,
         )
         stream = _stream(q.device)
-        # CuTe specializes tensor layouts.  Shape alone is insufficient now that a caller may
+        # CuTe specializes tensor layouts. Shape alone is insufficient now that a caller may
         # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
         # descriptor for a strided view (or vice versa).
         layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v))
-        key = (q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits, layout_key)
+        use_key_bias = key_bias is not None
+        bias_start, bias_stop = key_bias_range if use_key_bias else (0, 0)
+        key = (
+            q.device.index,
+            arch,
+            batch,
+            capacity_tokens,
+            k.shape[1],
+            heads,
+            kv_splits,
+            layout_key,
+            use_key_bias,
+            (tuple(key_bias.shape), tuple(key_bias.stride())) if use_key_bias else None,
+            bias_start,
+            bias_stop,
+        )
 
         if arch == (9, 0):
             if sink_tokens:
@@ -346,7 +392,14 @@ def _sol_attn_cute(
                 sink_start,
                 sink_tokens,
             )
-            tensors = [q, k, v, output, kc, vc, threshold, lse]
+            # Keep the no-measure arithmetic path identical: the extra tensor is
+            # compile-time dead when use_key_bias=False and is never read.
+            bias_tensor = (
+                key_bias
+                if use_key_bias
+                else torch.empty((1,), device=q.device, dtype=torch.float32)
+            )
+            tensors = [q, k, v, output, kc, vc, threshold, lse, bias_tensor]
             compiled = _compiled.get(key)
             if compiled is None:
                 compiled, args = _compile_sm120(
@@ -355,6 +408,9 @@ def _sol_attn_cute(
                     scale,
                     sink_start_block,
                     sink_end_block,
+                    bias_start,
+                    bias_stop,
+                    use_key_bias,
                     stream,
                 )
             else:
@@ -364,6 +420,8 @@ def _sol_attn_cute(
                 scale,
                 sink_start_block,
                 sink_end_block,
+                bias_start,
+                bias_stop,
                 stream=stream,
             )
     return output[:, :tokens]
@@ -389,7 +447,7 @@ def _pad_to_bucket(q, k, v, bucket_size: int):
     )
     padded = packed.split(q.shape[3], dim=-1)
     # Ulysses produces Q/K/V by splitting one contiguous [..., Q | K | V]
-    # allocation.  Recover that packed view and copy it in one launch.  The
+    # allocation. Recover that packed view and copy it in one launch. The
     # fallback retains support for callers that supply independent tensors.
     head_dim = q.shape[3]
     same_storage = (
@@ -416,7 +474,7 @@ def _pad_to_bucket(q, k, v, bucket_size: int):
     else:
         for destination, source in zip(padded, (q, k, v)):
             destination[:, :tokens].copy_(source)
-    # Only the bucket tail is unwritten.  Clearing it after copying avoids the
+    # Only the bucket tail is unwritten. Clearing it after copying avoids the
     # old full-capacity memset while preserving exactly the same padded values.
     packed[:, tokens:].zero_()
     return padded
@@ -434,12 +492,19 @@ def sol_attn(
     sink_tokens: int = 0,
     sink_start: int | None = None,
     compile_bucket_size: int | None = None,
+    key_bias: torch.Tensor | None = None,
+    key_bias_range: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
 
     ``sink_start`` and ``sink_tokens`` keep every KV block overlapping the
     corresponding contiguous token range exact for all queries. Omitting
     ``sink_start`` places the range at the token suffix.
+
+    ``key_bias`` is natural-log measure over K/V rows. Weighted execution is
+    implemented only by the SM120 CuTe exact path. ``key_bias_range`` declares
+    the only active interval; values outside it are never read, and every block
+    overlapping that interval must be covered by the exact sink range.
     """
 
     arch = _validate_inputs(
@@ -450,9 +515,14 @@ def sol_attn(
         sink_tokens,
         sink_start,
     )
+    key_bias, key_bias_range = _validate_key_bias(
+        k, key_bias, key_bias_range, sink_start, sink_tokens
+    )
     if kv_splits not in (1, 2, 4):
         raise ValueError("kv_splits must be 1, 2, or 4")
     backend = _backend_for_arch(arch)
+    if key_bias is not None and backend != "cute_sm120":
+        raise ValueError("key-log-measure Sol-Attn currently requires cute_sm120")
     if q.shape[1] != k.shape[1] and backend != "cute_sm120":
         raise ValueError("Rectangular attention currently requires cute_sm120")
     valid_tokens = q.shape[1]
@@ -464,6 +534,8 @@ def sol_attn(
             raise ValueError(f"compile_bucket_size must be a multiple of {BLOCK_SIZE}")
         q, k, v = _pad_to_bucket(q, k, v, compile_bucket_size)
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("scale must be finite and positive")
     tau = float(tau)
 
     if backend == "triton":
@@ -494,6 +566,8 @@ def sol_attn(
         kv_splits=kv_splits,
         sink_tokens=sink_tokens,
         sink_start=sink_start,
+        key_bias=key_bias,
+        key_bias_range=key_bias_range,
         valid_tokens=valid_tokens,
     )
 
