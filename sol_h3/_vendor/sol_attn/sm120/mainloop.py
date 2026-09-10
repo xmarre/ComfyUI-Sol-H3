@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry and exact-path key measure; see tools/rectangular_sm120.patch.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
@@ -34,6 +34,7 @@ D = 128
 DV = 128
 THREADS = 128
 STAGES = 1
+LOG2E = 1.4426950408889634
 
 
 class SolAttnForwardSm120:
@@ -45,6 +46,7 @@ class SolAttnForwardSm120:
         debug_route_trace: bool = False,
         prefetch_first_exact_k: bool = True,
         prefetch_next_route_k: bool = True,
+        use_key_bias: bool = False,
     ):
         self.dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
@@ -56,6 +58,7 @@ class SolAttnForwardSm120:
         self.debug_route_trace = debug_route_trace
         self.prefetch_first_exact_k = prefetch_first_exact_k
         self.prefetch_next_route_k = prefetch_next_route_k
+        self.use_key_bias = bool(use_key_bias)
 
     @cute.kernel
     def kernel(
@@ -68,6 +71,7 @@ class SolAttnForwardSm120:
         mVC: cute.Tensor,
         mThreshold: cute.Tensor,
         mLSE: cute.Tensor,
+        mKeyBias: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -83,6 +87,8 @@ class SolAttnForwardSm120:
         scale_softmax_log2e: cutlass.Float32,
         sink_start_block: cutlass.Int32,
         sink_end_block: cutlass.Int32,
+        key_bias_start: cutlass.Int32,
+        key_bias_stop: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane = cute.arch.lane_idx()
@@ -102,6 +108,12 @@ class SolAttnForwardSm120:
         threshold = cutlass.Float32(
             mThreshold[batch_idx, q_tile_idx, head_idx]
         )
+        bias_inv_scale = cutlass.Float32(0.0)
+        if cutlass.const_expr(self.use_key_bias):
+            # scale_softmax_log2e = softmax_scale * log2(e). The exact-score
+            # accumulator is still in raw-dot-product units here, so natural-log
+            # key measure b must enter as b / softmax_scale before online_softmax.
+            bias_inv_scale = cutlass.Float32(LOG2E) / scale_softmax_log2e
 
         storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
         if warp == 0 and lane == 0:
@@ -116,7 +128,7 @@ class SolAttnForwardSm120:
         consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, self.num_threads // 32
         )
-        cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
+        cta_layout_vmnk = (1, 1, 1, 1)
         Q_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.q_stage,
             producer_group=cg,
@@ -610,6 +622,18 @@ class SolAttnForwardSm120:
                 block_len = token_count - exact_block * cutlass.Int32(N)
                 if block_len > N:
                     block_len = cutlass.Int32(N)
+                if cutlass.const_expr(self.use_key_bias):
+                    add_exact_key_bias(
+                        tSrS,
+                        tScS,
+                        mKeyBias,
+                        exact_block,
+                        block_len,
+                        q_len,
+                        key_bias_start,
+                        key_bias_stop,
+                        bias_inv_scale,
+                    )
                 mask_exact_scores(tSrS, tScS, block_len, q_len)
                 row_scale = online_softmax(
                     tSrS, max_m, sum_m, scale_softmax_log2e
@@ -699,9 +723,12 @@ class SolAttnForwardSm120:
         vc: cute.Tensor,
         threshold: cute.Tensor,
         lse: cute.Tensor,
+        key_bias: cute.Tensor,
         softmax_scale: cutlass.Float32,
         sink_start_block: cutlass.Int32,
         sink_end_block: cutlass.Int32,
+        key_bias_start: cutlass.Int32,
+        key_bias_stop: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         q_mkl, k_nkl, kc_nkl = [
@@ -728,6 +755,8 @@ class SolAttnForwardSm120:
         assert self.Q_dtype == cutlass.BFloat16
         assert self.K_dtype == cutlass.BFloat16
         assert self.V_dtype == cutlass.BFloat16
+        if cutlass.const_expr(self.use_key_bias):
+            assert key_bias.element_type == cutlass.Float32
 
         self.Q_smem_layout = sm90_utils.make_smem_layout_a(
             self.Q_layout,
@@ -873,6 +902,7 @@ class SolAttnForwardSm120:
             tma_tensor_VC,
             threshold,
             lse_target,
+            key_bias,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -885,9 +915,11 @@ class SolAttnForwardSm120:
             self.K_smem_layout,
             self.V_smem_layout,
             self.O_smem_layout,
-            softmax_scale * 1.4426950408889634,
+            softmax_scale * LOG2E,
             sink_start_block,
             sink_end_block,
+            key_bias_start,
+            key_bias_stop,
         ).launch(
             grid=(cute.ceil_div(q_mkl.shape[0], M), q_mkl.shape[2], q_mkl.shape[3]),
             block=(self.num_threads, 1, 1),
@@ -1016,6 +1048,39 @@ def apply_route_mask(
                 if valid_row
                 else -cutlass.Float32.inf
             )
+
+
+@cute.jit
+def add_exact_key_bias(
+    scores: cute.Tensor,
+    coords: cute.Tensor,
+    key_bias: cute.Tensor,
+    exact_block: cutlass.Int32,
+    block_len: cutlass.Int32,
+    q_len: cutlass.Int32,
+    bias_start: cutlass.Int32,
+    bias_stop: cutlass.Int32,
+    inv_scale: cutlass.Float32,
+):
+    """Add natural-log key measure in raw QK units to one exact K block."""
+    scores_mn = layout_utils.reshape_acc_to_mn(scores)
+    coords_mn = layout_utils.reshape_acc_to_mn(coords)
+    block_start = exact_block * cutlass.Int32(N)
+    for m in cutlass.range_constexpr(cute.size(scores_mn, mode=[0])):
+        valid_row = coords_mn[m, 0][0] < q_len
+        for n in cutlass.range_constexpr(cute.size(scores_mn, mode=[1])):
+            column = cutlass.Int32(coords_mn[m, n][1])
+            key = block_start + column
+            if (
+                valid_row
+                and column < block_len
+                and key >= bias_start
+                and key < bias_stop
+            ):
+                scores_mn[m, n] = (
+                    cutlass.Float32(scores_mn[m, n])
+                    + cutlass.Float32(key_bias[key]) * inv_scale
+                )
 
 
 @cute.jit
