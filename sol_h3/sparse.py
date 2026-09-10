@@ -23,15 +23,21 @@ class KernelUnavailable(RuntimeError):
 
 
 def _sink_blocks(start, tokens, rows):
-    """Validate an exact interval and describe its overlapping 64-row blocks."""
+    """Validate an exact prefix interval and describe its overlapping 64-row blocks.
+
+    Sol-H3 only requests prefix sinks beginning at row zero. The final partial
+    block is intentionally rounded outward: this makes a few extra keys exact,
+    which is semantics-preserving and only slightly more expensive.
+    """
     if type(start) is not int or type(tokens) is not int or type(rows) is not int:
         raise RuntimeError("SOL sink geometry must use integer row counts")
-    if start < 0 or tokens < 0 or start + tokens > rows:
-        raise RuntimeError("SOL sink row interval is outside the current sequence")
+    if start != 0:
+        raise RuntimeError("Sol-H3 currently supports only a prefix sink beginning at row zero")
+    if tokens < 0 or tokens > rows:
+        raise RuntimeError("SOL sink row count is outside the current sequence")
     if tokens == 0:
-        blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
-        return [blocks, blocks]
-    return [start // BLOCK_SIZE, (start + tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
+        return [0, 0]
+    return [0, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
 
 
 def _validate_key_bias(key_bias, key_bias_range, rows):
@@ -85,9 +91,10 @@ def load_kernel(device):
         if key_bias is not None:
             if key_bias.device != q.device:
                 raise RuntimeError("SOL key bias must share the Q/K/V device")
-            bias_blocks = _sink_blocks(
-                bias_interval[0], bias_interval[1] - bias_interval[0], k.shape[1]
-            )
+            bias_blocks = [
+                bias_interval[0] // BLOCK_SIZE,
+                (bias_interval[1] + BLOCK_SIZE - 1) // BLOCK_SIZE,
+            ]
             if not (sink[0] <= bias_blocks[0] and sink[1] >= bias_blocks[1]):
                 raise RuntimeError("SOL nonzero key-bias interval must be covered by exact sink blocks")
         return sol_attn(
@@ -207,6 +214,7 @@ def attention(
     dense_attention=None,
     recompute_prefix_queries=True,
     *,
+    dense_query_prefix=None,
     key_bias=None,
     key_bias_range=None,
     measure_identity=None,
@@ -222,7 +230,10 @@ def attention(
         raise RuntimeError("SOL key bias must share the Q/K/V device")
     if key_bias is None and measure_identity is not None:
         raise RuntimeError("SOL measure identity requires a key bias")
-    if recompute_prefix_queries and prefix > q.shape[2]:
+    query_prefix = prefix if dense_query_prefix is None else dense_query_prefix
+    if type(query_prefix) is not int or query_prefix < 0:
+        raise RuntimeError("SOL dense query-prefix row count must be a nonnegative integer")
+    if recompute_prefix_queries and query_prefix > q.shape[2]:
         raise RuntimeError("Prefix query recomputation exceeds the available Q rows")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
@@ -249,7 +260,12 @@ def attention(
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
 
     layout_key = _bthd_layout_key(qb, kb, vb)
-    key = (q.device, q.dtype, layout_key, measure_identity, bias_interval)
+    if key_bias is None:
+        # Preserve the existing unweighted calibration identity exactly. Spectrum
+        # and current tests already rely on the cold/hot boundary for this route.
+        key = (q.device, q.dtype, layout_key)
+    else:
+        key = (q.device, q.dtype, layout_key, measure_identity, bias_interval)
     calibrating = key not in state.sparse_verified
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
@@ -299,11 +315,12 @@ def attention(
         key_bias=key_bias,
         key_bias_range=bias_interval,
     )
-    # Normal H3 replaces non-video query rows with exact dense attention.
-    # In weighted mode that replacement must use the same key measure.
-    if prefix and recompute_prefix_queries:
-        out[:, :prefix] = _dense_reference(
-            q[:, :, :prefix],
+    # Normal H3 replaces conditioning query rows with exact dense attention.
+    # Weighted execution keeps that query scope unchanged even when exact K
+    # coverage expands through the protected high-density video prefix.
+    if query_prefix and recompute_prefix_queries:
+        out[:, :query_prefix] = _dense_reference(
+            q[:, :, :query_prefix],
             k,
             v,
             dense_attention,
