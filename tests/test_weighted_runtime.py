@@ -33,14 +33,14 @@ def _contracts():
     return layout, external, measure
 
 
-def _plan():
+def _plan(profile, route):
     return SimpleNamespace(
         key_log_measure=torch.zeros(ROWS, dtype=torch.float32),
         exact_k_block_range=(0, 3),
         semantic_digest="measure-digest",
         owner_generation="owner-generation",
-        implementation_profile=weighted_measure.IMPLEMENTATION_PROFILE,
-        numerical_route=weighted_measure.NUMERICAL_ROUTE,
+        implementation_profile=profile,
+        numerical_route=route,
         q_rows=ROWS,
         kv_rows=ROWS,
         exact_range_digest="exact-range-digest",
@@ -51,7 +51,6 @@ def _plan():
 def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=True):
     state = Request(cfg)
     layout, external, measure = _contracts()
-    plan = _plan()
     q, k, v = (
         torch.randn(1, HEADS, ROWS, DIM, dtype=torch.bfloat16)
         for _ in range(3)
@@ -61,6 +60,7 @@ def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=Tr
     monkeypatch.setattr(weighted_measure, "preprocess_digest", lambda provider: "preprocess-digest")
 
     prepare_calls = []
+    plans = []
 
     def prepare(state_arg, options, request, **kwargs):
         prepare_calls.append((state_arg, options, request, kwargs))
@@ -68,6 +68,10 @@ def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=Tr
         assert kwargs["kv_rows"] == ROWS
         assert kwargs["existing_sink"] == (0, 1)
         assert kwargs["preprocess_identity"] == "preprocess-digest"
+        profile = kwargs["implementation_profile"]
+        route = kwargs["numerical_route"]
+        plan = _plan(profile, route)
+        plans.append(plan)
         return plan
 
     monkeypatch.setattr(weighted_measure, "prepare", prepare)
@@ -99,9 +103,11 @@ def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=Tr
             transformer_options=options,
         )
 
+    receipts = []
     options = {
         "minimax_h3_layout": layout,
         weighted_measure.ATTENTION_MEASURE_KEY: measure,
+        "attention_backend_receipts_v1": receipts,
     }
     if include_external:
         options["vdn_h3_external_sequence_v1"] = external
@@ -113,8 +119,7 @@ def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=Tr
     finally:
         _FORWARD.reset(token)
 
-    assert len(prepare_calls) == 1
-    return result, state, plan
+    return result, state, plans, prepare_calls, receipts
 
 
 def test_weighted_runtime_keeps_all_kv_rows_and_separates_q_prefix_from_k_sink(monkeypatch):
@@ -134,7 +139,7 @@ def test_weighted_runtime_keeps_all_kv_rows_and_separates_q_prefix_from_k_sink(m
     def dense_impl(*args, **kwargs):
         raise AssertionError("hot weighted sparse route must not take dense fallback")
 
-    result, state, _ = _run_block(
+    result, state, plans, _, receipts = _run_block(
         monkeypatch,
         Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0),
         sparse_impl=sparse_impl,
@@ -143,13 +148,21 @@ def test_weighted_runtime_keeps_all_kv_rows_and_separates_q_prefix_from_k_sink(m
 
     assert result.shape == (1, ROWS, HEADS * DIM)
     assert len(calls) == 1
+    assert [(p.implementation_profile, p.numerical_route) for p in plans] == [(
+        weighted_measure.SPARSE_IMPLEMENTATION_PROFILE,
+        weighted_measure.SPARSE_NUMERICAL_ROUTE,
+    )]
+    assert receipts[0][3][4:6] == (
+        weighted_measure.SPARSE_IMPLEMENTATION_PROFILE,
+        weighted_measure.SPARSE_NUMERICAL_ROUTE,
+    )
     assert state.external_mixed_weighted_measure_calls == 1
     assert state.external_mixed_weighted_measure_q_rows == ROWS
     assert state.external_mixed_weighted_measure_kv_rows == ROWS
     assert state.external_mixed_measure_calls == 0
 
 
-def test_weighted_dense_warmup_preserves_all_rows_and_same_measure(monkeypatch):
+def test_weighted_dense_warmup_preserves_all_rows_and_binds_dense_receipt(monkeypatch):
     dense_calls = []
 
     def sparse_impl(*args, **kwargs):
@@ -162,7 +175,7 @@ def test_weighted_dense_warmup_preserves_all_rows_and_same_measure(monkeypatch):
         assert output_heads is False
         return torch.zeros(1, ROWS, HEADS * DIM, dtype=q.dtype)
 
-    result, state, plan = _run_block(
+    result, state, plans, _, receipts = _run_block(
         monkeypatch,
         Config(exact=False, backend="sol", dense_evaluations=1, dense_layers=0),
         sparse_impl=sparse_impl,
@@ -171,23 +184,31 @@ def test_weighted_dense_warmup_preserves_all_rows_and_same_measure(monkeypatch):
 
     assert result.shape == (1, ROWS, HEADS * DIM)
     assert len(dense_calls) == 1
-    assert dense_calls[0][4] is plan
+    assert dense_calls[0][4] is plans[0]
+    assert [(p.implementation_profile, p.numerical_route) for p in plans] == [(
+        weighted_measure.DENSE_IMPLEMENTATION_PROFILE,
+        weighted_measure.DENSE_NUMERICAL_ROUTE,
+    )]
+    assert receipts[0][3][4:6] == (
+        weighted_measure.DENSE_IMPLEMENTATION_PROFILE,
+        weighted_measure.DENSE_NUMERICAL_ROUTE,
+    )
     assert state.dense_calls == 1
     assert state.external_mixed_weighted_measure_calls == 1
     assert state.external_mixed_weighted_measure_kv_rows == ROWS
 
 
-def test_weighted_kernel_unavailable_falls_back_to_weighted_dense_not_legacy(monkeypatch):
+def test_weighted_kernel_unavailable_rebinds_dense_fallback_receipt(monkeypatch):
     dense_calls = []
 
     def sparse_impl(*args, **kwargs):
         raise sparse.KernelUnavailable("test-unavailable")
 
     def dense_impl(q, k, v, heads, plan, *, scale=None, output_heads=False):
-        dense_calls.append((k.shape[2], plan.key_log_measure.shape[0], output_heads))
+        dense_calls.append((k.shape[2], plan, output_heads))
         return torch.zeros(1, ROWS, HEADS * DIM, dtype=q.dtype)
 
-    result, state, _ = _run_block(
+    result, state, plans, _, receipts = _run_block(
         monkeypatch,
         Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0),
         sparse_impl=sparse_impl,
@@ -195,8 +216,23 @@ def test_weighted_kernel_unavailable_falls_back_to_weighted_dense_not_legacy(mon
     )
 
     assert result.shape == (1, ROWS, HEADS * DIM)
-    assert dense_calls == [(ROWS, ROWS, False)]
-    assert state.external_mixed_weighted_measure_calls == 0
+    assert len(plans) == 2
+    assert (plans[0].implementation_profile, plans[0].numerical_route) == (
+        weighted_measure.SPARSE_IMPLEMENTATION_PROFILE,
+        weighted_measure.SPARSE_NUMERICAL_ROUTE,
+    )
+    assert (plans[1].implementation_profile, plans[1].numerical_route) == (
+        weighted_measure.DENSE_IMPLEMENTATION_PROFILE,
+        weighted_measure.DENSE_NUMERICAL_ROUTE,
+    )
+    assert dense_calls == [(ROWS, plans[1], False)]
+    assert receipts[0][3][4:6] == (
+        weighted_measure.DENSE_IMPLEMENTATION_PROFILE,
+        weighted_measure.DENSE_NUMERICAL_ROUTE,
+    )
+    assert state.external_mixed_weighted_measure_calls == 1
+    assert state.external_mixed_weighted_measure_q_rows == ROWS
+    assert state.external_mixed_weighted_measure_kv_rows == ROWS
     assert state.external_mixed_measure_calls == 0
     assert state.fallbacks["kernel_unavailable:test-unavailable"] == 1
 
@@ -212,7 +248,7 @@ def test_generic_weighted_measure_does_not_require_vdn_external_sequence(monkeyp
     def dense_impl(*args, **kwargs):
         raise AssertionError("generic all-row weighted route unexpectedly fell back to dense")
 
-    result, state, _ = _run_block(
+    result, state, plans, _, _ = _run_block(
         monkeypatch,
         Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0),
         sparse_impl=sparse_impl,
@@ -222,4 +258,5 @@ def test_generic_weighted_measure_does_not_require_vdn_external_sequence(monkeyp
 
     assert result.shape == (1, ROWS, HEADS * DIM)
     assert calls == [(10, ROWS, (0, 3))]
+    assert plans[0].numerical_route == weighted_measure.SPARSE_NUMERICAL_ROUTE
     assert state.external_mixed_weighted_measure_calls == 1
