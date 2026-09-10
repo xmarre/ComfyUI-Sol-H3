@@ -3,7 +3,7 @@ import shutil
 import subprocess
 import tempfile
 
-from tools.vendor_sol_attn import REVISION, SUBTREE, relocate
+from vendor_sol_attn import REVISION, SUBTREE, relocate
 
 
 repo = Path(__file__).resolve().parents[1]
