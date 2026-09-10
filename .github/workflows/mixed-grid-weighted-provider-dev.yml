@@ -1,0 +1,912 @@
+name: Weighted Mixed-Grid provider development transform
+
+on:
+  push:
+    branches:
+      - mirror/mixed-grid-weighted-provider-20260910
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/Sana
+          ref: 2936c47637380842aaa4a4488fac5006cc542b70
+          path: _deps/Sana
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply provider and SM120 weighted-measure implementation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          # ------------------------------------------------------------------
+          # Provider-local generic attention-measure binding. Imports of the
+          # companion core contract are deliberately lazy so this node remains
+          # usable with older ComfyUI builds for every pre-existing route.
+          # ------------------------------------------------------------------
+          Path('sol_h3/weighted_measure.py').write_text(r'''from __future__ import annotations
+
+from dataclasses import dataclass, replace
+import hashlib
+import importlib
+import uuid
+
+
+ATTENTION_MEASURE_KEY = "attention_measure_v1"
+ATTENTION_MEASURE_CAPABILITIES_KEY = "attention_measure_capabilities_v1"
+PROVIDER_IDENTITY = "comfy.sol_h3.sm120"
+IMPLEMENTATION_PROFILE = "weighted_exact_blocks_v1"
+NUMERICAL_ROUTE = "sol_h3_sm120_weighted_exact_blocks"
+
+
+def _core(required=True):
+    try:
+        return importlib.import_module("comfy.attention_measure")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"comfy", "comfy.attention_measure"}:
+            raise
+        if required:
+            raise RuntimeError(
+                "attention_measure_v1 requires a ComfyUI build with the generic attention-measure contract"
+            ) from exc
+        return None
+
+
+def _provider_name(provider):
+    if provider is None:
+        return "comfy.default"
+    return f"{getattr(provider, '__module__', '<unknown>')}.{getattr(provider, '__qualname__', type(provider).__name__)}"
+
+
+def preprocess_digest(provider):
+    """Hash the concrete preprocessing/leaf ownership chain for this process.
+
+    Object identity is intentional: a forecast or cached plan must not survive a
+    runtime provider replacement merely because the replacement has the same name.
+    """
+    chain = []
+    seen = set()
+    current = provider
+    while hasattr(current, "attention_preprocess_v1"):
+        if id(current) in seen:
+            raise RuntimeError("cyclic attention preprocessing contract")
+        seen.add(id(current))
+        transform, current = current.attention_preprocess_v1
+        chain.append((_provider_name(transform), id(transform)))
+    chain.append((_provider_name(current), id(current)))
+    return hashlib.sha256(repr(tuple(chain)).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProviderOwner:
+    generation: str
+
+
+class Capability:
+    api = 1
+    operator = "key_log_measure"
+    provider_identity = PROVIDER_IDENTITY
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def prepare(self, request, execution_context):
+        core = _core()
+        if not isinstance(execution_context, core.MeasureExecutionContext):
+            raise TypeError("Sol-H3 attention measure requires MeasureExecutionContext")
+        if execution_context.owner is not self.owner:
+            raise RuntimeError("Sol-H3 attention-measure capability is bound to another owner")
+        if execution_context.provider_identity != PROVIDER_IDENTITY:
+            raise RuntimeError("Sol-H3 attention-measure provider identity changed during binding")
+        return core.bind(
+            request,
+            context=execution_context,
+            block_size=64,
+            implementation_profile=IMPLEMENTATION_PROFILE,
+        )
+
+
+def register(transformer_options):
+    """Register when the companion core API exists; preserve legacy installations otherwise."""
+    core = _core(required=False)
+    if core is None:
+        return None
+    current = transformer_options.get(ATTENTION_MEASURE_CAPABILITIES_KEY)
+    existing = current.get(PROVIDER_IDENTITY) if isinstance(current, dict) else None
+    if existing is not None:
+        if not isinstance(existing, Capability):
+            raise RuntimeError("attention-measure provider identity is already owned by another capability")
+        return existing
+    capability = Capability(ProviderOwner(f"sol-h3-{uuid.uuid4().hex}"))
+    core.register_capability(transformer_options, PROVIDER_IDENTITY, capability)
+    return capability
+
+
+def prepare(
+    state,
+    transformer_options,
+    request,
+    *,
+    block_index,
+    layout,
+    q_rows,
+    kv_rows,
+    dtype,
+    device,
+    head_dim,
+    existing_sink,
+    external_sequence,
+    preprocess_identity,
+):
+    """Bind one actual all-row weighted route and cache its O(T) bias per request."""
+    core = _core()
+    registry = transformer_options.get(ATTENTION_MEASURE_CAPABILITIES_KEY)
+    capability = registry.get(PROVIDER_IDENTITY) if isinstance(registry, dict) else None
+    if not isinstance(capability, Capability):
+        raise RuntimeError(
+            "attention_measure_v1 selected Sol-H3 but its owner-bound capability is not registered"
+        )
+    digest = core.semantic_digest(request)
+    context = core.MeasureExecutionContext(
+        provider_identity=PROVIDER_IDENTITY,
+        block_index=int(block_index),
+        owner=capability.owner,
+        owner_generation=capability.owner.generation,
+        layout=layout,
+        q_rows=int(q_rows),
+        kv_rows=int(kv_rows),
+        dtype=dtype,
+        device=device,
+        head_dim=int(head_dim),
+        mask_class="none",
+        preprocess_digest=str(preprocess_identity),
+        numerical_route=NUMERICAL_ROUTE,
+        existing_sink=tuple(existing_sink),
+        external_sequence=external_sequence,
+    )
+    key = (
+        digest,
+        context.block_index,
+        context.q_rows,
+        context.kv_rows,
+        str(context.device),
+        str(context.dtype),
+        context.head_dim,
+        context.existing_sink,
+        context.preprocess_digest,
+        context.owner_generation,
+    )
+    plan = state.measure_plans.get(key)
+    if plan is None:
+        plan = core.prepare_capability(transformer_options, request, context)
+        if plan.implementation_profile != IMPLEMENTATION_PROFILE:
+            raise RuntimeError("Sol-H3 capability selected an unexpected attention-measure profile")
+        bias_key = (digest, str(context.device))
+        shared = state.measure_biases.get(bias_key)
+        if shared is None:
+            state.measure_biases[bias_key] = plan.key_log_measure
+        elif shared is not plan.key_log_measure:
+            plan = replace(plan, key_log_measure=shared)
+        state.measure_plans[key] = plan
+    return plan
+
+
+def dense(q, k, v, heads, plan, *, scale=None, output_heads=False):
+    """Exact all-row weighted fallback over already-preprocessed BHND tensors."""
+    core = _core()
+    return core.weighted_dense(
+        q,
+        k,
+        v,
+        heads,
+        key_bias=plan.key_log_measure,
+        skip_reshape=True,
+        skip_output_reshape=bool(output_heads),
+        scale=scale,
+    )
+
+
+def receipt_fields(plan, *, call_token):
+    return (
+        ATTENTION_MEASURE_KEY,
+        ("sol_h3_evaluation", int(call_token)),
+        plan.owner_generation,
+        plan.semantic_digest,
+        plan.implementation_profile,
+        plan.numerical_route,
+        plan.q_rows,
+        plan.kv_rows,
+        plan.exact_range_digest,
+        plan.preprocess_digest,
+        True,
+    )
+''')
+
+          # ------------------------------------------------------------------
+          # Runtime: add the generic route alongside, not in place of, the
+          # existing legacy representative-KV comparator.
+          # ------------------------------------------------------------------
+          p = 'sol_h3/runtime.py'
+          replace_once(p,
+              'from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract\n',
+              'from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract\n'
+              'from . import weighted_measure\n')
+          replace_once(p,
+              '    external_mixed_measure_removed_rows: int = 0\n'
+              '    vdn_local_sol_calls: int = 0\n',
+              '    external_mixed_measure_removed_rows: int = 0\n'
+              '    external_mixed_weighted_measure_calls: int = 0\n'
+              '    external_mixed_weighted_measure_q_rows: int = 0\n'
+              '    external_mixed_weighted_measure_kv_rows: int = 0\n'
+              '    measure_plans: dict = field(default_factory=dict)\n'
+              '    measure_biases: dict = field(default_factory=dict)\n'
+              '    vdn_local_sol_calls: int = 0\n')
+          replace_once(p,
+              '                        "external_mixed_measure_removed_rows": state.external_mixed_measure_removed_rows,\n'
+              '                        "compatibility_fallbacks": dict(state.fallbacks),\n',
+              '                        "external_mixed_measure_removed_rows": state.external_mixed_measure_removed_rows,\n'
+              '                        "external_mixed_weighted_measure_calls": state.external_mixed_weighted_measure_calls,\n'
+              '                        "external_mixed_weighted_measure_q_rows": state.external_mixed_weighted_measure_q_rows,\n'
+              '                        "external_mixed_weighted_measure_kv_rows": state.external_mixed_weighted_measure_kv_rows,\n'
+              '                        "compatibility_fallbacks": dict(state.fallbacks),\n')
+          replace_once(p,
+              '        def record(route, fallback=False):\n'
+              '            routes.append((self.index, route))\n'
+              '            receipt(options, self.index, route)\n'
+              '            if fallback:\n',
+              '        def record(route, fallback=False, measure_plan=None):\n'
+              '            routes.append((self.index, route))\n'
+              '            receipt(options, self.index, route, measure_plan=measure_plan, call_token=evaluation)\n'
+              '            if fallback:\n')
+          replace_once(p,
+              '                measure_contract = current_options.get(FLOW_MIXED_MEASURE_KEY)\n'
+              '                external_mixed = False\n',
+              '                legacy_measure_contract = current_options.get(FLOW_MIXED_MEASURE_KEY)\n'
+              '                generic_measure_contract = current_options.get(weighted_measure.ATTENTION_MEASURE_KEY)\n'
+              '                if legacy_measure_contract is not None and generic_measure_contract is not None:\n'
+              '                    raise RuntimeError("legacy and generic Mixed-Grid attention-measure contracts cannot coexist")\n'
+              '                external_mixed = False\n')
+          replace_once(p,
+              '                if measure_contract is not None and (reason is not None or not external_mixed):\n'
+              '                    raise RuntimeError(\n'
+              '                        "Flow mixed-grid attention-measure contract requires a valid external mixed sequence"\n'
+              '                    )\n',
+              '                if (legacy_measure_contract is not None or generic_measure_contract is not None) and (\n'
+              '                    reason is not None or not external_mixed\n'
+              '                ):\n'
+              '                    raise RuntimeError(\n'
+              '                        "Flow mixed-grid attention-measure contract requires a valid external mixed sequence"\n'
+              '                    )\n')
+          marker = '''                measure_validated = None
+                measure_stats = None
+                if measure_contract is not None:
+                    measure_validated = validate_measure_contract(
+                        measure_contract,
+                        external_contract,
+                        q_rows=int(q.shape[2]),
+                        kv_rows=int(k.shape[2]),
+                    )
+
+                state.eligible_calls += 1
+'''
+          generic = '''                if generic_measure_contract is not None:
+                    state.eligible_calls += 1
+                    preprocess_identity = weighted_measure.preprocess_digest(dense_provider)
+                    existing_sink = (0, (int(prefix) + 63) // 64)
+                    measure_plan = weighted_measure.prepare(
+                        state,
+                        current_options,
+                        generic_measure_contract,
+                        block_index=self.index,
+                        layout=layout,
+                        q_rows=int(q.shape[2]),
+                        kv_rows=int(k.shape[2]),
+                        dtype=q.dtype,
+                        device=q.device,
+                        head_dim=int(q.shape[-1]),
+                        existing_sink=existing_sink,
+                        external_sequence=external_contract,
+                        preprocess_identity=preprocess_identity,
+                    )
+                    # The measure plan is bound to the original mixed coordinates;
+                    # then the full-domain preprocess chain runs exactly once.
+                    q, k, v, dense_provider = _preprocess_chain(dense_provider, q, k, v, heads, kw)
+
+                    def weighted_dense_result(*, output_heads=False, qd=q, kd=k, vd=v):
+                        return weighted_measure.dense(
+                            qd,
+                            kd,
+                            vd,
+                            heads,
+                            measure_plan,
+                            scale=kw.get("scale"),
+                            output_heads=output_heads,
+                        )
+
+                    if warmup:
+                        result = weighted_dense_result()
+                        state.dense_calls += 1
+                        state.external_mixed_weighted_measure_calls += 1
+                        state.external_mixed_weighted_measure_q_rows += q.shape[2]
+                        state.external_mixed_weighted_measure_kv_rows += k.shape[2]
+                        record("dense_warmup", measure_plan=measure_plan)
+                        return result
+
+                    def weighted_prefix_dense(qd, kd, vd):
+                        out = weighted_dense_result(output_heads=True, qd=qd, kd=kd, vd=vd)
+                        if out.shape != qd.shape:
+                            raise RuntimeError("weighted dense prefix returned an invalid output shape")
+                        return out.transpose(1, 2)
+
+                    from .sparse import attention, KernelUnavailable
+
+                    try:
+                        result = attention(
+                            q,
+                            k,
+                            v,
+                            prefix,
+                            config,
+                            state,
+                            dense_attention=weighted_prefix_dense,
+                            key_bias=measure_plan.key_log_measure,
+                            exact_k_blocks=measure_plan.exact_k_block_range,
+                            calibration_identity=measure_plan.semantic_digest,
+                        )
+                    except KernelUnavailable as exc:
+                        result = weighted_dense_result()
+                        record("kernel_unavailable:" + str(exc), True, measure_plan=measure_plan)
+                        return result
+                    state.external_mixed_sol_calls += 1
+                    state.external_mixed_q_rows += q.shape[2]
+                    state.external_mixed_kernel_q_rows += q.shape[2]
+                    state.external_mixed_weighted_measure_calls += 1
+                    state.external_mixed_weighted_measure_q_rows += q.shape[2]
+                    state.external_mixed_weighted_measure_kv_rows += k.shape[2]
+                    record("sol_external_mixed_weighted_measure", measure_plan=measure_plan)
+                    return result
+
+                measure_validated = None
+                measure_stats = None
+                if legacy_measure_contract is not None:
+                    measure_validated = validate_measure_contract(
+                        legacy_measure_contract,
+                        external_contract,
+                        q_rows=int(q.shape[2]),
+                        kv_rows=int(k.shape[2]),
+                    )
+
+                state.eligible_calls += 1
+'''
+          replace_once(p, marker, generic)
+          replace_once(p,
+              '    if config.backend == "sol":\n'
+              '        to[HISTORY_KEY] = {**to.get(HISTORY_KEY, {}), "sol_h3": HistoryPolicy(config)}\n',
+              '    if config.backend == "sol":\n'
+              '        to[HISTORY_KEY] = {**to.get(HISTORY_KEY, {}), "sol_h3": HistoryPolicy(config)}\n'
+              '        weighted_measure.register(to)\n')
+
+          # ------------------------------------------------------------------
+          # Receipt/history fail closed for the new route until the Spectrum
+          # companion explicitly learns the richer completed receipt schema.
+          # ------------------------------------------------------------------
+          p = 'sol_h3/interop.py'
+          replace_once(p,
+              'FLOW_REFINEMENT_KEY = "h3_refinement"\n\n\n'
+              'def provider_name(provider):',
+              'FLOW_REFINEMENT_KEY = "h3_refinement"\n'
+              'ATTENTION_MEASURE_KEY = "attention_measure_v1"\n\n\n'
+              'def provider_name(provider):')
+          replace_once(p,
+              'def receipt(options, block, route):\n'
+              '    sink = options.get(RECEIPTS_KEY)\n'
+              '    if sink is not None:\n'
+              '        sink.append(("sol_h3", block, route))\n',
+              'def receipt(options, block, route, *, measure_plan=None, call_token=None):\n'
+              '    sink = options.get(RECEIPTS_KEY)\n'
+              '    if sink is None:\n'
+              '        return\n'
+              '    if measure_plan is None:\n'
+              '        sink.append(("sol_h3", block, route))\n'
+              '        return\n'
+              '    from .weighted_measure import receipt_fields\n'
+              '    sink.append(("sol_h3", block, route, receipt_fields(measure_plan, call_token=call_token)))\n')
+          replace_once(p,
+              '        state = _REQUEST.get()\n'
+              '        if state is None:\n'
+              '            return None\n'
+              '        replacements = options.get("patches_replace", {}).get("dit", {})\n',
+              '        state = _REQUEST.get()\n'
+              '        if state is None:\n'
+              '            return None\n'
+              '        # Generic weighted measure becomes forecastable only after\n'
+              '        # Spectrum binds its completed-receipt identity companion.\n'
+              '        if options.get(ATTENTION_MEASURE_KEY) is not None:\n'
+              '            return None\n'
+              '        replacements = options.get("patches_replace", {}).get("dit", {})\n')
+
+          # ------------------------------------------------------------------
+          # Sparse bridge: separate dense-query prefix ownership from exact-KV
+          # coverage, and make weighted arithmetic calibration measure-specific.
+          # ------------------------------------------------------------------
+          p = 'sol_h3/sparse.py'
+          replace_once(p,
+              'def _sink_blocks(start, tokens, rows):\n'
+              '    """Validate an exact prefix interval and describe its overlapping 64-row blocks.\n\n'
+              '    Sol-H3 only requests prefix sinks beginning at row zero. The final partial\n'
+              '    block is intentionally rounded outward: this makes a few extra keys exact,\n'
+              '    which is semantics-preserving and only slightly more expensive.\n'
+              '    """\n'
+              '    if type(start) is not int or type(tokens) is not int or type(rows) is not int:\n'
+              '        raise RuntimeError("SOL sink geometry must use integer row counts")\n'
+              '    if start != 0:\n'
+              '        raise RuntimeError("Sol-H3 currently supports only a prefix sink beginning at row zero")\n'
+              '    if tokens < 0 or tokens > rows:\n'
+              '        raise RuntimeError("SOL sink row count is outside the current sequence")\n'
+              '    if tokens == 0:\n'
+              '        return [0, 0]\n'
+              '    return [0, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]\n',
+              'def _sink_blocks(start, tokens, rows):\n'
+              '    """Validate one exact K interval and return its overlapping 64-row blocks."""\n'
+              '    if type(start) is not int or type(tokens) is not int or type(rows) is not int:\n'
+              '        raise RuntimeError("SOL sink geometry must use integer row counts")\n'
+              '    if start < 0 or tokens < 0 or rows < 0 or start > rows or start + tokens > rows:\n'
+              '        raise RuntimeError("SOL sink row range is outside the current sequence")\n'
+              '    if tokens == 0:\n'
+              '        block = start // BLOCK_SIZE\n'
+              '        return [block, block]\n'
+              '    return [start // BLOCK_SIZE, (start + tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]\n')
+          replace_once(p,
+              '    def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,\n'
+              '               sink_start=0, sink_tokens=0):\n'
+              '        _sink_blocks(sink_start, sink_tokens, k.shape[1])  # validate prefix geometry\n'
+              '        return sol_attn(q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),\n'
+              '                        thresh_type=thresh_type, kv_splits=kv_splits,\n'
+              '                        sink_start=sink_start, sink_tokens=sink_tokens)\n',
+              '    def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,\n'
+              '               sink_start=0, sink_tokens=0, key_bias=None):\n'
+              '        _sink_blocks(sink_start, sink_tokens, k.shape[1])\n'
+              '        return sol_attn(q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),\n'
+              '                        thresh_type=thresh_type, kv_splits=kv_splits,\n'
+              '                        sink_start=sink_start, sink_tokens=sink_tokens,\n'
+              '                        key_bias=key_bias)\n')
+          replace_once(p,
+              'def _dense_reference(q, k, v, dense_attention):\n'
+              '    if dense_attention is not None:\n'
+              '        out = dense_attention(q, k, v)\n'
+              '        expected = (q.shape[0], q.shape[2], q.shape[1], q.shape[3])\n'
+              '        if out.shape != expected:\n'
+              '            raise RuntimeError(f"Dense SOL reference returned {tuple(out.shape)}, expected {expected}")\n'
+              '        return out\n'
+              '    return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)\n',
+              'def _dense_reference(q, k, v, dense_attention, key_bias=None):\n'
+              '    if dense_attention is not None:\n'
+              '        out = dense_attention(q, k, v)\n'
+              '        expected = (q.shape[0], q.shape[2], q.shape[1], q.shape[3])\n'
+              '        if out.shape != expected:\n'
+              '            raise RuntimeError(f"Dense SOL reference returned {tuple(out.shape)}, expected {expected}")\n'
+              '        return out\n'
+              '    bias = None\n'
+              '    if key_bias is not None:\n'
+              '        bias = key_bias.view(1, 1, 1, -1)\n'
+              '    return F.scaled_dot_product_attention(q, k, v, attn_mask=bias).transpose(1, 2)\n')
+          replace_once(p,
+              'def attention(q, k, v, prefix, config, state, dense_attention=None,\n'
+              '              recompute_prefix_queries=True):\n',
+              'def attention(q, k, v, prefix, config, state, dense_attention=None,\n'
+              '              recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,\n'
+              '              calibration_identity=None):\n')
+          replace_once(p,
+              '    if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):\n'
+              '        raise RuntimeError("SOL requires BF16 QKV on the same device")\n'
+              '    kernel_loader_s = 0.0\n',
+              '    if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):\n'
+              '        raise RuntimeError("SOL requires BF16 QKV on the same device")\n'
+              '    if key_bias is not None:\n'
+              '        if (not torch.is_tensor(key_bias) or key_bias.ndim != 1\n'
+              '                or key_bias.shape[0] != k.shape[2] or key_bias.device != q.device\n'
+              '                or key_bias.dtype != torch.float32 or not key_bias.is_contiguous()):\n'
+              '            raise RuntimeError("weighted SOL requires contiguous FP32 key_bias with one value per K row")\n'
+              '        if not isinstance(calibration_identity, str) or not calibration_identity:\n'
+              '            raise RuntimeError("weighted SOL requires a semantic calibration identity")\n'
+              '        if (not isinstance(exact_k_blocks, (tuple, list)) or len(exact_k_blocks) != 2\n'
+              '                or any(type(x) is not int for x in exact_k_blocks)):\n'
+              '            raise RuntimeError("weighted SOL requires one exact K block interval")\n'
+              '        max_blocks = (k.shape[2] + BLOCK_SIZE - 1) // BLOCK_SIZE\n'
+              '        if exact_k_blocks[0] < 0 or exact_k_blocks[1] < exact_k_blocks[0] or exact_k_blocks[1] > max_blocks:\n'
+              '            raise RuntimeError("weighted SOL exact K block interval is out of range")\n'
+              '    elif exact_k_blocks is not None or calibration_identity is not None:\n'
+              '        raise RuntimeError("weighted SOL routing metadata was supplied without key_bias")\n'
+              '    kernel_loader_s = 0.0\n')
+          replace_once(p,
+              '    key = (q.device, q.dtype, layout_key)\n'
+              '    calibrating = key not in state.sparse_verified\n',
+              '    key = (q.device, q.dtype, layout_key, calibration_identity)\n'
+              '    calibrating = key not in state.sparse_verified\n')
+          replace_once(p,
+              '        got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,\n'
+              '                           sink_start=0, sink_tokens=kb.shape[1])\n'
+              '        want = _dense_reference(q, k, v, None)\n',
+              '        got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,\n'
+              '                           sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias)\n'
+              '        want = _dense_reference(q, k, v, None, key_bias=key_bias)\n')
+          replace_once(p,
+              '    out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,\n'
+              '                       sink_start=0, sink_tokens=prefix)\n',
+              '    if exact_k_blocks is None:\n'
+              '        sink_start, sink_tokens = 0, prefix\n'
+              '    else:\n'
+              '        sink_start = exact_k_blocks[0] * BLOCK_SIZE\n'
+              '        sink_end = min(k.shape[2], exact_k_blocks[1] * BLOCK_SIZE)\n'
+              '        sink_tokens = max(0, sink_end - sink_start)\n'
+              '    out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,\n'
+              '                       sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias)\n')
+          replace_once(p,
+              '        out[:, :prefix] = _dense_reference(q[:, :, :prefix], k, v, dense_attention)\n',
+              '        out[:, :prefix] = _dense_reference(\n'
+              '            q[:, :, :prefix], k, v, dense_attention, key_bias=key_bias\n'
+              '        )\n')
+
+          # ------------------------------------------------------------------
+          # Vendored public interface: weighted bias is SM120-only and appended
+          # to the API so existing positional callers retain their contract.
+          # ------------------------------------------------------------------
+          p = 'sol_h3/_vendor/sol_attn/interface.py'
+          replace_once(p, 'import functools\n\nimport torch\n', 'import functools\nimport math\n\nimport torch\n')
+          replace_once(p,
+              'def _compile_sm120(\n'
+              '    key,\n'
+              '    tensors,\n'
+              '    scale,\n'
+              '    sink_start_block,\n'
+              '    sink_end_block,\n'
+              '    stream,\n'
+              '):\n',
+              'def _compile_sm120(\n'
+              '    key,\n'
+              '    tensors,\n'
+              '    scale,\n'
+              '    sink_start_block,\n'
+              '    sink_end_block,\n'
+              '    stream,\n'
+              '    key_bias_enabled,\n'
+              '):\n')
+          replace_once(p, '    operator = make_kernel()\n', '    operator = make_kernel(key_bias_enabled=key_bias_enabled)\n')
+          replace_once(p,
+              '    sink_start,\n'
+              '    valid_tokens=None,\n'
+              '):\n',
+              '    sink_start,\n'
+              '    valid_tokens=None,\n'
+              '    key_bias=None,\n'
+              '):\n')
+          replace_once(p,
+              '        key = (q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits, layout_key)\n',
+              '        key = (\n'
+              '            q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,\n'
+              '            layout_key, key_bias is not None,\n'
+              '        )\n')
+          replace_once(p,
+              '            tensors = [q, k, v, output, kc, vc, threshold, lse]\n'
+              '            compiled = _compiled.get(key)\n'
+              '            if compiled is None:\n'
+              '                compiled, args = _compile_sm120(\n'
+              '                    key,\n'
+              '                    tensors,\n'
+              '                    scale,\n'
+              '                    sink_start_block,\n'
+              '                    sink_end_block,\n'
+              '                    stream,\n'
+              '                )\n',
+              '            key_bias_arg = key_bias if key_bias is not None else threshold\n'
+              '            tensors = [q, k, v, output, kc, vc, threshold, key_bias_arg, lse]\n'
+              '            compiled = _compiled.get(key)\n'
+              '            if compiled is None:\n'
+              '                compiled, args = _compile_sm120(\n'
+              '                    key,\n'
+              '                    tensors,\n'
+              '                    scale,\n'
+              '                    sink_start_block,\n'
+              '                    sink_end_block,\n'
+              '                    stream,\n'
+              '                    key_bias is not None,\n'
+              '                )\n')
+          replace_once(p,
+              '    sink_start: int | None = None,\n'
+              '    compile_bucket_size: int | None = None,\n'
+              ') -> torch.Tensor:\n',
+              '    sink_start: int | None = None,\n'
+              '    compile_bucket_size: int | None = None,\n'
+              '    key_bias: torch.Tensor | None = None,\n'
+              ') -> torch.Tensor:\n')
+          replace_once(p,
+              '    backend = _backend_for_arch(arch)\n'
+              '    if q.shape[1] != k.shape[1] and backend != "cute_sm120":\n',
+              '    backend = _backend_for_arch(arch)\n'
+              '    if key_bias is not None:\n'
+              '        if backend != "cute_sm120":\n'
+              '            raise ValueError("key_bias is currently supported by cute_sm120 only")\n'
+              '        if (not torch.is_tensor(key_bias) or key_bias.ndim != 1\n'
+              '                or key_bias.shape[0] != k.shape[1] or key_bias.device != q.device\n'
+              '                or key_bias.dtype != torch.float32 or not key_bias.is_contiguous()):\n'
+              '            raise ValueError("key_bias must be contiguous float32 with one natural-log value per K/V row")\n'
+              '        if not math.isfinite(scale if scale is not None else q.shape[-1] ** -0.5) or (\n'
+              '            scale if scale is not None else q.shape[-1] ** -0.5\n'
+              '        ) <= 0.0:\n'
+              '            raise ValueError("weighted Sol-Attn requires a finite positive attention scale")\n'
+              '    if q.shape[1] != k.shape[1] and backend != "cute_sm120":\n')
+          replace_once(p,
+              '        valid_tokens=valid_tokens,\n'
+              '    )\n',
+              '        valid_tokens=valid_tokens,\n'
+              '        key_bias=key_bias,\n'
+              '    )\n')
+
+          # SM120 recipe and exact-score bias injection. The bias is natural-log;
+          # exact raw QK scores receive b/scale before the existing helper applies
+          # scale*log2(e), so the resulting exponent adds b*log2(e) exactly once.
+          p = 'sol_h3/_vendor/sol_attn/sm120/kernel.py'
+          replace_once(p,
+              '    prefetch_next_route_k: bool = True,\n'
+              '):\n',
+              '    prefetch_next_route_k: bool = True,\n'
+              '    key_bias_enabled: bool = False,\n'
+              '):\n')
+          replace_once(p,
+              '        prefetch_next_route_k=prefetch_next_route_k,\n'
+              '    )\n',
+              '        prefetch_next_route_k=prefetch_next_route_k,\n'
+              '        key_bias_enabled=key_bias_enabled,\n'
+              '    )\n')
+
+          p = 'sol_h3/_vendor/sol_attn/sm120/mainloop.py'
+          replace_once(p,
+              '        prefetch_next_route_k: bool = True,\n'
+              '    ):\n',
+              '        prefetch_next_route_k: bool = True,\n'
+              '        key_bias_enabled: bool = False,\n'
+              '    ):\n')
+          replace_once(p,
+              '        self.prefetch_next_route_k = prefetch_next_route_k\n',
+              '        self.prefetch_next_route_k = prefetch_next_route_k\n'
+              '        self.key_bias_enabled = key_bias_enabled\n')
+          replace_once(p,
+              '        mThreshold: cute.Tensor,\n'
+              '        mLSE: cute.Tensor,\n',
+              '        mThreshold: cute.Tensor,\n'
+              '        mKeyBias: cute.Tensor,\n'
+              '        mLSE: cute.Tensor,\n')
+          replace_once(p,
+              '                mask_exact_scores(tSrS, tScS, block_len, q_len)\n'
+              '                row_scale = online_softmax(\n',
+              '                mask_exact_scores(tSrS, tScS, block_len, q_len)\n'
+              '                if cutlass.const_expr(self.key_bias_enabled):\n'
+              '                    add_exact_key_bias(\n'
+              '                        tSrS, tScS, mKeyBias, exact_block, block_len, q_len,\n'
+              '                        cutlass.Float32(1.4426950408889634) / scale_softmax_log2e,\n'
+              '                    )\n'
+              '                row_scale = online_softmax(\n')
+          replace_once(p,
+              '        threshold: cute.Tensor,\n'
+              '        lse: cute.Tensor,\n',
+              '        threshold: cute.Tensor,\n'
+              '        key_bias: cute.Tensor,\n'
+              '        lse: cute.Tensor,\n')
+          replace_once(p,
+              '            threshold,\n'
+              '            lse_target,\n'
+              '            tma_atom_Q,\n',
+              '            threshold,\n'
+              '            key_bias,\n'
+              '            lse_target,\n'
+              '            tma_atom_Q,\n')
+          insertion = '''\n\n@cute.jit\ndef add_exact_key_bias(\n    scores: cute.Tensor,\n    coords: cute.Tensor,\n    key_bias: cute.Tensor,\n    exact_block: cutlass.Int32,\n    block_len: cutlass.Int32,\n    q_len: cutlass.Int32,\n    inv_softmax_scale: cutlass.Float32,\n):\n    """Add natural-log key measure as b/scale to valid exact raw QK scores."""\n    scores_mn = layout_utils.reshape_acc_to_mn(scores)\n    coords_mn = layout_utils.reshape_acc_to_mn(coords)\n    for m in cutlass.range_constexpr(cute.size(scores_mn, mode=[0])):\n        valid_row = coords_mn[m, 0][0] < q_len\n        for n in cutlass.range_constexpr(cute.size(scores_mn, mode=[1])):\n            local_col = coords_mn[m, n][1]\n            if valid_row and local_col < block_len:\n                absolute_col = exact_block * cutlass.Int32(N) + local_col\n                scores_mn[m, n] = (\n                    cutlass.Float32(scores_mn[m, n])\n                    + cutlass.Float32(key_bias[absolute_col]) * inv_softmax_scale\n                )\n'''
+          anchor = '\n\n@cute.jit\ndef online_softmax(\n'
+          text = Path(p).read_text()
+          if text.count(anchor) != 1:
+              raise SystemExit(f'{p}: online_softmax insertion anchor mismatch')
+          Path(p).write_text(text.replace(anchor, insertion + anchor, 1))
+
+          # Provenance profile moves from the previous rectangular-only patch to
+          # a reproducible rectangular + weighted-SM120 functional patch.
+          p = 'tools/vendor_sol_attn.py'
+          replace_once(p, "['rectangular-sm120-v2']", "['rectangular-sm120-v3']")
+          replace_once(p,
+              "'relative-imports-v1; rectangular-sm120-v2 (tools/rectangular_sm120.patch)'",
+              "'relative-imports-v1; rectangular-sm120-v3 (tools/rectangular_sm120.patch)'")
+          p = 'sol_h3/provenance.py'
+          replace_once(p,
+              "CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-v2'",
+              "CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-v3'")
+
+          # ------------------------------------------------------------------
+          # Tests: preserve old route coverage and add weighted calibration/sink
+          # semantics plus public-interface fail-closed checks.
+          # ------------------------------------------------------------------
+          p = 'tests/test_sparse.py'
+          replace_once(p,
+              '    with pytest.raises(RuntimeError, match="beginning at row zero"):\n'
+              '        sparse._sink_blocks(64, 64, 130)\n',
+              '    assert sparse._sink_blocks(64, 64, 130) == [1, 2]\n')
+          add_sparse = r'''
+
+
+def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatch):
+    calls = []
+
+    def kernel(q, k, v, **kw):
+        calls.append(kw)
+        bias = kw.get("key_bias")
+        mask = None if bias is None else bias.view(1, 1, 1, -1)
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: kernel)
+    q, k, v = (torch.randn(1, 2, 260, 128).to(torch.bfloat16) for _ in range(3))
+    bias = torch.zeros(260, dtype=torch.float32)
+    bias[64:192] = torch.log(torch.tensor(0.5))
+    state = Request(Config(exact=False, backend="sol"))
+    out = sparse.attention(
+        q, k, v, 5, state.config, state,
+        key_bias=bias,
+        exact_k_blocks=(0, 3),
+        calibration_identity="measure-a",
+    )
+    assert out.shape == (1, 260, 256)
+    assert [c["sink_tokens"] for c in calls] == [260, 192]
+    assert all(c["sink_start"] == 0 for c in calls)
+    assert all(c["key_bias"] is bias for c in calls)
+    assert len(state.gates) == 1
+
+    sparse.attention(
+        q, k, v, 5, state.config, state,
+        key_bias=bias,
+        exact_k_blocks=(0, 3),
+        calibration_identity="measure-a",
+    )
+    assert len(calls) == 3
+    assert len(state.gates) == 1
+
+    other = bias.clone()
+    other[64:192] = torch.log(torch.tensor(0.25))
+    sparse.attention(
+        q, k, v, 5, state.config, state,
+        key_bias=other,
+        exact_k_blocks=(0, 3),
+        calibration_identity="measure-b",
+    )
+    assert len(calls) == 5
+    assert len(state.gates) == 2
+
+
+def test_weighted_bridge_rejects_bias_without_bound_route_metadata(monkeypatch):
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: None)
+    q = torch.ones(1, 1, 65, 128, dtype=torch.bfloat16)
+    state = Request(Config(exact=False, backend="sol"))
+    with pytest.raises(RuntimeError, match="calibration identity"):
+        sparse.attention(q, q, q, 1, state.config, state, key_bias=torch.zeros(65))
+'''
+          Path(p).write_text(Path(p).read_text() + add_sparse)
+
+          p = 'tests/test_sana_contract.py'
+          replace_once(p,
+              "        'sink_tokens', 'sink_start', 'compile_bucket_size')\n",
+              "        'sink_tokens', 'sink_start', 'compile_bucket_size', 'key_bias')\n")
+          add_interface = r'''
+
+
+def test_weighted_public_api_is_sm120_only_and_validates_bias(monkeypatch):
+    q = torch.zeros(1, 65, 2, 128, dtype=torch.bfloat16)
+    monkeypatch.setattr(interface, '_validate_inputs', lambda *a, **k: (10, 0))
+    monkeypatch.setattr(interface, '_cute_runtime_available', lambda: True)
+    with pytest.raises(ValueError, match='cute_sm120 only'):
+        interface.sol_attn(q, q, q, key_bias=torch.zeros(65))
+
+    monkeypatch.setattr(interface, '_validate_inputs', lambda *a, **k: (12, 0))
+    with pytest.raises(ValueError, match='one natural-log value'):
+        interface.sol_attn(q, q, q, key_bias=torch.zeros(64))
+    with pytest.raises(ValueError, match='finite positive'):
+        interface.sol_attn(q, q, q, scale=0.0, key_bias=torch.zeros(65))
+
+
+def test_sm120_source_injects_bias_only_between_exact_mask_and_softmax():
+    source = (Path(interface.__file__).parent / 'sm120' / 'mainloop.py').read_text()
+    exact = source.index('mask_exact_scores(tSrS, tScS, block_len, q_len)')
+    inject = source.index('add_exact_key_bias(', exact)
+    softmax = source.index('row_scale = online_softmax(', inject)
+    assert exact < inject < softmax
+    assert 'key_bias[absolute_col]' in source
+'''
+          Path(p).write_text(Path(p).read_text() + add_interface)
+          PY
+
+          # Rebuild the functional patch from the pinned upstream tree plus the
+          # relocation transform, then regenerate the vendored tree and manifest
+          # from that patch. This makes provenance reproducible rather than merely
+          # updating hashes around hand-edited package files.
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+          from tools.vendor_sol_attn import REVISION, SUBTREE, relocate
+
+          repo = Path.cwd()
+          sana = repo / '_deps/Sana'
+          vendor = repo / 'sol_h3/_vendor/sol_attn'
+          patch = repo / 'tools/rectangular_sm120.patch'
+
+          def git_sana(*args):
+              return subprocess.check_output(['git', '-C', str(sana), *args])
+
+          names = git_sana('ls-tree', '-r', '--name-only', REVISION, '--', SUBTREE).decode().splitlines()
+          with tempfile.TemporaryDirectory() as td:
+              root = Path(td)
+              target = root / 'sol_h3/_vendor/sol_attn'
+              for full in names:
+                  name = full[len(SUBTREE) + 1:]
+                  raw = git_sana('show', f'{REVISION}:{full}')
+                  dest = target / name
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_bytes(relocate(raw, name))
+              subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
+              subprocess.run(['git', 'config', 'user.name', 'ci'], cwd=root, check=True)
+              subprocess.run(['git', 'config', 'user.email', 'ci@example.invalid'], cwd=root, check=True)
+              subprocess.run(['git', 'add', '.'], cwd=root, check=True)
+              subprocess.run(['git', 'commit', '-q', '-m', 'relocated upstream'], cwd=root, check=True)
+              shutil.copytree(vendor, target, dirs_exist_ok=True)
+              diff = subprocess.check_output(['git', 'diff', '--binary', '--', 'sol_h3/_vendor/sol_attn'], cwd=root)
+              patch.write_bytes(diff)
+          PY
+          python tools/vendor_sol_attn.py _deps/Sana
+
+      - name: Structural validation before commit
+        shell: bash
+        run: |
+          python -m py_compile \
+            sol_h3/weighted_measure.py sol_h3/runtime.py sol_h3/interop.py sol_h3/sparse.py \
+            sol_h3/_vendor/sol_attn/interface.py sol_h3/_vendor/sol_attn/sm120/kernel.py \
+            sol_h3/_vendor/sol_attn/sm120/mainloop.py tools/vendor_sol_attn.py \
+            tests/test_sparse.py tests/test_sana_contract.py
+          git diff --check
+          python - <<'PY'
+          from pathlib import Path
+          source = Path('sol_h3/_vendor/sol_attn/sm120/mainloop.py').read_text()
+          assert source.count('add_exact_key_bias(') == 2
+          assert 'key_bias[absolute_col]' in source
+          interface = Path('sol_h3/_vendor/sol_attn/interface.py').read_text()
+          assert 'key_bias is currently supported by cute_sm120 only' in interface
+          runtime = Path('sol_h3/runtime.py').read_text()
+          assert 'reduce_kv(k, v, measure_validated)' in runtime
+          assert 'sol_external_mixed_weighted_measure' in runtime
+          PY
+
+      - name: Commit implementation and remove development harness
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/mixed-grid-weighted-provider-dev.yml
+          git add sol_h3 tools/rectangular_sm120.patch tools/vendor_sol_attn.py tests/test_sparse.py tests/test_sana_contract.py
+          git commit -m 'Add generic weighted Mixed-Grid Sol-H3 provider'
+          git push origin HEAD:mirror/mixed-grid-weighted-provider-20260910
