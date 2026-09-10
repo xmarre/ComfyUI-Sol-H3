@@ -80,8 +80,15 @@ class Capability:
         )
 
 
-def register(transformer_options):
-    """Register when the companion core API exists; preserve legacy installations otherwise."""
+def register(transformer_options, *, refresh_owned=False):
+    """Register a model-local capability when the companion core API exists.
+
+    ``MODEL.clone()`` can carry a shallow copy of the previous capability
+    registry. A new Sol-H3 installation owns a new replacement chain, so it must
+    receive a fresh owner generation rather than silently reusing the source
+    model's capability. Only a capability created by this module may be
+    refreshed; another owner under the same provider identity remains an error.
+    """
     core = _core(required=False)
     if core is None:
         return None
@@ -90,7 +97,11 @@ def register(transformer_options):
     if existing is not None:
         if not isinstance(existing, Capability):
             raise RuntimeError("attention-measure provider identity is already owned by another capability")
-        return existing
+        if not refresh_owned:
+            return existing
+        registry = dict(current)
+        del registry[PROVIDER_IDENTITY]
+        transformer_options[ATTENTION_MEASURE_CAPABILITIES_KEY] = registry
     capability = Capability(ProviderOwner(f"sol-h3-{uuid.uuid4().hex}"))
     core.register_capability(transformer_options, PROVIDER_IDENTITY, capability)
     return capability
