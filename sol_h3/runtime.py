@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 import json
 import logging
 
+from .attention_measure import ATTENTION_MEASURE_KEY
 from .contracts import KEY, Config, adaln_status, prefix_length
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from .interop import (
@@ -14,6 +15,7 @@ from .interop import (
     VDN_PREPROCESS_KEY,
     HistoryPolicy,
     dense_evaluation_warmup,
+    provider_identity,
     provider_name,
     receipt,
 )
@@ -38,6 +40,10 @@ class Request:
     external_mixed_measure_kv_rows_before: int = 0
     external_mixed_measure_kv_rows_after: int = 0
     external_mixed_measure_removed_rows: int = 0
+    external_mixed_weighted_calls: int = 0
+    external_mixed_weighted_q_rows: int = 0
+    external_mixed_weighted_kv_rows: int = 0
+    external_mixed_weighted_exact_k_rows: int = 0
     vdn_local_sol_calls: int = 0
     vdn_rectangular_sol_calls: int = 0
     vdn_requested_q_rows: int = 0
@@ -95,6 +101,10 @@ class SamplingWrapper:
                         "external_mixed_measure_kv_rows_before": state.external_mixed_measure_kv_rows_before,
                         "external_mixed_measure_kv_rows_after": state.external_mixed_measure_kv_rows_after,
                         "external_mixed_measure_removed_rows": state.external_mixed_measure_removed_rows,
+                        "external_mixed_weighted_calls": state.external_mixed_weighted_calls,
+                        "external_mixed_weighted_q_rows": state.external_mixed_weighted_q_rows,
+                        "external_mixed_weighted_kv_rows": state.external_mixed_weighted_kv_rows,
+                        "external_mixed_weighted_exact_k_rows": state.external_mixed_weighted_exact_k_rows,
                         "compatibility_fallbacks": dict(state.fallbacks),
                         "dense_provider_failures": dict(state.dense_provider_failures),
                         "vdn_local_sol_calls": state.vdn_local_sol_calls,
@@ -189,6 +199,19 @@ def _preprocess_chain(provider, q, k, v, heads, kw):
         if (q.dtype, k.dtype, v.dtype) != dtypes or (q.device, k.device, v.device) != devices:
             raise RuntimeError("Attention preprocessing changed its promised QKV dtype/device")
     return q, k, v, provider
+
+
+def _preprocess_identity(provider):
+    """Describe the exact full-domain QKV preprocessing owner chain without running it."""
+    seen = set()
+    identity = []
+    while hasattr(provider, "attention_preprocess_v1"):
+        if id(provider) in seen:
+            raise RuntimeError("Cyclic attention preprocessing contract")
+        seen.add(id(provider))
+        transform, provider = provider.attention_preprocess_v1
+        identity.append((provider_name(transform), id(transform)))
+    return tuple(identity)
 
 
 def _provider_leaf(provider):
@@ -293,9 +316,9 @@ class BlockPatch:
         forwarded = {**args, "transformer_options": options}
         route_start = len(routes)
 
-        def record(route, fallback=False):
+        def record(route, fallback=False, evidence=None):
             routes.append((self.index, route))
-            receipt(options, self.index, route)
+            receipt(options, self.index, route, evidence=evidence)
             if fallback:
                 state.fallbacks[route] += 1
 
@@ -367,7 +390,8 @@ class BlockPatch:
                     reason = "forecast_consumer_no_history_contract"
                 layout = current_options.get("minimax_h3_layout", args.get("layout"))
                 external_contract = current_options.get("vdn_h3_external_sequence_v1")
-                measure_contract = current_options.get(FLOW_MIXED_MEASURE_KEY)
+                legacy_measure_contract = current_options.get(FLOW_MIXED_MEASURE_KEY)
+                generic_measure_request = current_options.get(ATTENTION_MEASURE_KEY)
                 external_mixed = False
                 prefix = 0
                 if reason is None and external_contract is not None:
@@ -379,41 +403,90 @@ class BlockPatch:
                     except RuntimeError:
                         reason = "packed_layout_not_representable"
 
-                # The independent Flow measure contract is meaningful only on a
-                # fully validated external mixed stream. Never silently drop or
-                # reinterpret a malformed measure request as the old square path.
-                if measure_contract is not None and (reason is not None or not external_mixed):
+                if legacy_measure_contract is not None and generic_measure_request is not None:
+                    raise RuntimeError("Flow cannot publish legacy and generic Mixed-Grid measure contracts together")
+                # Both measure contracts are meaningful only on a fully validated
+                # external mixed stream. Never silently drop or reinterpret either
+                # request as the old square path.
+                if (
+                    (legacy_measure_contract is not None or generic_measure_request is not None)
+                    and (reason is not None or not external_mixed)
+                ):
                     raise RuntimeError(
-                        "Flow mixed-grid attention-measure contract requires a valid external mixed sequence"
+                        "Flow mixed-grid attention measure requires a valid external mixed sequence"
                     )
                 if reason is not None:
                     record(reason, True)
                     return dense()
 
-                measure_validated = None
+                legacy_measure = None
                 measure_stats = None
-                if measure_contract is not None:
-                    measure_validated = validate_measure_contract(
-                        measure_contract,
+                generic_measure = None
+                preprocess_id = _preprocess_identity(dense_provider)
+                if generic_measure_request is not None:
+                    from . import attention_measure as sol_measure
+
+                    # Generic measure keeps every Q/K/V row. Full-domain key
+                    # transforms execute once before provider binding/routing.
+                    q, k, v, dense_provider = _preprocess_chain(
+                        dense_provider, q, k, v, heads, kw
+                    )
+                    generic_measure = sol_measure.prepare(
+                        current_options,
+                        generic_measure_request,
+                        owner=self,
+                        block_index=self.index,
+                        layout=layout,
+                        q_rows=int(q.shape[2]),
+                        kv_rows=int(k.shape[2]),
+                        dtype=q.dtype,
+                        device=q.device,
+                        head_dim=int(q.shape[-1]),
+                        existing_sink=(0, (int(prefix) + 63) // 64),
+                        external_sequence=external_contract,
+                        preprocess_identity=preprocess_id,
+                        dense=warmup,
+                    )
+                    if warmup:
+                        from comfy import attention_measure as core_measure
+
+                        state.dense_calls += 1
+                        result = core_measure.weighted_dense(
+                            q,
+                            k,
+                            v,
+                            heads,
+                            key_bias=generic_measure.key_log_measure,
+                            mask=None,
+                            skip_reshape=True,
+                            skip_output_reshape=False,
+                        )
+                        record(
+                            "dense_warmup_weighted",
+                            evidence=generic_measure.receipt_fields(),
+                        )
+                        return result
+                elif legacy_measure_contract is not None:
+                    legacy_measure = validate_measure_contract(
+                        legacy_measure_contract,
                         external_contract,
                         q_rows=int(q.shape[2]),
                         kv_rows=int(k.shape[2]),
                     )
 
                 state.eligible_calls += 1
-                if measure_validated is not None:
-                    # Full-domain preprocessing (notably Untwist) must execute
-                    # before K/V selection because its metadata uses original
-                    # packed-row coordinates. Rebinding dense_provider to the leaf
-                    # also prevents the dense warmup/reference from preprocessing
-                    # the already-reduced rectangular domain a second time.
+                if legacy_measure is not None:
+                    # Legacy representative mode retains its existing behavior:
+                    # preprocess once on the full mixed coordinates, then gather
+                    # representative K/V rows. New generic weighted mode never
+                    # enters this branch.
                     q, k, v, dense_provider = _preprocess_chain(dense_provider, q, k, v, heads, kw)
-                    k, v, measure_stats = reduce_kv(k, v, measure_validated)
+                    k, v, measure_stats = reduce_kv(k, v, legacy_measure)
                     if warmup:
                         state.dense_calls += 1
                         record("dense_warmup")
                         return dense(q, k, v)
-                else:
+                elif generic_measure is None:
                     if warmup:
                         state.dense_calls += 1
                         record("dense_warmup")
@@ -429,8 +502,30 @@ class BlockPatch:
                 from .sparse import attention, KernelUnavailable
 
                 try:
-                    result = attention(q, k, v, prefix, config, state, dense_attention=dense_attention)
+                    result = attention(
+                        q,
+                        k,
+                        v,
+                        generic_measure.exact_rows if generic_measure is not None else prefix,
+                        config,
+                        state,
+                        dense_attention=dense_attention,
+                        dense_query_prefix=prefix if generic_measure is not None else None,
+                        key_bias=None if generic_measure is None else generic_measure.key_log_measure,
+                        key_bias_range=(
+                            None
+                            if generic_measure is None
+                            else (generic_measure.bias_start, generic_measure.bias_stop)
+                        ),
+                        measure_identity=(
+                            None if generic_measure is None else generic_measure.semantic_digest
+                        ),
+                    )
                 except KernelUnavailable as exc:
+                    if generic_measure is not None:
+                        raise RuntimeError(
+                            "attention_measure_v1 selected Sol-H3 but the weighted SM120 kernel is unavailable"
+                        ) from exc
                     record("kernel_unavailable:" + str(exc), True)
                     dense_provider = previous
                     return dense()
@@ -438,7 +533,16 @@ class BlockPatch:
                     state.external_mixed_sol_calls += 1
                     state.external_mixed_q_rows += q.shape[2]
                     state.external_mixed_kernel_q_rows += q.shape[2]
-                    if measure_validated is not None:
+                    if generic_measure is not None:
+                        state.external_mixed_weighted_calls += 1
+                        state.external_mixed_weighted_q_rows += q.shape[2]
+                        state.external_mixed_weighted_kv_rows += k.shape[2]
+                        state.external_mixed_weighted_exact_k_rows += generic_measure.exact_rows
+                        record(
+                            "sol_external_mixed_weighted_measure",
+                            evidence=generic_measure.receipt_fields(),
+                        )
+                    elif legacy_measure is not None:
                         if measure_stats is None:
                             raise RuntimeError("Flow mixed-grid attention-measure telemetry was not produced")
                         state.external_mixed_measure_calls += 1
@@ -579,6 +683,23 @@ def merge_config(old, new):
     return replace(policy, exact=old.exact or new.exact)
 
 
+def _find_block_patch(value, index):
+    """Find this install's Sol BlockPatch through known previous links only."""
+    seen = set()
+    current = value
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, BlockPatch):
+            return current if current.index == index else None
+        if hasattr(current, "_h3_flow_previous"):
+            current = current._h3_flow_previous
+        elif hasattr(current, "existing_patch"):
+            current = current.existing_patch
+        else:
+            return None
+    return None
+
+
 def install(model, config):
     from comfy.ldm.minimax.model import MiniMaxH3Model
     from comfy.patcher_extension import WrappersMP
@@ -603,12 +724,27 @@ def install(model, config):
         if reapplied:
             cloned.remove_wrappers_with_key(kind, KEY)
         cloned.add_wrapper_with_key(kind, KEY, wrapper)
+
+    measure_owners = {}
     if not reapplied:
         replacements = options.get("patches_replace", {}).get("dit", {})
         for i in range(len(inner.blocks)):
             previous = replacements.get(("double_block", i))
-            cloned.set_model_patch_replace(BlockPatch(i, config, previous), "dit", "double_block", i)
+            patch = BlockPatch(i, config, previous)
+            measure_owners[i] = patch
+            cloned.set_model_patch_replace(patch, "dit", "double_block", i)
+    else:
+        replacements = to.get("patches_replace", {}).get("dit", {})
+        for i in range(len(inner.blocks)):
+            patch = _find_block_patch(replacements.get(("double_block", i)), i)
+            if patch is None:
+                raise RuntimeError("Sol-H3 reapply cannot recover its block owner for attention measure binding")
+            measure_owners[i] = patch
+
     if config.backend == "sol":
+        from .attention_measure import register as register_attention_measure
+
+        register_attention_measure(to, measure_owners)
         vdn_patches = sum(
             bool(getattr(cloned.object_patches.get(f"diffusion_model.blocks.{i}.attn.forward"), "_vdn_forward", False))
             for i in range(len(inner.blocks))
