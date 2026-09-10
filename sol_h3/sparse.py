@@ -23,21 +23,35 @@ class KernelUnavailable(RuntimeError):
 
 
 def _sink_blocks(start, tokens, rows):
-    """Validate an exact prefix interval and describe its overlapping 64-row blocks.
-
-    Sol-H3 only requests prefix sinks beginning at row zero. The final partial
-    block is intentionally rounded outward: this makes a few extra keys exact,
-    which is semantics-preserving and only slightly more expensive.
-    """
+    """Validate an exact interval and describe its overlapping 64-row blocks."""
     if type(start) is not int or type(tokens) is not int or type(rows) is not int:
         raise RuntimeError("SOL sink geometry must use integer row counts")
-    if start != 0:
-        raise RuntimeError("Sol-H3 currently supports only a prefix sink beginning at row zero")
-    if tokens < 0 or tokens > rows:
-        raise RuntimeError("SOL sink row count is outside the current sequence")
+    if start < 0 or tokens < 0 or start + tokens > rows:
+        raise RuntimeError("SOL sink row interval is outside the current sequence")
     if tokens == 0:
-        return [0, 0]
-    return [0, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
+        blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+        return [blocks, blocks]
+    return [start // BLOCK_SIZE, (start + tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
+
+
+def _validate_key_bias(key_bias, key_bias_range, rows):
+    if key_bias is None:
+        if key_bias_range is not None:
+            raise RuntimeError("SOL key_bias_range requires key_bias")
+        return None
+    if (
+        not torch.is_tensor(key_bias)
+        or key_bias.ndim != 1
+        or key_bias.shape[0] != rows
+        or not key_bias.dtype.is_floating_point
+    ):
+        raise RuntimeError("SOL key bias must be a floating vector with one value per K/V row")
+    if not isinstance(key_bias_range, (tuple, list)) or len(key_bias_range) != 2:
+        raise RuntimeError("SOL weighted attention requires an explicit key-bias interval")
+    start, stop = key_bias_range
+    if type(start) is not int or type(stop) is not int or not 0 <= start < stop <= rows:
+        raise RuntimeError("SOL key-bias interval is invalid")
+    return int(start), int(stop)
 
 
 def load_kernel(device):
@@ -65,11 +79,30 @@ def load_kernel(device):
         raise RuntimeError(f"Sana Sol-Attn initialization failed: {exc}") from exc
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
-               sink_start=0, sink_tokens=0):
-        _sink_blocks(sink_start, sink_tokens, k.shape[1])  # validate prefix geometry
-        return sol_attn(q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
-                        thresh_type=thresh_type, kv_splits=kv_splits,
-                        sink_start=sink_start, sink_tokens=sink_tokens)
+               sink_start=0, sink_tokens=0, key_bias=None, key_bias_range=None):
+        sink = _sink_blocks(sink_start, sink_tokens, k.shape[1])
+        bias_interval = _validate_key_bias(key_bias, key_bias_range, k.shape[1])
+        if key_bias is not None:
+            if key_bias.device != q.device:
+                raise RuntimeError("SOL key bias must share the Q/K/V device")
+            bias_blocks = _sink_blocks(
+                bias_interval[0], bias_interval[1] - bias_interval[0], k.shape[1]
+            )
+            if not (sink[0] <= bias_blocks[0] and sink[1] >= bias_blocks[1]):
+                raise RuntimeError("SOL nonzero key-bias interval must be covered by exact sink blocks")
+        return sol_attn(
+            q,
+            k,
+            v,
+            scale=q.shape[-1] ** -0.5,
+            tau=float(tau),
+            thresh_type=thresh_type,
+            kv_splits=kv_splits,
+            sink_start=sink_start,
+            sink_tokens=sink_tokens,
+            key_bias=key_bias,
+            key_bias_range=bias_interval,
+        )
 
     kernel.backend_name = backend
     kernel.source_tree_verified = True
@@ -133,7 +166,23 @@ def arithmetic_gate_passes(metrics):
     )
 
 
-def _dense_reference(q, k, v, dense_attention):
+def _dense_reference(q, k, v, dense_attention, key_bias=None):
+    if key_bias is not None:
+        try:
+            from comfy import attention_measure as core_measure
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError("weighted SOL reference requires ComfyUI attention-measure support") from exc
+        out = core_measure.weighted_dense(
+            q,
+            k,
+            v,
+            q.shape[1],
+            key_bias=key_bias,
+            mask=None,
+            skip_reshape=True,
+            skip_output_reshape=True,
+        )
+        return out.transpose(1, 2)
     if dense_attention is not None:
         out = dense_attention(q, k, v)
         expected = (q.shape[0], q.shape[2], q.shape[1], q.shape[3])
@@ -148,14 +197,31 @@ def _bthd_layout_key(*tensors):
     return tuple((tuple(x.shape), tuple(x.stride())) for x in tensors)
 
 
-def attention(q, k, v, prefix, config, state, dense_attention=None,
-              recompute_prefix_queries=True):
+def attention(
+    q,
+    k,
+    v,
+    prefix,
+    config,
+    state,
+    dense_attention=None,
+    recompute_prefix_queries=True,
+    *,
+    key_bias=None,
+    key_bias_range=None,
+    measure_identity=None,
+):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
             or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
             or q.shape[0] != 1 or q.shape[-1] != 128
             or q.shape[2] == 0 or k.shape[2] == 0):
         raise RuntimeError("SOL requires Q [1, heads, Tq, 128], KV [1, heads, Tkv, 128]")
     _sink_blocks(0, prefix, k.shape[2])
+    bias_interval = _validate_key_bias(key_bias, key_bias_range, k.shape[2])
+    if key_bias is not None and key_bias.device != q.device:
+        raise RuntimeError("SOL key bias must share the Q/K/V device")
+    if key_bias is None and measure_identity is not None:
+        raise RuntimeError("SOL measure identity requires a key bias")
     if recompute_prefix_queries and prefix > q.shape[2]:
         raise RuntimeError("Prefix query recomputation exceeds the available Q rows")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
@@ -183,16 +249,25 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
 
     layout_key = _bthd_layout_key(qb, kb, vb)
-    key = (q.device, q.dtype, layout_key)
+    key = (q.device, q.dtype, layout_key, measure_identity, bias_interval)
     calibrating = key not in state.sparse_verified
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
-        # The all-selected gate now validates the exact strided layout that the
-        # hot path will reuse. error_metrics() already performs scalar reads, so
-        # this adds no new steady-state synchronization point.
-        got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-                           sink_start=0, sink_tokens=kb.shape[1])
-        want = _dense_reference(q, k, v, None)
+        # The all-selected gate validates the exact strided layout and, in
+        # weighted mode, the exact same key-log-measure used by the hot path.
+        got = state.kernel(
+            qb,
+            kb,
+            vb,
+            tau=config.tau,
+            thresh_type="diag",
+            kv_splits=1,
+            sink_start=0,
+            sink_tokens=kb.shape[1],
+            key_bias=key_bias,
+            key_bias_range=bias_interval,
+        )
+        want = _dense_reference(q, k, v, None, key_bias=key_bias)
         metrics = error_metrics(got, want)
         gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(metrics):
@@ -207,14 +282,32 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             "materialized_qkv_bytes": 0,
             "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
             "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
+            "attention_measure_identity": measure_identity,
+            "key_bias_range": list(bias_interval) if bias_interval is not None else None,
             **metrics,
         })
         del got, want
-    out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-                       sink_start=0, sink_tokens=prefix)
-    # Normal H3 replaces non-video query rows with the inherited dense provider.
-    # VDN local Q contains only requested rows; sink_rows describes K/V only.
+    out = state.kernel(
+        qb,
+        kb,
+        vb,
+        tau=config.tau,
+        thresh_type="diag",
+        kv_splits=1,
+        sink_start=0,
+        sink_tokens=prefix,
+        key_bias=key_bias,
+        key_bias_range=bias_interval,
+    )
+    # Normal H3 replaces non-video query rows with exact dense attention.
+    # In weighted mode that replacement must use the same key measure.
     if prefix and recompute_prefix_queries:
-        out[:, :prefix] = _dense_reference(q[:, :, :prefix], k, v, dense_attention)
+        out[:, :prefix] = _dense_reference(
+            q[:, :, :prefix],
+            k,
+            v,
+            dense_attention,
+            key_bias=key_bias,
+        )
     state.sparse_calls += 1
     return out.reshape(1, q.shape[2], -1)
