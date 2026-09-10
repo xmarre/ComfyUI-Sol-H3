@@ -1,0 +1,200 @@
+from types import SimpleNamespace
+
+import torch
+
+from sol_h3 import runtime, sparse, weighted_measure
+from sol_h3.contracts import Config
+from sol_h3.runtime import BlockPatch, Request, _FORWARD
+
+
+ROWS = 202
+HEADS = 2
+DIM = 128
+
+
+def _contracts():
+    layout = SimpleNamespace(
+        seq_len=ROWS,
+        segments=((0, 10, "text"), (10, ROWS, "video")),
+    )
+    external = {
+        "api": 2,
+        "mode": "dense_gate_no_linear",
+        "topology": "mixed_grid_low_suffix",
+        "native_sequence_rows": 138,
+        "sequence_rows": ROWS,
+        "video_start": 10,
+        "temporal": 2,
+        "prefix_t": 1,
+        "source_rows_per_frame": 64,
+        "prefix_rows_per_frame": 128,
+    }
+    measure = {"api": 1, "operator": "key_log_measure"}
+    return layout, external, measure
+
+
+def _plan():
+    return SimpleNamespace(
+        key_log_measure=torch.zeros(ROWS, dtype=torch.float32),
+        exact_k_block_range=(0, 3),
+        semantic_digest="measure-digest",
+        owner_generation="owner-generation",
+        implementation_profile=weighted_measure.IMPLEMENTATION_PROFILE,
+        numerical_route=weighted_measure.NUMERICAL_ROUTE,
+        q_rows=ROWS,
+        kv_rows=ROWS,
+        exact_range_digest="exact-range-digest",
+        preprocess_digest="preprocess-digest",
+    )
+
+
+def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl):
+    state = Request(cfg)
+    layout, external, measure = _contracts()
+    plan = _plan()
+    q, k, v = (
+        torch.randn(1, HEADS, ROWS, DIM, dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+
+    monkeypatch.setattr(runtime, "_shape_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(weighted_measure, "preprocess_digest", lambda provider: "preprocess-digest")
+
+    prepare_calls = []
+
+    def prepare(state_arg, options, request, **kwargs):
+        prepare_calls.append((state_arg, options, request, kwargs))
+        assert kwargs["q_rows"] == ROWS
+        assert kwargs["kv_rows"] == ROWS
+        assert kwargs["existing_sink"] == (0, 1)
+        assert kwargs["preprocess_identity"] == "preprocess-digest"
+        return plan
+
+    monkeypatch.setattr(weighted_measure, "prepare", prepare)
+    monkeypatch.setattr(weighted_measure, "dense", dense_impl)
+    monkeypatch.setattr(sparse, "attention", sparse_impl)
+    monkeypatch.setattr(
+        runtime,
+        "reduce_kv",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("weighted route must never enter legacy K/V reduction")
+        ),
+    )
+
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(forward=None))])
+    token = _FORWARD.set((model, state, 0, set(), []))
+
+    def original_block(call_args):
+        options = call_args["transformer_options"]
+        override = options["optimized_attention_override"]
+        return override(
+            None,
+            q,
+            k,
+            v,
+            HEADS,
+            mask=None,
+            skip_reshape=True,
+            skip_output_reshape=False,
+            transformer_options=options,
+        )
+
+    options = {
+        "minimax_h3_layout": layout,
+        "vdn_h3_external_sequence_v1": external,
+        weighted_measure.ATTENTION_MEASURE_KEY: measure,
+    }
+    try:
+        result = BlockPatch(0, cfg)(
+            {"transformer_options": options, "layout": layout},
+            {"original_block": original_block},
+        )
+    finally:
+        _FORWARD.reset(token)
+
+    assert len(prepare_calls) == 1
+    return result, state, plan
+
+
+def test_weighted_runtime_keeps_all_kv_rows_and_separates_q_prefix_from_k_sink(monkeypatch):
+    calls = []
+
+    def sparse_impl(q, k, v, prefix, config, state, **kwargs):
+        calls.append((q.shape, k.shape, v.shape, prefix, kwargs))
+        assert prefix == 10
+        assert k.shape[2] == v.shape[2] == ROWS
+        assert kwargs["key_bias"].shape == (ROWS,)
+        assert kwargs["exact_k_blocks"] == (0, 3)
+        assert kwargs["calibration_identity"] == "measure-digest"
+        assert kwargs["dense_attention"] is not None
+        state.sparse_calls += 1
+        return torch.zeros(1, ROWS, HEADS * DIM, dtype=q.dtype)
+
+    def dense_impl(*args, **kwargs):
+        raise AssertionError("hot weighted sparse route must not take dense fallback")
+
+    result, state, _ = _run_block(
+        monkeypatch,
+        Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0),
+        sparse_impl=sparse_impl,
+        dense_impl=dense_impl,
+    )
+
+    assert result.shape == (1, ROWS, HEADS * DIM)
+    assert len(calls) == 1
+    assert state.external_mixed_weighted_measure_calls == 1
+    assert state.external_mixed_weighted_measure_q_rows == ROWS
+    assert state.external_mixed_weighted_measure_kv_rows == ROWS
+    assert state.external_mixed_measure_calls == 0
+
+
+def test_weighted_dense_warmup_preserves_all_rows_and_same_measure(monkeypatch):
+    dense_calls = []
+
+    def sparse_impl(*args, **kwargs):
+        raise AssertionError("dense warmup must not dispatch sparse attention")
+
+    def dense_impl(q, k, v, heads, plan, *, scale=None, output_heads=False):
+        dense_calls.append((q.shape, k.shape, v.shape, heads, plan, scale, output_heads))
+        assert k.shape[2] == v.shape[2] == ROWS
+        assert plan.key_log_measure.shape == (ROWS,)
+        assert output_heads is False
+        return torch.zeros(1, ROWS, HEADS * DIM, dtype=q.dtype)
+
+    result, state, plan = _run_block(
+        monkeypatch,
+        Config(exact=False, backend="sol", dense_evaluations=1, dense_layers=0),
+        sparse_impl=sparse_impl,
+        dense_impl=dense_impl,
+    )
+
+    assert result.shape == (1, ROWS, HEADS * DIM)
+    assert len(dense_calls) == 1
+    assert dense_calls[0][4] is plan
+    assert state.dense_calls == 1
+    assert state.external_mixed_weighted_measure_calls == 1
+    assert state.external_mixed_weighted_measure_kv_rows == ROWS
+
+
+def test_weighted_kernel_unavailable_falls_back_to_weighted_dense_not_legacy(monkeypatch):
+    dense_calls = []
+
+    def sparse_impl(*args, **kwargs):
+        raise sparse.KernelUnavailable("test-unavailable")
+
+    def dense_impl(q, k, v, heads, plan, *, scale=None, output_heads=False):
+        dense_calls.append((k.shape[2], plan.key_log_measure.shape[0], output_heads))
+        return torch.zeros(1, ROWS, HEADS * DIM, dtype=q.dtype)
+
+    result, state, _ = _run_block(
+        monkeypatch,
+        Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0),
+        sparse_impl=sparse_impl,
+        dense_impl=dense_impl,
+    )
+
+    assert result.shape == (1, ROWS, HEADS * DIM)
+    assert dense_calls == [(ROWS, ROWS, False)]
+    assert state.external_mixed_weighted_measure_calls == 0
+    assert state.external_mixed_measure_calls == 0
+    assert state.fallbacks["kernel_unavailable:test-unavailable"] == 1
