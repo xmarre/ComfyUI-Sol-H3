@@ -391,14 +391,17 @@ class BlockPatch:
                     except RuntimeError:
                         reason = "packed_layout_not_representable"
 
-                # The independent Flow measure contract is meaningful only on a
-                # fully validated external mixed stream. Never silently drop or
-                # reinterpret a malformed measure request as the old square path.
-                if (legacy_measure_contract is not None or generic_measure_contract is not None) and (
-                    reason is not None or not external_mixed
-                ):
+                # The legacy representative-KV contract is coupled to VDN API 2
+                # because that contract describes its gather domain. The generic key-measure
+                # contract is not: it binds to the actual all-row H3 layout and only cross-checks
+                # VDN API 2 when that optional contract is present.
+                if legacy_measure_contract is not None and (reason is not None or not external_mixed):
                     raise RuntimeError(
-                        "Flow mixed-grid attention-measure contract requires a valid external mixed sequence"
+                        "Legacy Flow mixed-grid attention-measure contract requires a valid external mixed sequence"
+                    )
+                if generic_measure_contract is not None and reason is not None:
+                    raise RuntimeError(
+                        "Generic mixed-grid attention measure requires the actual representable H3 mixed layout"
                     )
                 if reason is not None:
                     record(reason, True)

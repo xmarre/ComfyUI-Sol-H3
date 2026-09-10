@@ -48,7 +48,7 @@ def _plan():
     )
 
 
-def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl):
+def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=True):
     state = Request(cfg)
     layout, external, measure = _contracts()
     plan = _plan()
@@ -101,9 +101,10 @@ def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl):
 
     options = {
         "minimax_h3_layout": layout,
-        "vdn_h3_external_sequence_v1": external,
         weighted_measure.ATTENTION_MEASURE_KEY: measure,
     }
+    if include_external:
+        options["vdn_h3_external_sequence_v1"] = external
     try:
         result = BlockPatch(0, cfg)(
             {"transformer_options": options, "layout": layout},
@@ -198,3 +199,27 @@ def test_weighted_kernel_unavailable_falls_back_to_weighted_dense_not_legacy(mon
     assert state.external_mixed_weighted_measure_calls == 0
     assert state.external_mixed_measure_calls == 0
     assert state.fallbacks["kernel_unavailable:test-unavailable"] == 1
+
+
+def test_generic_weighted_measure_does_not_require_vdn_external_sequence(monkeypatch):
+    calls = []
+
+    def sparse_impl(q, k, v, prefix, config, state, **kwargs):
+        calls.append((prefix, k.shape[2], kwargs["exact_k_blocks"]))
+        state.sparse_calls += 1
+        return torch.zeros(1, ROWS, HEADS * DIM, dtype=q.dtype)
+
+    def dense_impl(*args, **kwargs):
+        raise AssertionError("generic all-row weighted route unexpectedly fell back to dense")
+
+    result, state, _ = _run_block(
+        monkeypatch,
+        Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0),
+        sparse_impl=sparse_impl,
+        dense_impl=dense_impl,
+        include_external=False,
+    )
+
+    assert result.shape == (1, ROWS, HEADS * DIM)
+    assert calls == [(10, ROWS, (0, 3))]
+    assert state.external_mixed_weighted_measure_calls == 1
