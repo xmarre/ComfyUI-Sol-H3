@@ -1,9 +1,9 @@
 """Generic Mixed-Grid key-measure binding for the Sol-H3 SM120 provider.
 
-The schema and bound-plan implementation live in ComfyUI core.  This module
-only owns the Sol-H3 provider capability and the provider-specific exact-bias
-interval derived from a core-validated plan.  Legacy representative K/V
-selection remains in :mod:`sol_h3.mixed_measure` and never enters this path.
+The schema and bound-plan implementation live in ComfyUI core. This module
+owns only the Sol-H3 provider capability and provider-specific exact-bias
+interval. Legacy representative K/V selection remains in
+:mod:`sol_h3.mixed_measure` and never enters this path.
 """
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ import uuid
 ATTENTION_MEASURE_KEY = "attention_measure_v1"
 ATTENTION_MEASURE_CAPABILITIES_KEY = "attention_measure_capabilities_v1"
 PROVIDER_IDENTITY = "xmarre.comfyui_sol_h3.sm120"
-NUMERICAL_ROUTE = "sol_h3_sm120_weighted_exact_blocks_v1"
-IMPLEMENTATION_PROFILE = "weighted_exact_blocks_v1"
+SPARSE_NUMERICAL_ROUTE = "sol_h3_sm120_weighted_exact_blocks_v1"
+DENSE_NUMERICAL_ROUTE = "sol_h3_dense_weighted_v1"
+SPARSE_PROFILE = "weighted_exact_blocks_v1"
+DENSE_PROFILE = "dense_exact_v1"
 PREPROCESS_POLICY = "sol_h3_full_domain_preprocess_v1"
 
 
@@ -91,24 +93,29 @@ class SolMeasureCapability:
         )
         if execution_context.owner_generation != expected_generation:
             raise RuntimeError("Sol-H3 attention-measure owner generation is stale")
-        if execution_context.numerical_route != NUMERICAL_ROUTE:
+        profiles = {
+            SPARSE_NUMERICAL_ROUTE: SPARSE_PROFILE,
+            DENSE_NUMERICAL_ROUTE: DENSE_PROFILE,
+        }
+        profile = profiles.get(execution_context.numerical_route)
+        if profile is None:
             raise RuntimeError("Sol-H3 attention measure selected an unexpected numerical route")
         if execution_context.mask_class != "none":
-            raise RuntimeError("Sol-H3 weighted sparse attention does not accept an attention mask")
+            raise RuntimeError("Sol-H3 weighted attention does not accept an attention mask")
         return core.bind(
             request,
             context=execution_context,
             block_size=64,
-            implementation_profile=IMPLEMENTATION_PROFILE,
+            implementation_profile=profile,
         )
 
 
 def register(options, owners):
     """Publish one owner-bound Sol capability without disturbing other providers.
 
-    Current released ComfyUI builds do not yet expose the generic API.  Normal
+    Current released ComfyUI builds do not yet expose the generic API. Normal
     unweighted Sol-H3 installation therefore remains valid; the capability is
-    registered only when that API exists.  A later attention_measure_v1 request
+    registered only when that API exists. A later attention_measure_v1 request
     still fails explicitly in :func:`prepare` if the companion core is absent.
     """
     try:
@@ -161,6 +168,7 @@ def prepare(
     existing_sink,
     external_sequence,
     preprocess_identity,
+    dense: bool = False,
 ) -> PreparedMeasure:
     core = _core()
     registry = options.get(ATTENTION_MEASURE_CAPABILITIES_KEY)
@@ -169,6 +177,8 @@ def prepare(
         raise RuntimeError("attention_measure_v1 selected Sol-H3 without its owner-bound capability")
     generation = capability.generation_for(owner, block_index)
     digest = preprocess_digest(preprocess_identity)
+    numerical_route = DENSE_NUMERICAL_ROUTE if dense else SPARSE_NUMERICAL_ROUTE
+    expected_profile = DENSE_PROFILE if dense else SPARSE_PROFILE
     context = core.MeasureExecutionContext(
         provider_identity=PROVIDER_IDENTITY,
         block_index=int(block_index),
@@ -182,12 +192,12 @@ def prepare(
         head_dim=int(head_dim),
         mask_class="none",
         preprocess_digest=digest,
-        numerical_route=NUMERICAL_ROUTE,
+        numerical_route=numerical_route,
         existing_sink=tuple(existing_sink),
         external_sequence=external_sequence,
     )
     plan = core.prepare_capability(options, request, context)
-    if plan.implementation_profile != IMPLEMENTATION_PROFILE:
+    if plan.implementation_profile != expected_profile:
         raise RuntimeError("Sol-H3 attention-measure capability selected an unexpected profile")
     normalized, bias_start, bias_stop = _weighted_interval(core, request)
     if plan.exact_k_block_range[0] != 0:
@@ -215,8 +225,8 @@ def history_identity(options):
     return (
         PROVIDER_IDENTITY,
         core.semantic_digest(normalized),
-        IMPLEMENTATION_PROFILE,
-        NUMERICAL_ROUTE,
+        SPARSE_PROFILE,
+        SPARSE_NUMERICAL_ROUTE,
         bias_start,
         bias_stop,
         capability._generation,
