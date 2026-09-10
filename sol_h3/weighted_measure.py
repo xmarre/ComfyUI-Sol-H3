@@ -9,8 +9,17 @@ import uuid
 ATTENTION_MEASURE_KEY = "attention_measure_v1"
 ATTENTION_MEASURE_CAPABILITIES_KEY = "attention_measure_capabilities_v1"
 PROVIDER_IDENTITY = "comfy.sol_h3.sm120"
-IMPLEMENTATION_PROFILE = "weighted_exact_blocks_v1"
-NUMERICAL_ROUTE = "sol_h3_sm120_weighted_exact_blocks"
+SPARSE_IMPLEMENTATION_PROFILE = "weighted_exact_blocks_v1"
+DENSE_IMPLEMENTATION_PROFILE = "dense_exact_v1"
+SPARSE_NUMERICAL_ROUTE = "sol_h3_sm120_weighted_exact_blocks"
+DENSE_NUMERICAL_ROUTE = "sol_h3_weighted_dense_exact"
+# Backwards-compatible names used by the first provider tests and callers.
+IMPLEMENTATION_PROFILE = SPARSE_IMPLEMENTATION_PROFILE
+NUMERICAL_ROUTE = SPARSE_NUMERICAL_ROUTE
+_ROUTE_PROFILES = {
+    SPARSE_NUMERICAL_ROUTE: SPARSE_IMPLEMENTATION_PROFILE,
+    DENSE_NUMERICAL_ROUTE: DENSE_IMPLEMENTATION_PROFILE,
+}
 
 
 def _core(required=True):
@@ -72,11 +81,14 @@ class Capability:
             raise RuntimeError("Sol-H3 attention-measure capability is bound to another owner")
         if execution_context.provider_identity != PROVIDER_IDENTITY:
             raise RuntimeError("Sol-H3 attention-measure provider identity changed during binding")
+        implementation_profile = _ROUTE_PROFILES.get(execution_context.numerical_route)
+        if implementation_profile is None:
+            raise RuntimeError("Sol-H3 attention-measure numerical route is not capability-bound")
         return core.bind(
             request,
             context=execution_context,
             block_size=64,
-            implementation_profile=IMPLEMENTATION_PROFILE,
+            implementation_profile=implementation_profile,
         )
 
 
@@ -122,9 +134,14 @@ def prepare(
     existing_sink,
     external_sequence,
     preprocess_identity,
+    implementation_profile=SPARSE_IMPLEMENTATION_PROFILE,
+    numerical_route=SPARSE_NUMERICAL_ROUTE,
 ):
     """Bind one actual all-row weighted route and cache its O(T) bias per request."""
     core = _core()
+    expected_profile = _ROUTE_PROFILES.get(numerical_route)
+    if expected_profile is None or expected_profile != implementation_profile:
+        raise ValueError("Sol-H3 attention-measure route/profile pair is invalid")
     registry = transformer_options.get(ATTENTION_MEASURE_CAPABILITIES_KEY)
     capability = registry.get(PROVIDER_IDENTITY) if isinstance(registry, dict) else None
     if not isinstance(capability, Capability):
@@ -145,7 +162,7 @@ def prepare(
         head_dim=int(head_dim),
         mask_class="none",
         preprocess_digest=str(preprocess_identity),
-        numerical_route=NUMERICAL_ROUTE,
+        numerical_route=numerical_route,
         existing_sink=tuple(existing_sink),
         external_sequence=external_sequence,
     )
@@ -160,12 +177,14 @@ def prepare(
         context.existing_sink,
         context.preprocess_digest,
         context.owner_generation,
+        implementation_profile,
+        numerical_route,
     )
     plan = state.measure_plans.get(key)
     if plan is None:
         plan = core.prepare_capability(transformer_options, request, context)
-        if plan.implementation_profile != IMPLEMENTATION_PROFILE:
-            raise RuntimeError("Sol-H3 capability selected an unexpected attention-measure profile")
+        if plan.implementation_profile != implementation_profile or plan.numerical_route != numerical_route:
+            raise RuntimeError("Sol-H3 capability selected an unexpected attention-measure route/profile")
         bias_key = (digest, str(context.device))
         shared = state.measure_biases.get(bias_key)
         if shared is None:
