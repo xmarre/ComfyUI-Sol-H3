@@ -605,13 +605,12 @@ class BlockPatch:
                     sink_rows=sink_rows,
                 )
 
-            def vdn_preprocess(q, k, v, *, heads, transformer_options):
-                # VDN exposes post-RoPE [T,H,D]. Comfy attention preprocessors use
-                # [B,H,T,D], so adapt only at this explicit full-domain boundary.
-                qc, kc, vc = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
-                kw = {"transformer_options": transformer_options, "skip_reshape": True}
-                qc, kc, vc, _ = _preprocess_chain(previous, qc, kc, vc, heads, kw)
-                return tuple(t.squeeze(0).transpose(0, 1) for t in (qc, kc, vc))
+            def vdn_preprocess(q, k, v, heads, mask=None, **kw):
+                dense_kw = {**kw, "_inside_attn_wrapper": True}
+                if previous is None or not hasattr(previous, "attention_preprocess_v1"):
+                    return q, k, v
+                q, k, v, _ = _preprocess_chain(previous, q, k, v, heads, dense_kw)
+                return q, k, v
 
             options["optimized_attention_override"] = override
             options[VDN_KEY] = vdn_provider_v1
@@ -687,7 +686,7 @@ def install(model, config):
     to[KEY] = config.metadata()
     if config.backend == "sol":
         to[HISTORY_KEY] = {**to.get(HISTORY_KEY, {}), "sol_h3": HistoryPolicy(config)}
-        weighted_measure.register(to)
+        weighted_measure.register(to, refresh_owned=True)
     for kind, wrapper in (
         (WrappersMP.OUTER_SAMPLE, SamplingWrapper(config)),
         (WrappersMP.DIFFUSION_MODEL, DiffusionWrapper(config)),
