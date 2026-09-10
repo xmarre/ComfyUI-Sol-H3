@@ -54,7 +54,7 @@ def test_manifest_names_are_platform_independent():
 def test_public_api():
     assert tuple(inspect.signature(interface.sol_attn).parameters) == (
         'q', 'k', 'v', 'scale', 'tau', 'thresh_type', 'kv_splits',
-        'sink_tokens', 'sink_start', 'compile_bucket_size')
+        'sink_tokens', 'sink_start', 'compile_bucket_size', 'key_bias')
     assert interface._backend_for_arch((12, 0), cute_available=True) == 'cute_sm120'
     assert interface._backend_for_arch((12, 0), cute_available=False) == 'triton'
     assert interface._backend_for_arch((10, 3), cute_available=True) == 'cute_sm100'
@@ -177,3 +177,27 @@ def test_missing_cute_counts_no_sparse_and_caches_reason(monkeypatch):
     assert len(attempts) == 1
     assert state.sparse_calls == 0
     assert state.kernel is None
+
+
+
+def test_weighted_public_api_is_sm120_only_and_validates_bias(monkeypatch):
+    q = torch.zeros(1, 65, 2, 128, dtype=torch.bfloat16)
+    monkeypatch.setattr(interface, '_validate_inputs', lambda *a, **k: (10, 0))
+    monkeypatch.setattr(interface, '_cute_runtime_available', lambda: True)
+    with pytest.raises(ValueError, match='cute_sm120 only'):
+        interface.sol_attn(q, q, q, key_bias=torch.zeros(65))
+
+    monkeypatch.setattr(interface, '_validate_inputs', lambda *a, **k: (12, 0))
+    with pytest.raises(ValueError, match='one natural-log value'):
+        interface.sol_attn(q, q, q, key_bias=torch.zeros(64))
+    with pytest.raises(ValueError, match='finite positive'):
+        interface.sol_attn(q, q, q, scale=0.0, key_bias=torch.zeros(65))
+
+
+def test_sm120_source_injects_bias_only_between_exact_mask_and_softmax():
+    source = (Path(interface.__file__).parent / 'sm120' / 'mainloop.py').read_text()
+    exact = source.index('mask_exact_scores(tSrS, tScS, block_len, q_len)')
+    inject = source.index('add_exact_key_bias(', exact)
+    softmax = source.index('row_scale = online_softmax(', inject)
+    assert exact < inject < softmax
+    assert 'key_bias[absolute_col]' in source

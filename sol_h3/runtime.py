@@ -6,6 +6,7 @@ import logging
 
 from .contracts import KEY, Config, adaln_status, prefix_length
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
+from . import weighted_measure
 from .interop import (
     HISTORY_KEY,
     VDN_KEY,
@@ -38,6 +39,11 @@ class Request:
     external_mixed_measure_kv_rows_before: int = 0
     external_mixed_measure_kv_rows_after: int = 0
     external_mixed_measure_removed_rows: int = 0
+    external_mixed_weighted_measure_calls: int = 0
+    external_mixed_weighted_measure_q_rows: int = 0
+    external_mixed_weighted_measure_kv_rows: int = 0
+    measure_plans: dict = field(default_factory=dict)
+    measure_biases: dict = field(default_factory=dict)
     vdn_local_sol_calls: int = 0
     vdn_rectangular_sol_calls: int = 0
     vdn_requested_q_rows: int = 0
@@ -95,6 +101,9 @@ class SamplingWrapper:
                         "external_mixed_measure_kv_rows_before": state.external_mixed_measure_kv_rows_before,
                         "external_mixed_measure_kv_rows_after": state.external_mixed_measure_kv_rows_after,
                         "external_mixed_measure_removed_rows": state.external_mixed_measure_removed_rows,
+                        "external_mixed_weighted_measure_calls": state.external_mixed_weighted_measure_calls,
+                        "external_mixed_weighted_measure_q_rows": state.external_mixed_weighted_measure_q_rows,
+                        "external_mixed_weighted_measure_kv_rows": state.external_mixed_weighted_measure_kv_rows,
                         "compatibility_fallbacks": dict(state.fallbacks),
                         "dense_provider_failures": dict(state.dense_provider_failures),
                         "vdn_local_sol_calls": state.vdn_local_sol_calls,
@@ -293,9 +302,9 @@ class BlockPatch:
         forwarded = {**args, "transformer_options": options}
         route_start = len(routes)
 
-        def record(route, fallback=False):
+        def record(route, fallback=False, measure_plan=None):
             routes.append((self.index, route))
-            receipt(options, self.index, route)
+            receipt(options, self.index, route, measure_plan=measure_plan, call_token=evaluation)
             if fallback:
                 state.fallbacks[route] += 1
 
@@ -367,7 +376,10 @@ class BlockPatch:
                     reason = "forecast_consumer_no_history_contract"
                 layout = current_options.get("minimax_h3_layout", args.get("layout"))
                 external_contract = current_options.get("vdn_h3_external_sequence_v1")
-                measure_contract = current_options.get(FLOW_MIXED_MEASURE_KEY)
+                legacy_measure_contract = current_options.get(FLOW_MIXED_MEASURE_KEY)
+                generic_measure_contract = current_options.get(weighted_measure.ATTENTION_MEASURE_KEY)
+                if legacy_measure_contract is not None and generic_measure_contract is not None:
+                    raise RuntimeError("legacy and generic Mixed-Grid attention-measure contracts cannot coexist")
                 external_mixed = False
                 prefix = 0
                 if reason is None and external_contract is not None:
@@ -382,7 +394,9 @@ class BlockPatch:
                 # The independent Flow measure contract is meaningful only on a
                 # fully validated external mixed stream. Never silently drop or
                 # reinterpret a malformed measure request as the old square path.
-                if measure_contract is not None and (reason is not None or not external_mixed):
+                if (legacy_measure_contract is not None or generic_measure_contract is not None) and (
+                    reason is not None or not external_mixed
+                ):
                     raise RuntimeError(
                         "Flow mixed-grid attention-measure contract requires a valid external mixed sequence"
                     )
@@ -390,11 +404,88 @@ class BlockPatch:
                     record(reason, True)
                     return dense()
 
+                if generic_measure_contract is not None:
+                    state.eligible_calls += 1
+                    preprocess_identity = weighted_measure.preprocess_digest(dense_provider)
+                    existing_sink = (0, (int(prefix) + 63) // 64)
+                    measure_plan = weighted_measure.prepare(
+                        state,
+                        current_options,
+                        generic_measure_contract,
+                        block_index=self.index,
+                        layout=layout,
+                        q_rows=int(q.shape[2]),
+                        kv_rows=int(k.shape[2]),
+                        dtype=q.dtype,
+                        device=q.device,
+                        head_dim=int(q.shape[-1]),
+                        existing_sink=existing_sink,
+                        external_sequence=external_contract,
+                        preprocess_identity=preprocess_identity,
+                    )
+                    # Bind against the original mixed coordinates, then run the
+                    # full-domain preprocessing chain exactly once.
+                    q, k, v, dense_provider = _preprocess_chain(dense_provider, q, k, v, heads, kw)
+
+                    def weighted_dense_result(*, output_heads=False, qd=q, kd=k, vd=v):
+                        return weighted_measure.dense(
+                            qd,
+                            kd,
+                            vd,
+                            heads,
+                            measure_plan,
+                            scale=kw.get("scale"),
+                            output_heads=output_heads,
+                        )
+
+                    if warmup:
+                        result = weighted_dense_result()
+                        state.dense_calls += 1
+                        state.external_mixed_weighted_measure_calls += 1
+                        state.external_mixed_weighted_measure_q_rows += q.shape[2]
+                        state.external_mixed_weighted_measure_kv_rows += k.shape[2]
+                        record("dense_warmup", measure_plan=measure_plan)
+                        return result
+
+                    def weighted_prefix_dense(qd, kd, vd):
+                        out = weighted_dense_result(output_heads=True, qd=qd, kd=kd, vd=vd)
+                        if out.shape != qd.shape:
+                            raise RuntimeError("weighted dense prefix returned an invalid output shape")
+                        return out.transpose(1, 2)
+
+                    from .sparse import attention, KernelUnavailable
+
+                    try:
+                        result = attention(
+                            q,
+                            k,
+                            v,
+                            prefix,
+                            config,
+                            state,
+                            dense_attention=weighted_prefix_dense,
+                            key_bias=measure_plan.key_log_measure,
+                            exact_k_blocks=measure_plan.exact_k_block_range,
+                            calibration_identity=measure_plan.semantic_digest,
+                        )
+                    except KernelUnavailable as exc:
+                        result = weighted_dense_result()
+                        record("kernel_unavailable:" + str(exc), True, measure_plan=measure_plan)
+                        return result
+                    state.external_mixed_sol_calls += 1
+                    state.external_mixed_q_rows += q.shape[2]
+                    state.external_mixed_kernel_q_rows += q.shape[2]
+                    state.external_mixed_weighted_measure_calls += 1
+                    state.external_mixed_weighted_measure_q_rows += q.shape[2]
+                    state.external_mixed_weighted_measure_kv_rows += k.shape[2]
+                    record("sol_external_mixed_weighted_measure", measure_plan=measure_plan)
+                    return result
+
                 measure_validated = None
                 measure_stats = None
-                if measure_contract is not None:
+                if legacy_measure_contract is not None:
                     measure_validated = validate_measure_contract(
-                        measure_contract,
+                        legacy_measure_contract,
                         external_contract,
                         q_rows=int(q.shape[2]),
                         kv_rows=int(k.shape[2]),
@@ -596,6 +687,7 @@ def install(model, config):
     to[KEY] = config.metadata()
     if config.backend == "sol":
         to[HISTORY_KEY] = {**to.get(HISTORY_KEY, {}), "sol_h3": HistoryPolicy(config)}
+        weighted_measure.register(to)
     for kind, wrapper in (
         (WrappersMP.OUTER_SAMPLE, SamplingWrapper(config)),
         (WrappersMP.DIFFUSION_MODEL, DiffusionWrapper(config)),

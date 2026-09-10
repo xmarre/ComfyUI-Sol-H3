@@ -66,10 +66,10 @@ def main():
         records[path] = {'upstream_sha256': hashlib.sha256(raw).hexdigest(),
                          'packaged_sha256': hashlib.sha256(packaged).hexdigest()}
         if packaged != relocate(raw, path):
-            records[path]['modifications'] = ['rectangular-sm120-v2']
+            records[path]['modifications'] = ['rectangular-sm120-v3']
     manifest = {'source': 'sana-sol-engine', 'repository': 'https://github.com/xmarre/Sana',
                 'branch': 'sol-engine', 'revision': REVISION, 'subtree': SUBTREE,
-                'transformation': 'relative-imports-v1; rectangular-sm120-v2 (tools/rectangular_sm120.patch)',
+                'transformation': 'relative-imports-v1; rectangular-sm120-v3 (tools/rectangular_sm120.patch)',
                 'packaged_patch_sha256': hashlib.sha256((ROOT / 'tools/rectangular_sm120.patch').read_bytes()).hexdigest(),
                 'files': records}
     (ROOT / 'sol_h3' / 'sol_manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
