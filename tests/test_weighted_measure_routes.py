@@ -96,7 +96,7 @@ def test_dense_and_sparse_routes_bind_distinct_plans_but_share_measure_buffer():
     assert len(state.measure_biases) == 1
 
 
-def test_cached_plan_revalidates_current_layout_and_external_sequence():
+def test_cached_plan_revalidates_current_layout_external_sequence_and_sink():
     _, request, common = _fixture()
     options = {}
     weighted_measure.register(options, refresh_owned=True)
@@ -139,6 +139,16 @@ def test_cached_plan_revalidates_current_layout_and_external_sequence():
             options,
             request,
             **{**common, "layout": stale_layout, "external_sequence": external},
+        )
+
+    # Python bools alias 0/1 in tuple hashes/equality. Without explicit core
+    # revalidation this malformed sink can hit the plan cached under (0, 1).
+    with pytest.raises(ValueError, match="existing sink range"):
+        weighted_measure.prepare(
+            state,
+            options,
+            request,
+            **{**common, "existing_sink": (False, 1), "external_sequence": external},
         )
 
     assert len(state.measure_plans) == 1
