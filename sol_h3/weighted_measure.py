@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import importlib
+import marshal
+import threading
 import uuid
+import weakref
 
 
 ATTENTION_MEASURE_KEY = "attention_measure_v1"
@@ -20,6 +23,8 @@ _ROUTE_PROFILES = {
     SPARSE_NUMERICAL_ROUTE: SPARSE_IMPLEMENTATION_PROFILE,
     DENSE_NUMERICAL_ROUTE: DENSE_IMPLEMENTATION_PROFILE,
 }
+_OWNER_GENERATIONS = {}
+_OWNER_GENERATIONS_LOCK = threading.Lock()
 
 
 def _core(required=True):
@@ -41,11 +46,71 @@ def _provider_name(provider):
     return f"{getattr(provider, '__module__', '<unknown>')}.{getattr(provider, '__qualname__', type(provider).__name__)}"
 
 
-def preprocess_digest(provider):
-    """Hash the concrete preprocessing/leaf ownership chain for this process.
+def _stateless_function_identity(provider):
+    """Return a stable implementation identity for a genuinely stateless function.
 
-    Object identity is intentional: a forecast or cached plan must not survive a
-    runtime provider replacement merely because the replacement has the same name.
+    Attention preprocess factories may create a fresh function object for every
+    model invocation. Object identity is not numerical identity in that case and
+    would grow the request-scoped weighted-plan cache once per evaluation. Only
+    functions with no closure/default state qualify for code identity; anything
+    stateful falls back to concrete owner-generation tracking below.
+    """
+    code = getattr(provider, "__code__", None)
+    if code is None:
+        return None
+    if getattr(provider, "__closure__", None) is not None:
+        return None
+    if getattr(provider, "__defaults__", None):
+        return None
+    if getattr(provider, "__kwdefaults__", None):
+        return None
+    digest = hashlib.sha256(marshal.dumps(code)).hexdigest()
+    return ("stateless_function_v1", _provider_name(provider), digest)
+
+
+def _owner_identity(provider):
+    if provider is None:
+        return ("singleton_v1", "comfy.default")
+    stable = _stateless_function_identity(provider)
+    if stable is not None:
+        return stable
+
+    # Stateful callable identity must not be represented by raw id(obj): the
+    # object may die while a digest remains in a request cache and CPython may
+    # later reuse that address for a different owner. A weakref-bound generation
+    # token changes on replacement without globally retaining the provider.
+    try:
+        weakref.ref(provider)
+    except TypeError as exc:
+        raise RuntimeError(
+            "stateful attention preprocessing/provider owners must support weak references"
+        ) from exc
+
+    key = id(provider)
+    with _OWNER_GENERATIONS_LOCK:
+        current = _OWNER_GENERATIONS.get(key)
+        if current is not None and current[0]() is provider:
+            token = current[1]
+        else:
+            token = uuid.uuid4().hex
+
+            def cleanup(ref, *, owner_id=key, generation=token):
+                with _OWNER_GENERATIONS_LOCK:
+                    retained = _OWNER_GENERATIONS.get(owner_id)
+                    if retained is not None and retained[0] is ref and retained[1] == generation:
+                        _OWNER_GENERATIONS.pop(owner_id, None)
+
+            _OWNER_GENERATIONS[key] = (weakref.ref(provider, cleanup), token)
+    return ("owner_generation_v1", _provider_name(provider), token)
+
+
+def preprocess_digest(provider):
+    """Hash numerical preprocessing semantics plus concrete stateful ownership.
+
+    Closure-free/default-free function preprocessors are identified by immutable
+    code so equivalent factory-created wrappers share one numerical identity.
+    Stateful callables retain concrete weakref-bound generations so replacement
+    cannot inherit a cached plan through CPython address reuse.
     """
     chain = []
     seen = set()
@@ -55,8 +120,8 @@ def preprocess_digest(provider):
             raise RuntimeError("cyclic attention preprocessing contract")
         seen.add(id(current))
         transform, current = current.attention_preprocess_v1
-        chain.append((_provider_name(transform), id(transform)))
-    chain.append((_provider_name(current), id(current)))
+        chain.append(_owner_identity(transform))
+    chain.append(_owner_identity(current))
     return hashlib.sha256(repr(tuple(chain)).encode("utf-8")).hexdigest()
 
 
