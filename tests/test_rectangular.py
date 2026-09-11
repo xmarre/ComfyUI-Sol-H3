@@ -77,8 +77,8 @@ def test_cute_host_output_lse_sink_and_compile_cache(monkeypatch):
         prepares.append((q.shape[1], k.shape[1], kw))
         kc = torch.empty(1, (k.shape[1] + 63)//64, 2, 128)
         return kc, kc, torch.empty(1, (q.shape[1] + 63)//64, 2)
-    def compile_(key, tensors, scale, start, end, stream):
-        compiles.append((key, [t.shape for t in tensors], start, end))
+    def compile_(key, tensors, scale, start, end, stream, key_bias_enabled):
+        compiles.append((key, [t.shape for t in tensors], start, end, key_bias_enabled))
         def compiled(*args, **kwargs):
             args[3].copy_(args[0])
         interface._compiled[key] = compiled
@@ -93,9 +93,10 @@ def test_cute_host_output_lse_sink_and_compile_cache(monkeypatch):
                     valid_tokens=tq)
         assert got.shape == q.shape
     assert len(compiles) == 3
-    for _, shapes, start, end in compiles:
+    for _, shapes, start, end, key_bias_enabled in compiles:
         assert shapes[3] == shapes[0]
-        assert shapes[7] == shapes[0][:3]  # LSE: [B,Tq,H]
+        assert shapes[8] == shapes[0][:3]  # LSE: [B,Tq,H]
+        assert key_bias_enabled is False
         assert start == 0 and end == (shapes[1][1] + 63)//64
     assert all(kw['valid_tokens'] == tq and kw['valid_kv_tokens'] == tk
                for tq, tk, kw in prepares)

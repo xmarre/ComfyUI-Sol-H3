@@ -4,7 +4,8 @@
   "branch": "sol-engine",
   "revision": "2936c47637380842aaa4a4488fac5006cc542b70",
   "subtree": "models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn",
-  "transformation": "relative-imports-v1; rectangular-sm120-v2 (tools/rectangular_sm120.patch)",
+  "transformation": "relative-imports-v1; rectangular-sm120-v3 (tools/rectangular_sm120.patch)",
+  "packaged_patch_sha256": "ca318d72e526ad22d5968c1d7d5182bf6bb4f10f2b89f74612a7f74cad4ce4c2",
   "files": {
     "THIRD_PARTY_NOTICES.md": {
       "upstream_sha256": "103d86cce2d458005c83713765880b0d48205faa4b7b20a774d36fc3df56da00",
@@ -100,16 +101,16 @@
     },
     "interface.py": {
       "upstream_sha256": "1801195ca718a7d1d1af5b0fc5e2c779a8a142f6f541afebc38433784243351e",
-      "packaged_sha256": "5189941d7534c8c139ed24838a7e519752f159a04bf2c6bcc0df2df373d4f29e",
+      "packaged_sha256": "cd278f6efbba842bec5684997925d7bd10746dd1f2da2758e18ac571e0666166",
       "modifications": [
-        "rectangular-sm120-v2"
+        "rectangular-sm120-v3"
       ]
     },
     "preprocess.py": {
       "upstream_sha256": "d38c924280e00c34072652cfedf6fd65c85db6a4fe93e7858dd919e28d89d958",
       "packaged_sha256": "97c9f5f3a9c491442b3298819153f090221305398379b55825db54e5b3aa28ec",
       "modifications": [
-        "rectangular-sm120-v2"
+        "rectangular-sm120-v3"
       ]
     },
     "sm100/LICENSE.flash-attention": {
@@ -146,13 +147,16 @@
     },
     "sm120/kernel.py": {
       "upstream_sha256": "cba5a94506cb15025faf7065340d36eba8747cff5a0852816486213fbd7fb715",
-      "packaged_sha256": "cba5a94506cb15025faf7065340d36eba8747cff5a0852816486213fbd7fb715"
+      "packaged_sha256": "03e7c3da49e2af2e75366765784fab809529ce461993068da96aedcfdefab9df",
+      "modifications": [
+        "rectangular-sm120-v3"
+      ]
     },
     "sm120/mainloop.py": {
       "upstream_sha256": "8b6b87be7fe21cb0ebfbab34cd0ae819faa96b829c57c7b27c1c14c29e771570",
-      "packaged_sha256": "6602a1c3467ef07a8cd8ee213eb7d9ef33b3a8cd258ad53bff401393e5196c89",
+      "packaged_sha256": "3568c456083fc1ebf468648628e8026507da6efcd3f256ca8cc5eccea965b2a6",
       "modifications": [
-        "rectangular-sm120-v2"
+        "rectangular-sm120-v3"
       ]
     },
     "sm90/__init__.py": {
@@ -219,6 +223,5 @@
       "upstream_sha256": "c1aaa53b26ac9293f504f1d107814ed6c1924a9b671ebebfffc54ec83f743264",
       "packaged_sha256": "c1aaa53b26ac9293f504f1d107814ed6c1924a9b671ebebfffc54ec83f743264"
     }
-  },
-  "packaged_patch_sha256": "cde382135ed205f6bacb88096b822c4ba19e63922d8418f8352a216d05432ee6"
+  }
 }

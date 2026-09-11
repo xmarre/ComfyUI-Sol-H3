@@ -70,7 +70,7 @@ def test_sparse_bridge_preserves_comfy_strided_views_and_calibrates_per_layout(m
     monkeypatch.setattr(
         sparse,
         "_dense_reference",
-        lambda q, k, v, dense_attention: torch.zeros(
+        lambda q, k, v, dense_attention, key_bias=None: torch.zeros(
             (q.shape[0], q.shape[2], q.shape[1], q.shape[3]),
             dtype=q.dtype,
             device=q.device,
