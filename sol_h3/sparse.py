@@ -23,21 +23,15 @@ class KernelUnavailable(RuntimeError):
 
 
 def _sink_blocks(start, tokens, rows):
-    """Validate an exact prefix interval and describe its overlapping 64-row blocks.
-
-    Sol-H3 only requests prefix sinks beginning at row zero. The final partial
-    block is intentionally rounded outward: this makes a few extra keys exact,
-    which is semantics-preserving and only slightly more expensive.
-    """
+    """Validate one exact K interval and return its overlapping 64-row blocks."""
     if type(start) is not int or type(tokens) is not int or type(rows) is not int:
         raise RuntimeError("SOL sink geometry must use integer row counts")
-    if start != 0:
-        raise RuntimeError("Sol-H3 currently supports only a prefix sink beginning at row zero")
-    if tokens < 0 or tokens > rows:
-        raise RuntimeError("SOL sink row count is outside the current sequence")
+    if start < 0 or tokens < 0 or rows < 0 or start > rows or start + tokens > rows:
+        raise RuntimeError("SOL sink row range is outside the current sequence")
     if tokens == 0:
-        return [0, 0]
-    return [0, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
+        block = start // BLOCK_SIZE
+        return [block, block]
+    return [start // BLOCK_SIZE, (start + tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
 
 
 def load_kernel(device):
@@ -65,11 +59,12 @@ def load_kernel(device):
         raise RuntimeError(f"Sana Sol-Attn initialization failed: {exc}") from exc
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
-               sink_start=0, sink_tokens=0):
-        _sink_blocks(sink_start, sink_tokens, k.shape[1])  # validate prefix geometry
+               sink_start=0, sink_tokens=0, key_bias=None):
+        _sink_blocks(sink_start, sink_tokens, k.shape[1])
         return sol_attn(q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
                         thresh_type=thresh_type, kv_splits=kv_splits,
-                        sink_start=sink_start, sink_tokens=sink_tokens)
+                        sink_start=sink_start, sink_tokens=sink_tokens,
+                        key_bias=key_bias)
 
     kernel.backend_name = backend
     kernel.source_tree_verified = True
@@ -133,14 +128,20 @@ def arithmetic_gate_passes(metrics):
     )
 
 
-def _dense_reference(q, k, v, dense_attention):
+def _dense_reference(q, k, v, dense_attention, key_bias=None):
     if dense_attention is not None:
         out = dense_attention(q, k, v)
         expected = (q.shape[0], q.shape[2], q.shape[1], q.shape[3])
         if out.shape != expected:
             raise RuntimeError(f"Dense SOL reference returned {tuple(out.shape)}, expected {expected}")
         return out
-    return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
+    # ``attention_measure_v1`` deliberately owns an FP32 natural-log key vector,
+    # while production Sol-H3 Q/K/V are BF16. PyTorch SDPA requires an additive
+    # floating mask to match the query dtype on CUDA. Cast only the calibration
+    # view; the authoritative FP32 key-bias tensor remains unchanged for the CuTe
+    # weighted specialization and for plan/cache identity.
+    bias = None if key_bias is None else key_bias.to(dtype=q.dtype).view(1, 1, 1, -1)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=bias).transpose(1, 2)
 
 
 def _bthd_layout_key(*tensors):
@@ -149,7 +150,8 @@ def _bthd_layout_key(*tensors):
 
 
 def attention(q, k, v, prefix, config, state, dense_attention=None,
-              recompute_prefix_queries=True):
+              recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,
+              calibration_identity=None):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
             or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
             or q.shape[0] != 1 or q.shape[-1] != 128
@@ -160,6 +162,21 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         raise RuntimeError("Prefix query recomputation exceeds the available Q rows")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
+    if key_bias is not None:
+        if (not torch.is_tensor(key_bias) or key_bias.ndim != 1
+                or key_bias.shape[0] != k.shape[2] or key_bias.device != q.device
+                or key_bias.dtype != torch.float32 or not key_bias.is_contiguous()):
+            raise RuntimeError("weighted SOL requires contiguous FP32 key_bias with one value per K row")
+        if not isinstance(calibration_identity, str) or not calibration_identity:
+            raise RuntimeError("weighted SOL requires a semantic calibration identity")
+        if (not isinstance(exact_k_blocks, (tuple, list)) or len(exact_k_blocks) != 2
+                or any(type(x) is not int for x in exact_k_blocks)):
+            raise RuntimeError("weighted SOL requires one exact K block interval")
+        max_blocks = (k.shape[2] + BLOCK_SIZE - 1) // BLOCK_SIZE
+        if exact_k_blocks[0] < 0 or exact_k_blocks[1] < exact_k_blocks[0] or exact_k_blocks[1] > max_blocks:
+            raise RuntimeError("weighted SOL exact K block interval is out of range")
+    elif exact_k_blocks is not None or calibration_identity is not None:
+        raise RuntimeError("weighted SOL routing metadata was supplied without key_bias")
     kernel_loader_s = 0.0
     if state.kernel is None:
         failure = getattr(state, "kernel_failure", None)
@@ -183,7 +200,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
 
     layout_key = _bthd_layout_key(qb, kb, vb)
-    key = (q.device, q.dtype, layout_key)
+    key = (q.device, q.dtype, layout_key, calibration_identity)
     calibrating = key not in state.sparse_verified
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
@@ -191,8 +208,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         # hot path will reuse. error_metrics() already performs scalar reads, so
         # this adds no new steady-state synchronization point.
         got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-                           sink_start=0, sink_tokens=kb.shape[1])
-        want = _dense_reference(q, k, v, None)
+                           sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias)
+        want = _dense_reference(q, k, v, None, key_bias=key_bias)
         metrics = error_metrics(got, want)
         gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(metrics):
@@ -210,11 +227,19 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             **metrics,
         })
         del got, want
+    if exact_k_blocks is None:
+        sink_start, sink_tokens = 0, prefix
+    else:
+        sink_start = exact_k_blocks[0] * BLOCK_SIZE
+        sink_end = min(k.shape[2], exact_k_blocks[1] * BLOCK_SIZE)
+        sink_tokens = max(0, sink_end - sink_start)
     out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-                       sink_start=0, sink_tokens=prefix)
+                       sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias)
     # Normal H3 replaces non-video query rows with the inherited dense provider.
     # VDN local Q contains only requested rows; sink_rows describes K/V only.
     if prefix and recompute_prefix_queries:
-        out[:, :prefix] = _dense_reference(q[:, :, :prefix], k, v, dense_attention)
+        out[:, :prefix] = _dense_reference(
+            q[:, :, :prefix], k, v, dense_attention, key_bias=key_bias
+        )
     state.sparse_calls += 1
     return out.reshape(1, q.shape[2], -1)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import math
 
 import torch
 
@@ -200,12 +201,13 @@ def _compile_sm120(
     sink_start_block,
     sink_end_block,
     stream,
+    key_bias_enabled,
 ):
     import cutlass.cute as cute
 
     from .sm120 import make_kernel
 
-    operator = make_kernel()
+    operator = make_kernel(key_bias_enabled=key_bias_enabled)
     args = _to_cute_tensors(tensors)
     compiled = cute.compile(
         operator,
@@ -233,6 +235,7 @@ def _sol_attn_cute(
     sink_tokens,
     sink_start,
     valid_tokens=None,
+    key_bias=None,
 ):
     from .preprocess import prepare
 
@@ -263,7 +266,10 @@ def _sol_attn_cute(
         # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
         # descriptor for a strided view (or vice versa).
         layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v))
-        key = (q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits, layout_key)
+        key = (
+            q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,
+            layout_key, key_bias is not None,
+        )
 
         if arch == (9, 0):
             if sink_tokens:
@@ -346,7 +352,8 @@ def _sol_attn_cute(
                 sink_start,
                 sink_tokens,
             )
-            tensors = [q, k, v, output, kc, vc, threshold, lse]
+            key_bias_arg = key_bias if key_bias is not None else threshold
+            tensors = [q, k, v, output, kc, vc, threshold, key_bias_arg, lse]
             compiled = _compiled.get(key)
             if compiled is None:
                 compiled, args = _compile_sm120(
@@ -356,6 +363,7 @@ def _sol_attn_cute(
                     sink_start_block,
                     sink_end_block,
                     stream,
+                    key_bias is not None,
                 )
             else:
                 args = _to_cute_tensors(tensors)
@@ -434,6 +442,7 @@ def sol_attn(
     sink_tokens: int = 0,
     sink_start: int | None = None,
     compile_bucket_size: int | None = None,
+    key_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
 
@@ -453,6 +462,16 @@ def sol_attn(
     if kv_splits not in (1, 2, 4):
         raise ValueError("kv_splits must be 1, 2, or 4")
     backend = _backend_for_arch(arch)
+    if key_bias is not None:
+        if backend != "cute_sm120":
+            raise ValueError("key_bias is currently supported by cute_sm120 only")
+        if (not torch.is_tensor(key_bias) or key_bias.ndim != 1
+                or key_bias.shape[0] != k.shape[1] or key_bias.device != q.device
+                or key_bias.dtype != torch.float32 or not key_bias.is_contiguous()):
+            raise ValueError("key_bias must be contiguous float32 with one natural-log value per K/V row")
+        weighted_scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+        if not math.isfinite(weighted_scale) or weighted_scale <= 0.0:
+            raise ValueError("weighted Sol-Attn requires a finite positive attention scale")
     if q.shape[1] != k.shape[1] and backend != "cute_sm120":
         raise ValueError("Rectangular attention currently requires cute_sm120")
     valid_tokens = q.shape[1]
@@ -495,6 +514,7 @@ def sol_attn(
         sink_tokens=sink_tokens,
         sink_start=sink_start,
         valid_tokens=valid_tokens,
+        key_bias=key_bias,
     )
 
 
