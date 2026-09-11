@@ -46,6 +46,21 @@ def _fixture():
     return rows, request, common
 
 
+def _external_sequence():
+    return {
+        "api": 2,
+        "mode": "dense_gate_no_linear",
+        "topology": "mixed_grid_low_suffix",
+        "native_sequence_rows": 138,
+        "sequence_rows": 202,
+        "video_start": 10,
+        "temporal": 2,
+        "prefix_t": 1,
+        "source_rows_per_frame": 64,
+        "prefix_rows_per_frame": 128,
+    }
+
+
 def test_dense_and_sparse_routes_bind_distinct_plans_but_share_measure_buffer():
     rows, request, common = _fixture()
     options = {}
@@ -78,6 +93,55 @@ def test_dense_and_sparse_routes_bind_distinct_plans_but_share_measure_buffer():
     assert sparse_plan.key_log_measure is dense_plan.key_log_measure
     assert sparse_plan.key_log_measure.shape == (rows,)
     assert len(state.measure_plans) == 2
+    assert len(state.measure_biases) == 1
+
+
+def test_cached_plan_revalidates_current_layout_and_external_sequence():
+    _, request, common = _fixture()
+    options = {}
+    weighted_measure.register(options, refresh_owned=True)
+    state = SimpleNamespace(measure_plans={}, measure_biases={})
+    external = _external_sequence()
+
+    first = weighted_measure.prepare(
+        state,
+        options,
+        request,
+        **{**common, "external_sequence": external},
+    )
+    second = weighted_measure.prepare(
+        state,
+        options,
+        request,
+        **{**common, "external_sequence": dict(external)},
+    )
+    assert second is first
+    assert len(state.measure_plans) == 1
+    assert len(state.measure_biases) == 1
+
+    stale_external = dict(external)
+    stale_external["prefix_rows_per_frame"] = 64
+    with pytest.raises(ValueError, match="external-sequence"):
+        weighted_measure.prepare(
+            state,
+            options,
+            request,
+            **{**common, "external_sequence": stale_external},
+        )
+
+    stale_layout = SimpleNamespace(
+        seq_len=202,
+        segments=((0, 11, "text"), (11, 202, "video")),
+    )
+    with pytest.raises(ValueError, match="layout"):
+        weighted_measure.prepare(
+            state,
+            options,
+            request,
+            **{**common, "layout": stale_layout, "external_sequence": external},
+        )
+
+    assert len(state.measure_plans) == 1
     assert len(state.measure_biases) == 1
 
 
