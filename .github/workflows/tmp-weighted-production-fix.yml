@@ -1,0 +1,128 @@
+name: tmp-weighted-production-fix
+
+on:
+  push:
+    branches:
+      - mirror/pr9-weighted-bias-dtype-fix-20260911
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'Temporary weighted production receipt fix harness'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mirror/pr9-weighted-bias-dtype-fix-20260911
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Patch weighted receipt validation and test
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('sol_h3/interop.py')
+          text = path.read_text()
+          old = '''    def accept_receipts(self, receipts):
+              return bool(receipts) and all(
+                  len(item) == 3 and item[0] == "sol_h3" and item[2] in (
+                      "sol", "sol_external_mixed", "sol_external_mixed_measure", "dense_warmup",
+                      "vdn_local_sol", "vdn_dense_warmup",
+                      "vdn_local_native", "vdn_global_native", "vdn_anchor_native",
+                      "vdn_flex_masked_native", "external_sequence_native")
+                  for item in receipts)
+          '''
+          new = '''    def accept_receipts(self, receipts):
+              if not receipts:
+                  return False
+              plain_routes = {
+                  "sol", "sol_external_mixed", "sol_external_mixed_measure", "dense_warmup",
+                  "vdn_local_sol", "vdn_dense_warmup", "vdn_local_native", "vdn_global_native",
+                  "vdn_anchor_native", "vdn_flex_masked_native", "external_sequence_native",
+              }
+              from . import weighted_measure
+
+              for item in receipts:
+                  if not isinstance(item, tuple) or len(item) not in {3, 4} or item[0] != "sol_h3":
+                      return False
+                  route = item[2]
+                  if not isinstance(route, str):
+                      return False
+                  if len(item) == 3:
+                      if route not in plain_routes:
+                          return False
+                      continue
+
+                  if route == "sol_external_mixed_weighted_measure":
+                      expected_profile = weighted_measure.SPARSE_IMPLEMENTATION_PROFILE
+                      expected_route = weighted_measure.SPARSE_NUMERICAL_ROUTE
+                  elif route == "dense_warmup" or route.startswith("kernel_unavailable:"):
+                      expected_profile = weighted_measure.DENSE_IMPLEMENTATION_PROFILE
+                      expected_route = weighted_measure.DENSE_NUMERICAL_ROUTE
+                  else:
+                      return False
+
+                  fields = item[3]
+                  if not isinstance(fields, tuple) or len(fields) != 11:
+                      return False
+                  (
+                      key,
+                      call_token,
+                      owner_generation,
+                      semantic_digest,
+                      implementation_profile,
+                      numerical_route,
+                      q_rows,
+                      kv_rows,
+                      exact_range_digest,
+                      preprocess_digest,
+                      completed,
+                  ) = fields
+                  if (
+                      key != ATTENTION_MEASURE_KEY
+                      or not isinstance(call_token, tuple)
+                      or len(call_token) != 2
+                      or call_token[0] != "sol_h3_evaluation"
+                      or type(call_token[1]) is not int
+                      or call_token[1] < 0
+                      or not isinstance(owner_generation, str)
+                      or not owner_generation
+                      or not isinstance(semantic_digest, str)
+                      or not semantic_digest
+                      or implementation_profile != expected_profile
+                      or numerical_route != expected_route
+                      or type(q_rows) is not int
+                      or q_rows <= 0
+                      or type(kv_rows) is not int
+                      or kv_rows <= 0
+                      or not isinstance(exact_range_digest, str)
+                      or not exact_range_digest
+                      or not isinstance(preprocess_digest, str)
+                      or not preprocess_digest
+                      or completed is not True
+                  ):
+                      return False
+              return True
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one accept_receipts block, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+
+          Path('tests/test_weighted_history_receipts.py').write_text('''from types import SimpleNamespace\n\nfrom sol_h3 import interop, weighted_measure\n\n\ndef _plan(profile, route):\n    return SimpleNamespace(\n        owner_generation="owner-generation",\n        semantic_digest="semantic-digest",\n        implementation_profile=profile,\n        numerical_route=route,\n        q_rows=44958,\n        kv_rows=44958,\n        exact_range_digest="exact-range-digest",\n        preprocess_digest="preprocess-digest",\n    )\n\n\ndef _weighted_receipt(route, profile, numerical_route):\n    plan = _plan(profile, numerical_route)\n    return (\n        "sol_h3",\n        0,\n        route,\n        weighted_measure.receipt_fields(plan, call_token=1),\n    )\n\n\ndef test_history_policy_accepts_completed_weighted_dense_and_sparse_receipts():\n    policy = interop.HistoryPolicy(SimpleNamespace())\n    dense = _weighted_receipt(\n        "dense_warmup",\n        weighted_measure.DENSE_IMPLEMENTATION_PROFILE,\n        weighted_measure.DENSE_NUMERICAL_ROUTE,\n    )\n    sparse = _weighted_receipt(\n        "sol_external_mixed_weighted_measure",\n        weighted_measure.SPARSE_IMPLEMENTATION_PROFILE,\n        weighted_measure.SPARSE_NUMERICAL_ROUTE,\n    )\n    fallback = _weighted_receipt(\n        "kernel_unavailable:test",\n        weighted_measure.DENSE_IMPLEMENTATION_PROFILE,\n        weighted_measure.DENSE_NUMERICAL_ROUTE,\n    )\n    assert policy.accept_receipts((dense, sparse, fallback))\n\n\ndef test_history_policy_rejects_weighted_route_profile_mismatch_and_malformed_token():\n    policy = interop.HistoryPolicy(SimpleNamespace())\n    wrong_route = _weighted_receipt(\n        "sol_external_mixed_weighted_measure",\n        weighted_measure.DENSE_IMPLEMENTATION_PROFILE,\n        weighted_measure.DENSE_NUMERICAL_ROUTE,\n    )\n    assert not policy.accept_receipts((wrong_route,))\n\n    good = _weighted_receipt(\n        "dense_warmup",\n        weighted_measure.DENSE_IMPLEMENTATION_PROFILE,\n        weighted_measure.DENSE_NUMERICAL_ROUTE,\n    )\n    fields = list(good[3])\n    fields[1] = ("sol_h3_evaluation", True)\n    malformed = (*good[:3], tuple(fields))\n    assert not policy.accept_receipts((malformed,))\n\n\ndef test_history_policy_keeps_legacy_three_field_receipts():\n    policy = interop.HistoryPolicy(SimpleNamespace())\n    assert policy.accept_receipts((("sol_h3", 0, "dense_warmup"),))\n    assert not policy.accept_receipts((("sol_h3", 0, "unknown"),))\n''')
+          PY
+          python -m pip install -q pytest ruff
+          ruff check sol_h3/interop.py tests/test_weighted_history_receipts.py tests/test_weighted_bias_dtype.py
+          ruff format --check sol_h3/interop.py tests/test_weighted_history_receipts.py tests/test_weighted_bias_dtype.py
+          python -m pytest -q tests/test_weighted_history_receipts.py tests/test_weighted_bias_dtype.py
+      - name: Commit source and tests
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sol_h3/interop.py tests/test_weighted_history_receipts.py
+          git commit -m "Validate weighted Sol-H3 history receipts"
+          git push origin HEAD:mirror/pr9-weighted-bias-dtype-fix-20260911
