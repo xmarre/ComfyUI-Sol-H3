@@ -192,6 +192,20 @@ def prepare(
         elif shared is not plan.key_log_measure:
             plan = replace(plan, key_log_measure=shared)
         state.measure_plans[key] = plan
+    else:
+        # The plan cache intentionally excludes transient layout/external objects
+        # so identical geometry can reuse the O(T) measure buffer. Revalidate the
+        # current objects on every cache hit; otherwise a stale/foreign VDN
+        # external-sequence contract or changed H3 layout could bypass core's
+        # fail-closed geometry checks merely because the semantic request digest
+        # and numerical route stayed the same.
+        core.validate_h3(
+            request,
+            layout=context.layout,
+            q_rows=context.q_rows,
+            kv_rows=context.kv_rows,
+            external_sequence=context.external_sequence,
+        )
     return plan
 
 
