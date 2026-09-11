@@ -135,7 +135,12 @@ def _dense_reference(q, k, v, dense_attention, key_bias=None):
         if out.shape != expected:
             raise RuntimeError(f"Dense SOL reference returned {tuple(out.shape)}, expected {expected}")
         return out
-    bias = None if key_bias is None else key_bias.view(1, 1, 1, -1)
+    # ``attention_measure_v1`` deliberately owns an FP32 natural-log key vector,
+    # while production Sol-H3 Q/K/V are BF16. PyTorch SDPA requires an additive
+    # floating mask to match the query dtype on CUDA. Cast only the calibration
+    # view; the authoritative FP32 key-bias tensor remains unchanged for the CuTe
+    # weighted specialization and for plan/cache identity.
+    bias = None if key_bias is None else key_bias.to(dtype=q.dtype).view(1, 1, 1, -1)
     return F.scaled_dot_product_attention(q, k, v, attn_mask=bias).transpose(1, 2)
 
 
