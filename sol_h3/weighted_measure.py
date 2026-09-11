@@ -206,6 +206,13 @@ def prepare(
             kv_rows=context.kv_rows,
             external_sequence=context.external_sequence,
         )
+        exact_k_block_range = core.merge_exact_k_blocks(
+            request,
+            64,
+            context.existing_sink,
+        )
+        if exact_k_block_range != plan.exact_k_block_range:
+            raise RuntimeError("cached Sol-H3 attention-measure exact K range is stale")
     return plan
 
 
