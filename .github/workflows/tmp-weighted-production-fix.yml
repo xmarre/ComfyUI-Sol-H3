@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   patch:
-    if: github.event.head_commit.message == 'Fix weighted receipt harness indentation'
+    if: github.event.head_commit.message == 'Run weighted receipt harness without Torch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -113,7 +113,8 @@ jobs:
           ruff format sol_h3/interop.py tests/test_weighted_history_receipts.py tests/test_weighted_bias_dtype.py
           ruff check sol_h3/interop.py tests/test_weighted_history_receipts.py tests/test_weighted_bias_dtype.py
           ruff format --check sol_h3/interop.py tests/test_weighted_history_receipts.py tests/test_weighted_bias_dtype.py
-          python -m pytest -q tests/test_weighted_history_receipts.py tests/test_weighted_bias_dtype.py
+          python -m pytest -q tests/test_weighted_history_receipts.py
+          python -m py_compile tests/test_weighted_bias_dtype.py sol_h3/sparse.py
       - name: Commit source and tests
         run: |
           git config user.name "github-actions[bot]"
