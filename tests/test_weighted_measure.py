@@ -48,15 +48,18 @@ def test_register_rejects_foreign_provider_identity_owner(monkeypatch):
         weighted_measure.register(options, refresh_owned=True)
 
 
-def test_preprocess_digest_tracks_concrete_chain_identity_and_rejects_cycles():
+def test_preprocess_digest_tracks_numerical_chain_and_concrete_stateful_owners():
+    class Leaf:
+        pass
+
     def transform_a(q, k, v, heads, **kw):
         return q, k, v
 
     def transform_b(q, k, v, heads, **kw):
         return q, k, v
 
-    leaf_a = object()
-    leaf_b = object()
+    leaf_a = Leaf()
+    leaf_b = Leaf()
     provider_a = SimpleNamespace(attention_preprocess_v1=(transform_a, leaf_a))
     provider_b = SimpleNamespace(attention_preprocess_v1=(transform_a, leaf_b))
     provider_c = SimpleNamespace(attention_preprocess_v1=(transform_b, leaf_a))
@@ -66,8 +69,57 @@ def test_preprocess_digest_tracks_concrete_chain_identity_and_rejects_cycles():
     assert digest != weighted_measure.preprocess_digest(provider_b)
     assert digest != weighted_measure.preprocess_digest(provider_c)
 
+
+def test_preprocess_digest_stabilizes_factory_recreated_stateless_functions():
+    class Leaf:
+        pass
+
+    leaf = Leaf()
+
+    def factory():
+        # Mirrors the reviewed Untwist H3 preprocessing shape: the wrapper
+        # function is recreated per model invocation, but the preprocessor itself
+        # carries no closure/default state and reads execution state from kwargs.
+        def preprocess(q, k, v, heads, **kwargs):
+            options = kwargs.get("transformer_options")
+            return q, k, v if options is not None else v
+
+        return SimpleNamespace(attention_preprocess_v1=(preprocess, leaf))
+
+    first = factory()
+    second = factory()
+    assert first.attention_preprocess_v1[0] is not second.attention_preprocess_v1[0]
+    assert first.attention_preprocess_v1[0].__closure__ is None
+    assert weighted_measure.preprocess_digest(first) == weighted_measure.preprocess_digest(second)
+
+
+def test_preprocess_digest_keeps_stateful_recreated_functions_owner_bound():
+    class Leaf:
+        pass
+
+    leaf = Leaf()
+
+    def factory(scale):
+        def preprocess(q, k, v, heads, **kwargs):
+            return q, k * scale, v
+
+        return SimpleNamespace(attention_preprocess_v1=(preprocess, leaf))
+
+    first = factory(0.5)
+    second = factory(0.5)
+    assert first.attention_preprocess_v1[0].__closure__ is not None
+    assert weighted_measure.preprocess_digest(first) != weighted_measure.preprocess_digest(second)
+
+
+def test_preprocess_digest_rejects_unsafe_nonweakrefable_stateful_owner_and_cycles():
+    def transform(q, k, v, heads, **kw):
+        return q, k, v
+
+    with pytest.raises(RuntimeError, match="weak references"):
+        weighted_measure.preprocess_digest(SimpleNamespace(attention_preprocess_v1=(transform, object())))
+
     cycle = SimpleNamespace()
-    cycle.attention_preprocess_v1 = (transform_a, cycle)
+    cycle.attention_preprocess_v1 = (transform, cycle)
     with pytest.raises(RuntimeError, match="cyclic"):
         weighted_measure.preprocess_digest(cycle)
 
