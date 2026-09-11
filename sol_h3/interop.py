@@ -10,6 +10,7 @@ VDN_PREPROCESS_KEY = "vdn_attention_preprocess_v1"
 SPECTRUM_EXTERNAL_RUNTIME_KEY = "spectrum_h3_external_patch_runtime"
 FLOW_STAGE_KEY = "h3_flow_stage"
 FLOW_REFINEMENT_KEY = "h3_refinement"
+ATTENTION_MEASURE_KEY = "attention_measure_v1"
 
 
 def provider_name(provider):
@@ -18,10 +19,15 @@ def provider_name(provider):
     return f"{getattr(provider, '__module__', '<unknown>')}.{getattr(provider, '__qualname__', type(provider).__name__)}"
 
 
-def receipt(options, block, route):
+def receipt(options, block, route, *, measure_plan=None, call_token=None):
     sink = options.get(RECEIPTS_KEY)
-    if sink is not None:
+    if sink is None:
+        return
+    if measure_plan is None:
         sink.append(("sol_h3", block, route))
+        return
+    from .weighted_measure import receipt_fields
+    sink.append(("sol_h3", block, route, receipt_fields(measure_plan, call_token=call_token)))
 
 
 def _flow_progressive_high_continuation(options):
@@ -380,6 +386,10 @@ class HistoryPolicy:
         from .runtime import _REQUEST
         state = _REQUEST.get()
         if state is None:
+            return None
+        # Generic weighted measure becomes forecastable only after Spectrum
+        # binds its completed-receipt identity companion.
+        if options.get(ATTENTION_MEASURE_KEY) is not None:
             return None
         replacements = options.get("patches_replace", {}).get("dit", {})
         replacement_identity = []
