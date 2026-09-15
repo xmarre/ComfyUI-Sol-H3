@@ -53,6 +53,8 @@ def test_request_parser_is_strict_immutable_and_fail_closed():
         w.parse_request({**_options(), "vdn_h3_external_sequence_v1": object()})
     with pytest.raises(RuntimeError, match="weighted/Mixed-Grid"):
         w.parse_request({**_options(), "attention_measure_v1": object()})
+    with pytest.raises(RuntimeError, match="no-Untwist"):
+        w.parse_request({**_options(), "minimax_h3_untwist_rope": {"enabled": False}})
     with pytest.raises(RuntimeError, match="outside the high stage"):
         w.parse_request({**_options(), "h3_flow_stage": "low"})
 
