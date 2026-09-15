@@ -42,6 +42,7 @@ _ORIGINAL_RUNTIME_RECEIPT = None
 _ORIGINAL_BLOCK_CALL = None
 _DEBUG_COMPILED: dict[tuple[Any, ...], Any] = {}
 _LSE_COMPILED: dict[tuple[Any, ...], Any] = {}
+_REFERENCE_KEY_CHUNK = 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,7 +458,13 @@ def _frozen_route_reference(
     *,
     scale: float,
 ) -> dict[str, Any]:
-    """Streaming FP32 mixed exact/approx reference with kernel routes frozen."""
+    """Streaming FP32 mixed exact/approx reference with kernel routes frozen.
+
+    Score storage is capped to one Q64 tile by at most ``_REFERENCE_KEY_CHUNK``
+    exact rows or approximate blocks.  The first pass establishes one common
+    stable row maximum; the second accumulates numerator and denominator in that
+    shared scale.  No full QxKVxH score tensor is materialized.
+    """
     device = q.device
     q_blocks, heads, k_blocks = routes.shape
     tkv = int(k.shape[1])
@@ -466,59 +473,80 @@ def _frozen_route_reference(
     denominator_acc = _metric_accumulator(device)
     lse_acc = _metric_accumulator(device)
     finite = torch.ones((), device=device, dtype=torch.bool)
+    max_live_score_elements = 0
+
     for q_block in range(q_blocks):
         q_start = q_block * 64
         q_stop = min(int(q.shape[1]), q_start + 64)
         for head in range(heads):
             qh = q[0, q_start:q_stop, head].float()
             exact_blocks = routes[q_block, head]
-            row_mask = exact_blocks.repeat_interleave(64)[:tkv]
-            approx_blocks = ~exact_blocks
+            exact_rows_mask = exact_blocks.repeat_interleave(64)[:tkv]
+            exact_rows = exact_rows_mask.nonzero(as_tuple=False).flatten()
+            approx_blocks = (~exact_blocks).nonzero(as_tuple=False).flatten()
             row_max = torch.full((qh.shape[0],), -torch.inf, device=device, dtype=torch.float32)
-            exact_scores = None
-            approx_scores = None
-            if bool(row_mask.any().item()):
-                exact_scores = qh @ k[0, row_mask, head].float().T
-                exact_scores.mul_(float(scale))
-                row_max = torch.maximum(row_max, exact_scores.max(dim=1).values)
-            if bool(approx_blocks.any().item()):
-                approx_scores = qh @ kc[0, approx_blocks, head].float().T
-                approx_scores.mul_(float(scale))
-                row_max = torch.maximum(row_max, approx_scores.max(dim=1).values)
+
+            for offset in range(0, int(exact_rows.numel()), _REFERENCE_KEY_CHUNK):
+                row_ids = exact_rows[offset : offset + _REFERENCE_KEY_CHUNK]
+                scores = qh @ k[0, row_ids, head].float().T
+                scores.mul_(float(scale))
+                max_live_score_elements = max(max_live_score_elements, int(scores.numel()))
+                row_max = torch.maximum(row_max, scores.max(dim=1).values)
+                del scores
+            for offset in range(0, int(approx_blocks.numel()), _REFERENCE_KEY_CHUNK):
+                block_ids = approx_blocks[offset : offset + _REFERENCE_KEY_CHUNK]
+                scores = qh @ kc[0, block_ids, head].float().T
+                scores.mul_(float(scale))
+                max_live_score_elements = max(max_live_score_elements, int(scores.numel()))
+                row_max = torch.maximum(row_max, scores.max(dim=1).values)
+                del scores
+
             if not bool(torch.isfinite(row_max).all().item()):
                 raise RuntimeError("first-high Sol-local frozen-route reference produced no finite attention mass")
+
             denominator = torch.zeros_like(row_max)
             numerator = torch.zeros((qh.shape[0], qh.shape[1]), device=device, dtype=torch.float32)
-            if exact_scores is not None:
-                p = torch.exp(exact_scores - row_max[:, None])
-                denominator.add_(p.sum(dim=1))
-                numerator.add_(p @ v[0, row_mask, head].float())
-            if approx_scores is not None:
-                p = torch.exp(approx_scores - row_max[:, None])
-                block_ids = torch.arange(k_blocks, device=device)[approx_blocks]
+            for offset in range(0, int(exact_rows.numel()), _REFERENCE_KEY_CHUNK):
+                row_ids = exact_rows[offset : offset + _REFERENCE_KEY_CHUNK]
+                scores = qh @ k[0, row_ids, head].float().T
+                scores.mul_(float(scale))
+                probabilities = torch.exp(scores - row_max[:, None])
+                denominator.add_(probabilities.sum(dim=1))
+                numerator.add_(probabilities @ v[0, row_ids, head].float())
+                del scores, probabilities
+            for offset in range(0, int(approx_blocks.numel()), _REFERENCE_KEY_CHUNK):
+                block_ids = approx_blocks[offset : offset + _REFERENCE_KEY_CHUNK]
+                scores = qh @ kc[0, block_ids, head].float().T
+                scores.mul_(float(scale))
+                probabilities = torch.exp(scores - row_max[:, None])
                 lengths = (tkv - block_ids * 64).clamp(min=0, max=64).to(torch.float32)
-                denominator.add_((p * lengths[None, :]).sum(dim=1))
-                numerator.add_(p @ vc[0, approx_blocks, head].float())
+                denominator.add_((probabilities * lengths[None, :]).sum(dim=1))
+                numerator.add_(probabilities @ vc[0, block_ids, head].float())
+                del scores, probabilities
+
             reference = numerator / denominator[:, None]
             reference_lse = row_max + torch.log(denominator)
             got = sparse_output[0, q_start:q_stop, head].float()
             got_lse = kernel_lse[0, q_start:q_stop, head].float()
             kernel_denom_in_ref_scale = torch.exp(got_lse - row_max)
-            kernel_num_in_ref_scale = got * denominator[:, None]
+            kernel_num_in_ref_scale = got * kernel_denom_in_ref_scale[:, None]
             _accumulate_metric(output_acc, got, reference)
             _accumulate_metric(numerator_acc, kernel_num_in_ref_scale, numerator)
             _accumulate_metric(denominator_acc, kernel_denom_in_ref_scale, denominator)
             _accumulate_metric(lse_acc, got_lse, reference_lse)
             finite = finite & torch.isfinite(reference).all() & torch.isfinite(reference_lse).all()
+
     return {
         "finite": bool(finite.item()),
         "output": _finish_metric(output_acc),
         "numerator_scaled_to_reference_rowmax": _finish_metric(numerator_acc),
         "denominator_scaled_to_reference_rowmax": _finish_metric(denominator_acc),
         "lse": _finish_metric(lse_acc),
-        "reference": "FP32 streaming; exact routed rows plus zeroth-order KC/VC approximation",
+        "reference": "FP32 two-pass streaming; exact routed rows plus zeroth-order KC/VC approximation",
+        "score_chunk_keys": _REFERENCE_KEY_CHUNK,
+        "max_live_score_elements": max_live_score_elements,
+        "max_live_score_bytes_fp32": max_live_score_elements * 4,
     }
-
 
 def _append_provenance_once(options: dict[str, Any]) -> None:
     sink = options.get(EVIDENCE_KEY)
@@ -553,10 +581,30 @@ def _run_witness(
         raise RuntimeError("first-high Sol-local witness attention scale changed")
     if state.kernel is None:
         raise RuntimeError("first-high Sol-local witness requires the returned E call to load the real kernel first")
-    if getattr(state.kernel, "backend_name", None) != "cute_sm120" or getattr(state.kernel, "source_tree_verified", False) is not True:
+    if (
+        getattr(state.kernel, "backend_name", None) != "cute_sm120"
+        or getattr(state.kernel, "source_tree_verified", False) is not True
+    ):
         raise RuntimeError("first-high Sol-local witness did not execute the packaged verified SM120 backend")
 
     qb, kb, vb = (value.transpose(1, 2) for value in (q, k, v))
+    saved_q = record.get("q")
+    saved_k = record.get("k")
+    saved_v = record.get("v")
+    if not all(torch.is_tensor(value) and value.device.type == "cpu" for value in (saved_q, saved_k, saved_v)):
+        raise RuntimeError("first-high Sol-local witness lost its pre-scratch CPU Q/K/V preservation")
+    preserved_hashes = {
+        "q": _tensor_sha256_cpu(saved_q),
+        "k": _tensor_sha256_cpu(saved_k),
+        "v": _tensor_sha256_cpu(saved_v),
+    }
+    entry_hashes = {
+        "q": _tensor_sha256_cpu(qb[0]),
+        "k": _tensor_sha256_cpu(kb[0]),
+        "v": _tensor_sha256_cpu(vb[0]),
+    }
+    input_exact_on_entry = entry_hashes == preserved_hashes
+
     native = F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
     sparse_out = state.kernel(
         qb,
@@ -570,6 +618,7 @@ def _run_witness(
     )
 
     from ._vendor.sol_attn.preprocess import prepare
+    from .sparse import arithmetic_gate_passes
 
     kc, vc, threshold, _qbar_packaged = prepare(
         qb,
@@ -582,7 +631,7 @@ def _run_witness(
         valid_kv_tokens=int(kb.shape[1]),
         return_q_bar=True,
     )
-    debug_out, trace = _diagnostic_sm120_launch(
+    debug_out, sparse_trace = _diagnostic_sm120_launch(
         qb,
         kb,
         vb,
@@ -604,8 +653,27 @@ def _run_witness(
         sink_rows=group.original_sink_rows,
         trace=False,
     )
-    if not torch.equal(debug_out, lse_out) or not torch.equal(debug_out, sparse_out):
-        raise RuntimeError("first-high Sol-local debug/LSE specialization changed ordinary sparse output")
+    all_selected_debug_out, all_selected_trace = _diagnostic_sm120_launch(
+        qb,
+        kb,
+        vb,
+        kc,
+        vc,
+        threshold,
+        scale=group.scale,
+        sink_rows=group.kv_rows,
+        trace=True,
+    )
+
+    returned_bthd = returned.reshape(1, int(q.shape[2]), int(q.shape[1]), int(q.shape[3]))
+    debug_sparse_metrics = _metrics(debug_out, sparse_out)
+    lse_sparse_metrics = _metrics(lse_out, sparse_out)
+    debug_all_selected_metrics = _metrics(all_selected_debug_out, returned_bthd)
+    debug_specializations_conform = bool(
+        arithmetic_gate_passes(debug_sparse_metrics)
+        and arithmetic_gate_passes(lse_sparse_metrics)
+        and arithmetic_gate_passes(debug_all_selected_metrics)
+    )
 
     independent_kc, independent_vc, independent_threshold, qbar = _prepare_independent(
         qb, kb, vb, tau=float(config.tau), scale=float(group.scale)
@@ -616,7 +684,13 @@ def _run_witness(
         "threshold": _metrics(threshold, independent_threshold),
     }
     k_blocks = int(kc.shape[1])
-    traced_routes = _decode_route_trace(trace, k_blocks)
+    traced_routes = _decode_route_trace(sparse_trace, k_blocks)
+    all_selected_routes = _decode_route_trace(all_selected_trace, k_blocks)
+    expected_all_selected_pairs = int(traced_routes.shape[0]) * int(traced_routes.shape[1]) * k_blocks
+    all_selected_pairs = int(all_selected_routes.sum().item())
+    all_selected_trace_complete = bool(all_selected_routes.all().item())
+    sparse_selected_pairs = int(traced_routes.sum().item())
+
     independent_routes, column_means, margins, forced = _independent_routes(
         qbar,
         kc,
@@ -659,9 +733,13 @@ def _run_witness(
         lse,
         scale=group.scale,
     )
-    returned_bthd = returned.reshape(1, int(q.shape[2]), int(q.shape[1]), int(q.shape[3]))
     all_selected_vs_native = _metrics(returned_bthd, native)
-    from .sparse import arithmetic_gate_passes
+    exit_hashes = {
+        "q": _tensor_sha256_cpu(qb[0]),
+        "k": _tensor_sha256_cpu(kb[0]),
+        "v": _tensor_sha256_cpu(vb[0]),
+    }
+    input_exact_after_sidecars = exit_hashes == preserved_hashes
 
     record.update(
         {
@@ -671,26 +749,37 @@ def _run_witness(
             "kc": kc.detach().to(device="cpu", copy=True),
             "vc": vc.detach().to(device="cpu", copy=True),
             "threshold": threshold.detach().to(device="cpu", copy=True),
-            "route_trace": trace.detach().to(device="cpu", copy=True),
+            "route_trace": sparse_trace.detach().to(device="cpu", copy=True),
+            "all_selected_route_trace": all_selected_trace.detach().to(device="cpu", copy=True),
             "route_column_means": column_means.detach().to(device="cpu", copy=True),
             "route_margins": margins.detach().to(device="cpu", copy=True),
             "kernel_lse": lse.detach().to(device="cpu", copy=True),
+            "preserved_qkv_sha256": preserved_hashes,
+            "entry_qkv_sha256": entry_hashes,
+            "exit_qkv_sha256": exit_hashes,
+            "input_exact_on_entry": input_exact_on_entry,
+            "input_exact_after_sidecars": input_exact_after_sidecars,
             "all_selected_vs_native": all_selected_vs_native,
             "all_selected_arithmetic_gate_pass": bool(arithmetic_gate_passes(all_selected_vs_native)),
             "summary_metrics": summary_metrics,
             "route_trace_matches_independent": mismatch_count == 0,
             "route_mismatch_count": mismatch_count,
             "route_mismatch_examples": mismatch_examples,
+            "sparse_selected_block_pairs": sparse_selected_pairs,
+            "all_selected_selected_block_pairs": all_selected_pairs,
+            "all_selected_expected_block_pairs": expected_all_selected_pairs,
+            "all_selected_trace_complete": all_selected_trace_complete,
             "frozen_route_reference": frozen,
-            "debug_output_sha256": _tensor_sha256_cpu(debug_out.detach().to(device="cpu", copy=True)),
-            "debug_matches_ordinary_sparse": True,
+            "debug_sparse_vs_ordinary": debug_sparse_metrics,
+            "lse_specialization_vs_ordinary": lse_sparse_metrics,
+            "debug_all_selected_vs_returned": debug_all_selected_metrics,
+            "debug_specializations_conform": debug_specializations_conform,
             "packaged_backend": getattr(state.kernel, "backend_name", None),
             "packaged_source_tree_verified": getattr(state.kernel, "source_tree_verified", False),
             "completed": True,
         }
     )
     _append_provenance_once(options)
-
 
 def _install_sparse_patch() -> None:
     global _ORIGINAL_SPARSE_ATTENTION
@@ -811,6 +900,7 @@ def _install_history_patches() -> None:
                 forward = original
             return current_vdn(forward, options, layout)
 
+        vdn_history_identity.__dict__.update(getattr(current_vdn, "__dict__", {}))
         vdn_history_identity._first_high_sol_local_e_v1 = True
         vdn_history_identity._first_high_sol_local_original = current_vdn
         interop._vdn_history_identity = vdn_history_identity
