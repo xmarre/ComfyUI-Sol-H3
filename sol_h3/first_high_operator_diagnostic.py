@@ -1,9 +1,10 @@
 """Sol-H3 history/receipt contract for first-high operator comparison W.
 
 Ordinary Sol-H3 routing is unchanged when the namespaced Flow request is absent.
-For W, VDN owns the native-SDPA intervention while Sol owns the backend-history
-identity and acceptance of the two explicit local-native receipt kinds.  Sparse
-Sol-Attn is therefore never executed for W local calls.
+For W, VDN owns the support/complement intervention while Sol owns the local
+provider route and backend-history identity.  The diagnostic binds to the live
+BlockPatch v3 provider closure and records a distinct native-local route only
+after VDN's native SDPA succeeds; the sparse Sol-Attn body is never executed.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from collections.abc import Mapping
 from typing import Any
 
 REQUEST_KEY = "h3_first_high_operator_diagnostic_v1"
+VDN_PROVIDER_V3_KEY = "vdn_softmax_provider_v3"
 _ALLOWED_MODES = frozenset({"native_window", "native_full_support"})
 _REQUIRED_FIELDS = (
     "api",
@@ -87,28 +89,80 @@ def history_identity(options: Mapping[str, Any] | None):
     )
 
 
-def _diagnostic_receipt(item: Any) -> tuple | None:
-    if not isinstance(item, tuple) or len(item) != 4 or item[0] != "sol_h3":
-        return None
-    route = item[2]
+def _closure_values(function: Any) -> dict[str, Any]:
+    target = getattr(function, "__func__", function)
+    code = getattr(target, "__code__", None)
+    cells = getattr(target, "__closure__", None)
+    if code is None or cells is None or len(code.co_freevars) != len(cells):
+        return {}
+    result: dict[str, Any] = {}
+    for name, cell in zip(code.co_freevars, cells, strict=True):
+        try:
+            result[str(name)] = cell.cell_contents
+        except ValueError:
+            continue
+    return result
+
+
+def _provider_record(provider: Any):
+    """Resolve the reviewed BlockPatch-local receipt owner fail-closed."""
+    seen: set[int] = set()
+    pending = [provider]
+    while pending:
+        current = pending.pop()
+        if not callable(current) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        values = _closure_values(current)
+        record = values.get("record")
+        if callable(record):
+            return record
+        for value in values.values():
+            if callable(value):
+                pending.append(value)
+    raise RuntimeError("first-high operator diagnostic could not resolve the Sol BlockPatch receipt owner")
+
+
+def _provider_block_index(provider: Any) -> int:
+    record = _provider_record(provider)
+    owner = _closure_values(record).get("self")
+    index = getattr(owner, "index", None)
+    if type(index) is not int or index < 0:
+        raise RuntimeError("first-high operator diagnostic could not resolve the Sol block owner")
+    return index
+
+
+def record_native_local(
+    options: Mapping[str, Any],
+    block_index: int,
+    route: str,
+    request: Mapping[str, Any],
+) -> None:
+    """Record a completed VDN-native local call through the live Sol owner.
+
+    VDN calls this only after native SDPA returned successfully.  Resolving the
+    active v3 provider closure ties the diagnostic receipt to the actual
+    BlockPatch request/counter lifetime instead of fabricating a parallel sink.
+    """
+    active = parse_request(options)
+    if active is None or dict(active) != dict(request):
+        raise RuntimeError("first-high operator diagnostic Sol/VDN request identity diverged")
     expected_mode = _DIAGNOSTIC_ROUTES.get(route)
-    if expected_mode is None:
+    if expected_mode is None or expected_mode != active["mode"]:
+        raise RuntimeError("first-high operator diagnostic local route does not match the selected mode")
+    provider = options.get(VDN_PROVIDER_V3_KEY)
+    if not callable(provider):
+        raise RuntimeError("first-high operator diagnostic requires the live Sol VDN v3 provider")
+    if _provider_block_index(provider) != int(block_index):
+        raise RuntimeError("first-high operator diagnostic Sol/VDN block ownership diverged")
+    _provider_record(provider)(route)
+
+
+def _diagnostic_receipt(item: Any) -> tuple | None:
+    if not isinstance(item, tuple) or len(item) != 3 or item[0] != "sol_h3":
         return None
-    fields = item[3]
-    if not isinstance(fields, tuple) or len(fields) != 4:
-        raise RuntimeError("first-high operator diagnostic Sol receipt fields are malformed")
-    values = dict(fields)
-    if tuple(key for key, _value in fields) != ("capture_id", "mode", "source_contract_digest", "completed"):
-        raise RuntimeError("first-high operator diagnostic Sol receipt schema is malformed")
-    if not isinstance(values.get("capture_id"), str) or not values["capture_id"]:
-        raise RuntimeError("first-high operator diagnostic Sol receipt capture_id is invalid")
-    if values.get("mode") != expected_mode:
-        raise RuntimeError("first-high operator diagnostic Sol receipt mode/route disagree")
-    digest = values.get("source_contract_digest")
-    if not isinstance(digest, str) or len(digest) != 64 or any(ch not in _HEX for ch in digest):
-        raise RuntimeError("first-high operator diagnostic Sol receipt source digest is invalid")
-    if values.get("completed") is not True:
-        raise RuntimeError("first-high operator diagnostic Sol receipt is incomplete")
+    if item[2] not in _DIAGNOSTIC_ROUTES:
+        return None
     return (item[0], item[1], "vdn_local_native")
 
 
@@ -146,4 +200,4 @@ def _install_history_policy_patch() -> None:
 
 _install_history_policy_patch()
 
-__all__ = ["REQUEST_KEY", "history_identity", "parse_request"]
+__all__ = ["REQUEST_KEY", "history_identity", "parse_request", "record_native_local"]
