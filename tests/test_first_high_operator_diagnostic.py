@@ -67,6 +67,45 @@ def test_history_identity_distinguishes_w_arms_and_binds_capture_source_contract
     assert window[-1] == "b" * 64
 
 
+def test_history_forward_preserves_ordinary_vdn_identity_and_fails_closed():
+    def ordinary():
+        return None
+
+    assert w._history_forward(ordinary) is ordinary
+
+    def wrapped():
+        return None
+
+    wrapped._h3_first_high_operator_diagnostic_v1 = True
+    wrapped._h3_first_high_operator_original_forward = ordinary
+    assert w._history_forward(wrapped) is ordinary
+
+    def missing_original():
+        return None
+
+    missing_original._h3_first_high_operator_diagnostic_v1 = True
+    assert w._history_forward(missing_original) is None
+
+    def recursively_wrapped():
+        return None
+
+    recursively_wrapped._h3_first_high_operator_diagnostic_v1 = True
+    recursively_wrapped._h3_first_high_operator_original_forward = ordinary
+    ordinary._h3_first_high_operator_diagnostic_v1 = True
+    try:
+        assert w._history_forward(recursively_wrapped) is None
+    finally:
+        del ordinary._h3_first_high_operator_diagnostic_v1
+
+
+def test_vdn_history_identity_patch_is_installed_before_history_policy_use():
+    from sol_h3 import interop
+
+    patched = interop._vdn_history_identity
+    assert getattr(patched, "_first_high_operator_diagnostic_v1", False) is True
+    assert callable(getattr(patched, "_first_high_operator_original", None))
+
+
 def _live_provider(block_index, sink):
     class Owner:
         def __init__(self, index):
