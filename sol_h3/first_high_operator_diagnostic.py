@@ -70,6 +70,8 @@ def parse_request(options: Mapping[str, Any] | None) -> dict[str, Any] | None:
         raise RuntimeError("first-high operator diagnostic forbids external/reduced VDN sequence")
     if options.get("attention_measure_v1") is not None or options.get("h3_flow_mixed_grid_attention_measure_v1") is not None:
         raise RuntimeError("first-high operator diagnostic forbids weighted/Mixed-Grid attention")
+    if options.get("minimax_h3_untwist_rope") is not None:
+        raise RuntimeError("first-high operator diagnostic requires the no-Untwist R control")
     stage = options.get("h3_flow_stage")
     if stage not in {None, "high"}:
         raise RuntimeError("first-high operator diagnostic reached Sol outside the high stage")
