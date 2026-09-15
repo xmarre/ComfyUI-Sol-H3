@@ -47,7 +47,7 @@ def test_detailed_bthd_metrics_report_tile_head_p99_and_exact_worst_coordinate()
 
     assert metrics["finite"] is True
     assert metrics["max_abs"] == 1.0
-    assert metrics["p99_method"] == "exact_all_values"
+    assert metrics["method"] == "exact_all_values"
     assert metrics["sample_count"] == got.numel()
     assert metrics["worst_coordinate"] == {"row": 2, "q_block": 0, "head": 1, "dim": 2}
     assert len(metrics["per_head"]) == 2
