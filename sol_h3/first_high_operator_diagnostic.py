@@ -2,7 +2,7 @@
 
 Ordinary Sol-H3 routing is unchanged when the namespaced Flow request is absent.
 For W, VDN owns the support/complement intervention while Sol owns the local
-provider route and backend-history identity.  The diagnostic binds to the live
+provider route and backend-history identity. The diagnostic binds to the live
 BlockPatch v3 provider closure and records a distinct native-local route only
 after VDN's native SDPA succeeds; the sparse Sol-Attn body is never executed.
 """
@@ -30,6 +30,8 @@ _DIAGNOSTIC_ROUTES = {
     "vdn_local_native_full_w": "native_full_support",
 }
 _HEX = frozenset("0123456789abcdef")
+_VDN_WRAPPER_MARKER = "_h3_first_high_operator_diagnostic_v1"
+_VDN_ORIGINAL_FORWARD = "_h3_first_high_operator_original_forward"
 
 
 def parse_request(options: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -140,7 +142,7 @@ def record_native_local(
 ) -> None:
     """Record a completed VDN-native local call through the live Sol owner.
 
-    VDN calls this only after native SDPA returned successfully.  Resolving the
+    VDN calls this only after native SDPA returned successfully. Resolving the
     active v3 provider closure ties the diagnostic receipt to the actual
     BlockPatch request/counter lifetime instead of fabricating a parallel sink.
     """
@@ -164,6 +166,44 @@ def _diagnostic_receipt(item: Any) -> tuple | None:
     if item[2] not in _DIAGNOSTIC_ROUTES:
         return None
     return (item[0], item[1], "vdn_local_native")
+
+
+def _history_forward(forward: Any):
+    """Recover VDN's ordinary grouped closure from the exact W wrapper.
+
+    VDN's diagnostic construction wrapper is intentionally transparent when no
+    W request exists, but its closure shape is different from the production
+    ``vdn_forward`` closure that Sol's history policy audits. Forecast history
+    must therefore identify the exposed underlying production closure, not the
+    measurement wrapper itself. Unknown or recursively wrapped markers remain
+    opaque and force an actual evaluation.
+    """
+    if getattr(forward, _VDN_WRAPPER_MARKER, False) is not True:
+        return forward
+    original = getattr(forward, _VDN_ORIGINAL_FORWARD, None)
+    if not callable(original) or original is forward:
+        return None
+    if getattr(original, _VDN_WRAPPER_MARKER, False) is True:
+        return None
+    return original
+
+
+def _install_vdn_history_identity_patch() -> None:
+    from . import interop
+
+    original = interop._vdn_history_identity
+    if getattr(original, "_first_high_operator_diagnostic_v1", False):
+        return
+
+    def vdn_history_identity(forward, options, layout):
+        selected = _history_forward(forward)
+        if selected is None:
+            return None
+        return original(selected, options, layout)
+
+    vdn_history_identity._first_high_operator_diagnostic_v1 = True
+    vdn_history_identity._first_high_operator_original = original
+    interop._vdn_history_identity = vdn_history_identity
 
 
 def _install_history_policy_patch() -> None:
@@ -198,6 +238,7 @@ def _install_history_policy_patch() -> None:
     cls._first_high_operator_diagnostic_v1 = True
 
 
+_install_vdn_history_identity_patch()
 _install_history_policy_patch()
 
 __all__ = ["REQUEST_KEY", "history_identity", "parse_request", "record_native_local"]
