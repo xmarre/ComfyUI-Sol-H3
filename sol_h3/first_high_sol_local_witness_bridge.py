@@ -1,50 +1,17 @@
 """Internal witness-owner adapter for the bounded first-high Sol-local diagnostic.
 
 The production ``sparse.attention`` signature deliberately has no transformer
-options argument. E keeps that API unchanged: this diagnostic-only adapter
+options argument.  E keeps that API unchanged: this diagnostic-only adapter
 passes the clone-stable Flow evidence owner to the already-installed E wrapper
-only for the three preserved witness calls, strips the private keyword before
-delegating to the untouched production function, and aligns the bounded rich
-all-selected-vs-native metric payload with the production arithmetic-gate schema.
+only for the three preserved witness calls, and strips the private keyword before
+delegating to the untouched production function.
 """
 from __future__ import annotations
-
-import math
 
 from . import first_high_sol_local_diagnostic as diagnostic
 from . import sparse
 
 _INSTALLED = False
-
-
-def _install_metric_gate_contract() -> None:
-    current = diagnostic._detailed_bthd_metrics
-    if getattr(current, "_first_high_sol_local_gate_schema_v1", False):
-        return
-
-    def detailed_bthd_metrics_with_gate_schema(got, want):
-        metrics = current(got, want)
-        if not bool(metrics.get("finite")):
-            reference_peak_abs = math.nan
-            catastrophic_limit = math.nan
-        else:
-            reference_peak_abs = 0.0
-            tokens = int(want.shape[1])
-            for start in range(0, tokens, 64):
-                stop = min(tokens, start + 64)
-                tile_peak = float(want[0, start:stop].float().abs().max().item())
-                reference_peak_abs = max(reference_peak_abs, tile_peak)
-            catastrophic_limit = max(
-                sparse.ARITH_CATASTROPHIC_MAX_FLOOR,
-                sparse.ARITH_CATASTROPHIC_REFERENCE_PEAK_MULTIPLIER * reference_peak_abs,
-            )
-        metrics["reference_peak_abs"] = reference_peak_abs
-        metrics["catastrophic_max_abs_limit"] = catastrophic_limit
-        return metrics
-
-    detailed_bthd_metrics_with_gate_schema._first_high_sol_local_gate_schema_v1 = True
-    detailed_bthd_metrics_with_gate_schema._first_high_sol_local_inner = current
-    diagnostic._detailed_bthd_metrics = detailed_bthd_metrics_with_gate_schema
 
 
 def install() -> None:
@@ -57,8 +24,6 @@ def install() -> None:
     production = diagnostic._ORIGINAL_SPARSE_ATTENTION
     if not callable(production):
         raise RuntimeError("Sol-local witness bridge cannot resolve the production sparse attention owner")
-
-    _install_metric_gate_contract()
 
     def production_adapter(q, k, v, prefix, config, state, *args, diagnostic_transformer_options=None, **kwargs):
         _ = diagnostic_transformer_options
