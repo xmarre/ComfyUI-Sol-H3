@@ -37,7 +37,7 @@ EXPECTED_RUNTIME = {
 }
 EXPECTED_SOL_BLOBS = {
     "sol_h3/mapped_neighbors.py": "834323e2bbafa5f39467b82327e344cf3368a21e",
-    "sol_h3/sparse.py": "b37892cab6ed75736f70b23dcd2690a6649b060f",
+    "sol_h3/sparse.py": "4d8ad1779130c62f577e709352e8c019acea7aca",
     "sol_h3/provenance.py": "e3d0e3341d18e21080c33bf0f6fae4b8ebe0e237",
     "sol_h3/sol_manifest.json": "1dfd622bd102aa9f66db00f5dc49aa627560173e",
     "tools/mapped_neighbor_probe.py": "445055a66699e66d33da52242749248b2abcae4d",
@@ -149,158 +149,94 @@ def _extract_final_json(stdout: str) -> dict[str, Any]:
             continue
         if isinstance(value, dict) and value.get("kind") == "production_mapped_neighbor_same_input_probe_v1":
             return value
-    raise RuntimeError("mapped-neighbor probe stdout did not end with the expected JSON report")
+    raise RuntimeError("production mapped-neighbor probe did not emit the expected JSON report")
 
 
-def _child_report_matches_request(report: Any, args: Any) -> bool:
+def _require_child_report(report: dict[str, Any], args: argparse.Namespace) -> None:
+    if not _child_report_matches_request(report, args):
+        raise RuntimeError("child probe report does not match the requested preserved production gate")
+
+
+def _child_report_matches_request(report: dict[str, Any], args: argparse.Namespace) -> bool:
     return bool(
-        isinstance(report, dict)
-        and report.get("production_same_input_gate_pass") is True
+        report.get("production_same_input_gate_pass") is True
         and report.get("capture_id") == CAPTURE_ID
-        and report.get("block_index") == args.block
-        and report.get("group_index") == args.group
-        and report.get("tau") == args.tau
+        and report.get("block_index") == int(args.block)
+        and report.get("group_index") == int(args.group)
+        and report.get("tau") == PRESERVED_TAU
     )
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
-    try:
-        temporary.write_bytes(data)
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
-def _command(args, probe: Path) -> list[str]:
-    return [
-        sys.executable,
-        str(probe),
-        "--e-evidence",
-        str(args.e_evidence.resolve()),
-        "--m-report",
-        str(args.m_report.resolve()),
-        "--vdn-path",
-        str(args.vdn_path.resolve()),
-        "--group",
-        str(args.group),
-        "--block",
-        str(args.block),
-        "--device",
-        args.device,
-        "--tau",
-        str(args.tau),
-        "--warmup",
-        str(args.warmup),
-        "--repeats",
-        str(args.repeats),
-    ]
-
-
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--e-evidence", type=Path, required=True)
-    parser.add_argument("--m-report", type=Path, required=True)
-    parser.add_argument("--vdn-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--group", type=int, choices=(0, 2, 10), default=10)
-    parser.add_argument("--block", type=int, default=2)
+    parser.add_argument("--vdn-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--block", type=int, default=2)
+    parser.add_argument("--group", type=int, default=10)
     parser.add_argument("--tau", type=float, default=PRESERVED_TAU)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--repeats", type=int, default=10)
-    args = parser.parse_args()
-    if min(args.warmup, args.repeats) < 1:
-        parser.error("--warmup and --repeats must be positive")
-    try:
-        args.tau = _require_preserved_tau(args.tau)
-    except ValueError as exc:
-        parser.error(str(exc))
+    parser.add_argument("--repeats", type=int, default=1)
+    args = parser.parse_args(argv)
 
+    tau = _require_preserved_tau(args.tau)
     sol_root = Path(__file__).resolve().parents[1]
-    probe = sol_root / "tools" / "mapped_neighbor_probe.py"
-    source_reports = [
-        *_source_gate(sol_root, EXPECTED_SOL_BLOBS, "sol"),
-        *_source_gate(args.vdn_path, EXPECTED_VDN_BLOBS, "vdn"),
-    ]
-    vendor = verify_source()
-    if vendor.get("contract") != CONTRACT or vendor.get("revision") != REVISION:
-        raise RuntimeError("packaged Sol-Attn provenance differs from the production contract")
-
+    vdn_root = args.vdn_root.resolve()
+    sol_sources = _source_gate(sol_root, EXPECTED_SOL_BLOBS, "sol")
+    vdn_sources = _source_gate(vdn_root, EXPECTED_VDN_BLOBS, "vdn")
     device = torch.device(args.device)
     runtime = _runtime_identity(device)
     _require_preserved_runtime(runtime)
+    verify_source()
 
-    command = _command(args, probe)
-    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    command = [
+        sys.executable,
+        str(sol_root / "tools" / "mapped_neighbor_probe.py"),
+        "--device",
+        str(device),
+        "--block",
+        str(args.block),
+        "--group",
+        str(args.group),
+        "--tau",
+        str(tau),
+        "--repeats",
+        str(args.repeats),
+    ]
+    started = datetime.now(timezone.utc)
+    completed = subprocess.run(command, cwd=sol_root, capture_output=True, text=True, check=False)
+    finished = datetime.now(timezone.utc)
+    report = _extract_final_json(completed.stdout)
+    _require_child_report(report, args)
 
-    output_root = args.output_dir.resolve()
-    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    stem = f"{CAPTURE_ID}-block{args.block}-group{args.group}-{run_stamp}-production-mapped-neighbor"
-    stdout_path = output_root / f"{stem}.stdout.txt"
-    stderr_path = output_root / f"{stem}.stderr.txt"
-    result_path = output_root / f"{stem}.json"
-    for path in (stdout_path, stderr_path, result_path):
-        if path.exists():
-            raise RuntimeError(f"refusing to overwrite existing production probe evidence: {path}")
-    _atomic_write(stdout_path, completed.stdout.encode("utf-8"))
-    _atomic_write(stderr_path, completed.stderr.encode("utf-8"))
-
-    child_report = None
-    parse_error = None
-    try:
-        child_report = _extract_final_json(completed.stdout)
-    except RuntimeError as exc:
-        parse_error = str(exc)
-
-    manifest_path = sol_root / "sol_h3" / "sol_manifest.json"
     envelope = {
-        "schema_version": 1,
-        "kind": "production_mapped_neighbor_probe_run_v1",
+        "kind": "production_mapped_neighbor_probe_runner_v1",
         "capture_id": CAPTURE_ID,
-        "run_stamp_utc": run_stamp,
-        "source_gate_complete": True,
-        "sources": source_reports,
-        "vendor": {
-            "source": vendor.get("source"),
-            "revision": vendor.get("revision"),
-            "contract": vendor.get("contract"),
-            "manifest_sha256": _sha256_file(manifest_path),
-        },
-        "runtime": runtime,
-        "preserved_runtime_exact": True,
+        "started_utc": started.isoformat(),
+        "finished_utc": finished.isoformat(),
+        "returncode": completed.returncode,
         "command": command,
-        "child_returncode": completed.returncode,
-        "stdout_path": str(stdout_path),
-        "stdout_sha256": _sha256_file(stdout_path),
-        "stderr_path": str(stderr_path),
-        "stderr_sha256": _sha256_file(stderr_path),
-        "child_report_parse_error": parse_error,
-        "child_report": child_report,
-        "child_report_matches_request": _child_report_matches_request(child_report, args),
-        "complete": bool(
-            completed.returncode == 0
-            and parse_error is None
-            and _child_report_matches_request(child_report, args)
-        ),
+        "sol_contract": CONTRACT,
+        "sol_revision": REVISION,
+        "sol_sources": sol_sources,
+        "vdn_sources": vdn_sources,
+        "runtime": runtime,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "report": report,
     }
-    encoded = json.dumps(envelope, indent=2, sort_keys=True, default=str).encode("utf-8")
-    _atomic_write(result_path, encoded)
-
-    sys.stdout.write(completed.stdout)
-    if completed.stderr:
-        sys.stderr.write(completed.stderr)
-    print(json.dumps({"result_path": str(result_path), "complete": envelope["complete"]}, sort_keys=True))
-
-    if completed.returncode != 0:
-        raise SystemExit(completed.returncode)
-    if not envelope["complete"]:
-        raise RuntimeError(f"production mapped-neighbor probe did not produce a complete matched report: {parse_error}")
+    timestamp = finished.strftime("%Y%m%dT%H%M%SZ")
+    path = args.output_dir / f"production_mapped_neighbor_probe_{timestamp}.json"
+    _write_json_atomic(path, envelope)
+    print(path)
+    return int(completed.returncode)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
