@@ -72,6 +72,7 @@ class SolAttnForwardSm120:
         mVC: cute.Tensor,
         mThreshold: cute.Tensor,
         mKeyBias: cute.Tensor,
+        mMappedNeighborIntervals: cute.Tensor,
         mLSE: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
@@ -107,6 +108,18 @@ class SolAttnForwardSm120:
         threshold = cutlass.Float32(
             mThreshold[batch_idx, q_tile_idx, head_idx]
         )
+        mapped_start_block = cutlass.Int32(0)
+        mapped_end_block = cutlass.Int32(0)
+        if cutlass.const_expr(self.mapped_neighbors_enabled):
+            if warp == 0:
+                # Every lane in routing warp 0 reads the same two endpoints once.
+                # They remain register-resident across all route groups for this CTA.
+                mapped_start_block = cutlass.Int32(
+                    mMappedNeighborIntervals[q_tile_idx, 0]
+                )
+                mapped_end_block = cutlass.Int32(
+                    mMappedNeighborIntervals[q_tile_idx, 1]
+                )
 
         storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
         if warp == 0 and lane == 0:
@@ -425,15 +438,6 @@ class SolAttnForwardSm120:
             cute.arch.sync_threads()
 
             if warp == 0:
-                mapped_start_block = cutlass.Int32(0)
-                mapped_end_block = cutlass.Int32(0)
-                if cutlass.const_expr(self.mapped_neighbors_enabled):
-                    mapped_start_block = cutlass.Int32(
-                        mKeyBias[q_tile_idx, 0]
-                    )
-                    mapped_end_block = cutlass.Int32(
-                        mKeyBias[q_tile_idx, 1]
-                    )
                 preceding = cutlass.Int32(0)
                 lane_mask_lt = cutlass.Int32(0x7FFFFFFF) >> (
                     cutlass.Int32(31) - lane
@@ -723,6 +727,7 @@ class SolAttnForwardSm120:
         vc: cute.Tensor,
         threshold: cute.Tensor,
         key_bias: cute.Tensor,
+        mapped_neighbor_intervals: cute.Tensor,
         lse: cute.Tensor,
         softmax_scale: cutlass.Float32,
         sink_start_block: cutlass.Int32,
@@ -898,6 +903,7 @@ class SolAttnForwardSm120:
             tma_tensor_VC,
             threshold,
             key_bias,
+            mapped_neighbor_intervals,
             lse_target,
             tma_atom_Q,
             tma_atom_K,
