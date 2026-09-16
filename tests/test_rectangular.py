@@ -96,7 +96,7 @@ def test_cute_host_output_lse_sink_and_compile_cache(monkeypatch):
     assert len(compiles) == 3
     for _, shapes, start, end, key_bias_enabled, mapped_neighbors_enabled in compiles:
         assert shapes[3] == shapes[0]
-        assert shapes[8] == shapes[0][:3]  # LSE: [B,Tq,H]
+        assert shapes[9] == shapes[0][:3]  # LSE: [B,Tq,H]
         assert key_bias_enabled is False
         assert mapped_neighbors_enabled is False
         assert start == 0 and end == (shapes[1][1] + 63)//64
