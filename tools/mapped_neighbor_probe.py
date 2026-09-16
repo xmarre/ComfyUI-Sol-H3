@@ -623,6 +623,7 @@ def main() -> None:
             "capture_id": CAPTURE_ID,
             "block_index": args.block,
             "group_index": args.group,
+            "tau": args.tau,
             "device": torch.cuda.get_device_name(device),
             "compute_capability": list(torch.cuda.get_device_capability(device)),
             "torch": torch.__version__,
