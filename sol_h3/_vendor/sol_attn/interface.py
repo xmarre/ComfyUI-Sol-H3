@@ -10,6 +10,7 @@ import threading
 import torch
 
 BLOCK_SIZE = 64
+MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"
 _CUTE_BACKENDS = {
     (9, 0): "cute_sm90",
     (10, 0): "cute_sm100",
@@ -269,14 +270,16 @@ def _sol_attn_cute(
             dtype=torch.float32,
         )
         stream = _stream(q.device)
-        # CuTe specializes tensor layouts.  Shape alone is insufficient now that a caller may
-        # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
-        # descriptor for a strided view (or vice versa). Runtime mapped-neighbor interval values
-        # are deliberately absent from this key; only the structural mapped ABI is specialized.
+        # CuTe specializes tensor layouts. Shape alone is insufficient now that a caller may
+        # supply views into an interleaved packed QKV buffer. Mapped descriptor values remain
+        # runtime data; the compile key carries only the structural ABI/source contract.
         layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v))
+        mapped_profile = (
+            MAPPED_NEIGHBOR_CONTRACT if mapped_neighbor_intervals is not None else None
+        )
         key = (
             q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,
-            layout_key, key_bias is not None, mapped_neighbor_intervals is not None,
+            layout_key, key_bias is not None, mapped_profile,
         )
 
         if arch == (9, 0):
@@ -360,22 +363,22 @@ def _sol_attn_cute(
                 sink_start,
                 sink_tokens,
             )
-            # The existing SM120 key-bias tensor slot is mutually exclusive with
-            # mapped routing. Reusing it avoids any ordinary-path argument or
-            # allocation change while still passing the descriptor as a runtime
-            # CuTe tensor in the mapped specialization.
-            route_metadata_arg = (
-                key_bias
-                if key_bias is not None
-                else mapped_neighbor_intervals
+            key_bias_arg = key_bias if key_bias is not None else threshold
+            mapped_arg = (
+                mapped_neighbor_intervals
                 if mapped_neighbor_intervals is not None
                 else threshold
             )
-            tensors = [q, k, v, output, kc, vc, threshold, route_metadata_arg, lse]
+            # Disabled optional arguments reuse the already-live threshold tensor;
+            # ordinary and weighted calls allocate no mapped metadata.
+            tensors = [
+                q, k, v, output, kc, vc, threshold,
+                key_bias_arg, mapped_arg, lse,
+            ]
             compiled = _compiled.get(key)
             if compiled is None:
-                # CuTe's global compiled cache is shared by concurrent calls. Serialize
-                # only first compilation for one structural key and recheck under lock.
+                # CuTe's compiled cache is process-global. Serialize only first
+                # compilation for one structural key and recheck under the lock.
                 with _compile_lock:
                     compiled = _compiled.get(key)
                     if compiled is None:
@@ -423,7 +426,7 @@ def _pad_to_bucket(q, k, v, bucket_size: int):
     )
     padded = packed.split(q.shape[3], dim=-1)
     # Ulysses produces Q/K/V by splitting one contiguous [..., Q | K | V]
-    # allocation.  Recover that packed view and copy it in one launch.  The
+    # allocation. Recover that packed view and copy it in one launch. The
     # fallback retains support for callers that supply independent tensors.
     head_dim = q.shape[3]
     same_storage = (
@@ -450,7 +453,7 @@ def _pad_to_bucket(q, k, v, bucket_size: int):
     else:
         for destination, source in zip(padded, (q, k, v)):
             destination[:, :tokens].copy_(source)
-    # Only the bucket tail is unwritten.  Clearing it after copying avoids the
+    # Only the bucket tail is unwritten. Clearing it after copying avoids the
     # old full-capacity memset while preserving exactly the same padded values.
     packed[:, tokens:].zero_()
     return padded
