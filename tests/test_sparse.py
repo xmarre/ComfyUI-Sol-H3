@@ -148,7 +148,6 @@ def test_failed_arithmetic_never_counts_sparse(monkeypatch):
     assert state.sparse_calls == 0
 
 
-
 def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatch):
     calls = []
 
@@ -196,6 +195,39 @@ def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatc
     )
     assert len(calls) == 5
     assert len(state.gates) == 2
+
+
+def test_weighted_bridge_clamps_empty_exact_k_range_to_k_rows(monkeypatch):
+    calls = []
+
+    def kernel(q, k, v, **kw):
+        calls.append(kw)
+        bias = kw.get("key_bias")
+        mask = None if bias is None else bias.view(1, 1, 1, -1)
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: kernel)
+    q, k, v = (torch.randn(1, 2, 130, 128).to(torch.bfloat16) for _ in range(3))
+    bias = torch.zeros(130, dtype=torch.float32)
+    state = Request(Config(exact=False, backend="sol"))
+
+    out = sparse.attention(
+        q,
+        k,
+        v,
+        0,
+        state.config,
+        state,
+        key_bias=bias,
+        exact_k_blocks=(3, 3),
+        calibration_identity="empty-exact-range",
+    )
+
+    assert out.shape == (1, 130, 256)
+    assert [call["sink_tokens"] for call in calls] == [130, 0]
+    assert calls[-1]["sink_start"] == 130
 
 
 def test_weighted_bridge_rejects_bias_without_bound_route_metadata(monkeypatch):
