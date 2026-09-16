@@ -22,12 +22,16 @@ import sys
 from typing import Any
 
 PERFORMANCE_BUDGET_FRACTION = 0.05
+PRESERVED_TAU = 1.0
 _RUNTIME_MATCH_FIELDS = (
     "torch",
     "torch_cuda",
     "device_name",
     "compute_capability",
     "cutlass_dsl",
+    "cuda_python",
+    "triton",
+    "apache_tvm_ffi",
 )
 
 
@@ -118,6 +122,12 @@ def _candidate_geometry(candidate_report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _require_preserved_tau(value: Any) -> float:
+    if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) != PRESERVED_TAU:
+        raise ValueError(f"preserved M performance comparison requires tau={PRESERVED_TAU}, got {value!r}")
+    return PRESERVED_TAU
+
+
 def _positive_median(timing: Any, label: str) -> float:
     if not isinstance(timing, dict):
         raise RuntimeError(f"{label} timing report is missing")
@@ -198,12 +208,16 @@ def main() -> None:
     parser.add_argument("--group", type=int, choices=(0, 2, 10), default=10)
     parser.add_argument("--block", type=int, default=2)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--tau", type=float, default=PRESERVED_TAU)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
     if min(args.warmup, args.repeats) < 1:
         parser.error("--warmup and --repeats must be positive")
+    try:
+        args.tau = _require_preserved_tau(args.tau)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     root = Path(__file__).resolve().parents[1]
     current_runner = root / "tools" / "run_mapped_neighbor_probe.py"
@@ -242,6 +256,7 @@ def main() -> None:
         "run_stamp_utc": run_stamp,
         "block_index": args.block,
         "group_index": args.group,
+        "tau": args.tau,
         "warmup": args.warmup,
         "repeats": args.repeats,
         "candidate_command": candidate_command,
@@ -326,6 +341,8 @@ def main() -> None:
             raise RuntimeError("candidate and historical M descriptor identities differ")
         if candidate_geometry["query_positions_sha256"] != historical_report.get("query_positions_sha256"):
             raise RuntimeError("candidate and historical M query-position identities differ")
+        if candidate_report.get("tau") != PRESERVED_TAU or historical_report.get("tau") != PRESERVED_TAU:
+            raise RuntimeError("candidate and historical M reports do not preserve tau=1.0")
 
         candidate_timing = (candidate_report.get("warmed_kernel_timing") or {}).get("mapped")
         historical_timing = historical_report.get("warmed_m_timing")
