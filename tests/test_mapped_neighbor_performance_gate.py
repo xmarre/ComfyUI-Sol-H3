@@ -3,6 +3,9 @@ import json
 import pytest
 
 from tools.historical_m_timing_probe import (
+    HISTORICAL_SOURCE,
+    SANA_REVISION,
+    _historical_vendor_identity_matches,
     _m_summary_record,
     _require_preserved_tau as _require_historical_tau,
 )
@@ -75,6 +78,22 @@ def test_preserved_m_performance_gate_rejects_tau_drift():
             _require_preserved_tau(value)
         with pytest.raises(ValueError, match="requires tau=1.0"):
             _require_historical_tau(value)
+
+
+def test_historical_vendor_identity_accepts_frozen_v3_manifest_without_contract_field():
+    manifest = {
+        "source": HISTORICAL_SOURCE,
+        "revision": SANA_REVISION,
+        "files": {"interface.py": {"packaged_sha256": "a" * 64}},
+    }
+    assert _historical_vendor_identity_matches(manifest) is True
+
+    manifest["source"] = "other-source"
+    assert _historical_vendor_identity_matches(manifest) is False
+
+    manifest["source"] = HISTORICAL_SOURCE
+    manifest["revision"] = "0" * 40
+    assert _historical_vendor_identity_matches(manifest) is False
 
 
 def test_candidate_geometry_accepts_preserved_m_matched_descriptor():
