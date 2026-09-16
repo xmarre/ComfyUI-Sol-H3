@@ -247,7 +247,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     if exact_k_blocks is None:
         sink_start, sink_tokens = 0, prefix
     else:
-        sink_start = exact_k_blocks[0] * BLOCK_SIZE
+        sink_start = min(k.shape[2], exact_k_blocks[0] * BLOCK_SIZE)
         sink_end = min(k.shape[2], exact_k_blocks[1] * BLOCK_SIZE)
         sink_tokens = max(0, sink_end - sink_start)
     out = state.kernel(
