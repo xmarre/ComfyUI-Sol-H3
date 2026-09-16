@@ -213,6 +213,7 @@ def _detailed_bthd_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, A
     global_abs_sum = torch.zeros((), device=device, dtype=torch.float64)
     global_delta_sq = torch.zeros((), device=device, dtype=torch.float64)
     global_ref_sq = torch.zeros((), device=device, dtype=torch.float64)
+    global_ref_abs_max = torch.zeros((), device=device, dtype=torch.float32)
     global_max = torch.tensor(-1.0, device=device, dtype=torch.float32)
     global_max_row = torch.zeros((), device=device, dtype=torch.int64)
     global_max_head = torch.zeros((), device=device, dtype=torch.int64)
@@ -232,6 +233,7 @@ def _detailed_bthd_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, A
         global_abs_sum += abs_delta.double().sum()
         global_delta_sq += delta_sq.sum()
         global_ref_sq += ref_sq.sum()
+        global_ref_abs_max = torch.maximum(global_ref_abs_max, want_f.abs().max())
 
         head_abs_sum += abs_delta.double().sum(dim=(0, 2))
         head_delta_sq += delta_sq.sum(dim=(0, 2))
@@ -277,11 +279,25 @@ def _detailed_bthd_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, A
         )
     p99 = _sampled_p99_abs(got, want)
     total = max(tokens * heads * dim, 1)
+    finite_value = bool(finite.item())
+    if finite_value:
+        from .sparse import ARITH_CATASTROPHIC_MAX_FLOOR, ARITH_CATASTROPHIC_REFERENCE_PEAK_MULTIPLIER
+
+        reference_peak_abs = float(global_ref_abs_max.item())
+        catastrophic_limit = max(
+            ARITH_CATASTROPHIC_MAX_FLOOR,
+            ARITH_CATASTROPHIC_REFERENCE_PEAK_MULTIPLIER * reference_peak_abs,
+        )
+    else:
+        reference_peak_abs = math.nan
+        catastrophic_limit = math.nan
     result = {
-        "finite": bool(finite.item()),
+        "finite": finite_value,
         "max_abs": float(global_max.item()),
         "mean_abs": float((global_abs_sum / total).item()),
         "rel_l2": float(torch.sqrt(global_delta_sq / global_ref_sq.clamp_min(1.0e-24)).item()),
+        "reference_peak_abs": reference_peak_abs,
+        "catastrophic_max_abs_limit": catastrophic_limit,
         **p99,
         "worst_coordinate": {
             "row": int(global_max_row.item()),
