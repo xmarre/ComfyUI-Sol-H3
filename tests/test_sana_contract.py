@@ -11,15 +11,24 @@ import pytest
 import torch
 
 from sol_h3._vendor.sol_attn import interface
-from sol_h3.provenance import _manifest_name, verify_source, REVISION
-from tools.vendor_sol_attn import package_sources
+from sol_h3.provenance import CONTRACT, _manifest_name, verify_source, REVISION
+from tools.vendor_sol_attn import PATCHES, package_sources
 
 
 def test_provenance_and_node_local_imports():
     manifest = verify_source()
     assert manifest['revision'] == REVISION
-    patch = Path(__file__).resolve().parents[1] / 'tools/rectangular_sm120.patch'
-    assert hashlib.sha256(patch.read_bytes()).hexdigest() == manifest['packaged_patch_sha256']
+    assert manifest['contract'] == CONTRACT
+    rectangular_patch = Path(__file__).resolve().parents[1] / 'tools/rectangular_sm120.patch'
+    assert hashlib.sha256(rectangular_patch.read_bytes()).hexdigest() == manifest['packaged_patch_sha256']
+    assert manifest['patches'] == [
+        {
+            'label': label,
+            'path': patch.relative_to(Path(__file__).resolve().parents[1]).as_posix(),
+            'sha256': hashlib.sha256(patch.read_bytes()).hexdigest(),
+        }
+        for label, patch in PATCHES
+    ]
     root = Path(interface.__file__).parent
     assert len(manifest['files']) == 51
     raw_files = {}
@@ -54,7 +63,8 @@ def test_manifest_names_are_platform_independent():
 def test_public_api():
     assert tuple(inspect.signature(interface.sol_attn).parameters) == (
         'q', 'k', 'v', 'scale', 'tau', 'thresh_type', 'kv_splits',
-        'sink_tokens', 'sink_start', 'compile_bucket_size')
+        'sink_tokens', 'sink_start', 'compile_bucket_size', 'key_bias',
+        'mapped_neighbor_intervals')
     assert interface._backend_for_arch((12, 0), cute_available=True) == 'cute_sm120'
     assert interface._backend_for_arch((12, 0), cute_available=False) == 'triton'
     assert interface._backend_for_arch((10, 3), cute_available=True) == 'cute_sm100'
@@ -107,6 +117,7 @@ def test_bridge_calls_real_public_interface(monkeypatch):
     assert all(c[0] == (1, 65, 2, 128) and c[1] == torch.bfloat16 for c in calls)
     assert all(c[2]['scale'] == 128 ** -0.5 and c[2]['sink_start'] == 0 for c in calls)
     assert all(c[2]['thresh_type'] == 'diag' and c[2]['tau'] == 1.0 for c in calls)
+    assert all(c[2]['mapped_neighbor_intervals'] is None for c in calls)
     assert state.sparse_calls == 1
 
 
@@ -144,7 +155,7 @@ def test_tampered_source_cannot_claim_verified(tmp_path, monkeypatch):
     provenance = _copy_provenance_tree(tmp_path, monkeypatch)
     target = tmp_path / '_vendor/sol_attn/interface.py'
     target.write_text(target.read_text() + '\n# corrupt\n')
-    with pytest.raises(RuntimeError, match='hash mismatch: interface.py'):
+    with pytest.raises(RuntimeError, match='hash mismatch.*interface.py'):
         provenance.verify_source()
 
 
@@ -177,3 +188,57 @@ def test_missing_cute_counts_no_sparse_and_caches_reason(monkeypatch):
     assert len(attempts) == 1
     assert state.sparse_calls == 0
     assert state.kernel is None
+
+
+def test_weighted_public_api_is_sm120_only_and_validates_bias(monkeypatch):
+    q = torch.zeros(1, 65, 2, 128, dtype=torch.bfloat16)
+    monkeypatch.setattr(interface, '_validate_inputs', lambda *a, **k: (10, 0))
+    monkeypatch.setattr(interface, '_cute_runtime_available', lambda: True)
+    with pytest.raises(ValueError, match='cute_sm120 only'):
+        interface.sol_attn(q, q, q, key_bias=torch.zeros(65))
+
+    monkeypatch.setattr(interface, '_validate_inputs', lambda *a, **k: (12, 0))
+    with pytest.raises(ValueError, match='one natural-log value'):
+        interface.sol_attn(q, q, q, key_bias=torch.zeros(64))
+    with pytest.raises(ValueError, match='finite positive'):
+        interface.sol_attn(q, q, q, scale=0.0, key_bias=torch.zeros(65))
+
+
+def test_mapped_public_api_is_sm120_only_and_mutually_exclusive(monkeypatch):
+    q = torch.zeros(1, 65, 2, 128, dtype=torch.bfloat16)
+    mapped = torch.zeros(2, 2, dtype=torch.int32)
+    monkeypatch.setattr(interface, '_validate_inputs', lambda *a, **k: (10, 0))
+    monkeypatch.setattr(interface, '_cute_runtime_available', lambda: True)
+    with pytest.raises(ValueError, match='mapped_neighbor_intervals.*cute_sm120 only'):
+        interface.sol_attn(q, q, q, mapped_neighbor_intervals=mapped)
+
+    monkeypatch.setattr(interface, '_validate_inputs', lambda *a, **k: (12, 0))
+    with pytest.raises(ValueError, match='cannot be combined with key_bias'):
+        interface.sol_attn(
+            q, q, q,
+            key_bias=torch.zeros(65),
+            mapped_neighbor_intervals=mapped,
+        )
+    with pytest.raises(ValueError, match=r'ceil\(Tq/64\)'):
+        interface.sol_attn(q, q, q, mapped_neighbor_intervals=torch.zeros(1, 2, dtype=torch.int32))
+    with pytest.raises(ValueError, match='contiguous int32'):
+        interface.sol_attn(q, q, q, mapped_neighbor_intervals=torch.zeros(2, 2, dtype=torch.int64))
+
+
+def test_sm120_source_injects_bias_only_between_exact_mask_and_softmax():
+    source = (Path(interface.__file__).parent / 'sm120' / 'mainloop.py').read_text()
+    exact = source.index('mask_exact_scores(tSrS, tScS, block_len, q_len)')
+    inject = source.index('add_exact_key_bias(', exact)
+    softmax = source.index('row_scale = online_softmax(', inject)
+    assert exact < inject < softmax
+    assert 'key_bias[absolute_col]' in source
+
+
+def test_sm120_source_adds_mapped_neighbors_before_ballot_and_masking():
+    source = (Path(interface.__file__).parent / 'sm120' / 'mainloop.py').read_text()
+    selector = source.index('exact = sol_attn_route_is_exact(')
+    sink = source.index('kv_block >= sink_start_block', selector)
+    mapped = source.index('kv_block >= mapped_start_block', sink)
+    ballot = source.index('vote_ballot_sync(exact)', mapped)
+    mask = source.index('column_masks[off]', ballot)
+    assert selector < sink < mapped < ballot < mask

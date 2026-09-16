@@ -1,4 +1,5 @@
 """Small duck-typed contracts shared with optional attention/forecast providers."""
+
 from dataclasses import dataclass
 
 HISTORY_KEY = "attention_backend_history_v1"
@@ -6,35 +7,56 @@ RECEIPTS_KEY = "attention_backend_receipts_v1"
 VDN_KEY = "vdn_softmax_provider_v1"
 VDN_KEY_V2 = "vdn_softmax_provider_v2"
 VDN_KEY_V3 = "vdn_softmax_provider_v3"
+VDN_KEY_V4 = "vdn_softmax_provider_v4"
 VDN_PREPROCESS_KEY = "vdn_attention_preprocess_v1"
 SPECTRUM_EXTERNAL_RUNTIME_KEY = "spectrum_h3_external_patch_runtime"
 FLOW_STAGE_KEY = "h3_flow_stage"
 FLOW_REFINEMENT_KEY = "h3_refinement"
+ATTENTION_MEASURE_KEY = "attention_measure_v1"
 
 
 def provider_name(provider):
     if provider is None:
         return "comfy.default"
-    return f"{getattr(provider, '__module__', '<unknown>')}.{getattr(provider, '__qualname__', type(provider).__name__)}"
+    return (
+        f"{getattr(provider, '__module__', '<unknown>')}.{getattr(provider, '__qualname__', type(provider).__name__)}"
+    )
 
 
-def receipt(options, block, route):
+def receipt(options, block, route, *, measure_plan=None, call_token=None, fields=None):
+    if fields is not None and route == "vdn_local_sol_mapped_v1":
+        # This is called only after the mapped kernel returns successfully. Keep a
+        # small immutable proof on the request even if its device descriptor is
+        # later evicted from the bounded LRU; receipt acceptance must not rely on
+        # the current cache contents.
+        from .runtime import _REQUEST
+
+        state = _REQUEST.get()
+        if state is not None:
+            owned = getattr(state, "mapped_validated_receipts", None)
+            if owned is None:
+                owned = set()
+                state.mapped_validated_receipts = owned
+            owned.add((block, fields))
+
     sink = options.get(RECEIPTS_KEY)
-    if sink is not None:
+    if sink is None:
+        return
+    if fields is not None:
+        if measure_plan is not None:
+            raise RuntimeError("attention receipt cannot combine explicit and weighted fields")
+        sink.append(("sol_h3", block, route, fields))
+        return
+    if measure_plan is None:
         sink.append(("sol_h3", block, route))
+        return
+    from .weighted_measure import receipt_fields
+
+    sink.append(("sol_h3", block, route, receipt_fields(measure_plan, call_token=call_token)))
 
 
 def _flow_progressive_high_continuation(options):
-    """Recognize Flow's explicit later-stage continuation contract.
-
-    Flow splits one progressive trajectory into low/probe/high OUTER_SAMPLE
-    lifetimes so Spectrum can own history independently in each lifetime. Its
-    high-stage contract nevertheless states that this is a continuation at the
-    handoff sigma, not a fresh diffusion trajectory, and separately requires an
-    actual first high-stage model evaluation. Dense Sol-Attn warmup is a
-    trajectory-start policy, so it must not restart solely because Flow opened
-    this later sampler lifetime.
-    """
+    """Recognize Flow's explicit later-stage continuation contract."""
     if options.get(FLOW_STAGE_KEY) != "high":
         return False
     refinement = options.get(FLOW_REFINEMENT_KEY)
@@ -49,31 +71,17 @@ def _flow_progressive_high_continuation(options):
 
 
 def dense_evaluation_warmup(config, evaluation, options):
-    """Return whether the current evaluation is in Sol's trajectory warmup.
-
-    The audited Flow continuation can suppress only the default single dense
-    evaluation: its low stage necessarily consumed that trajectory-start anchor
-    before the high continuation begins. Larger user-requested warmups remain
-    request-local because Sol cannot prove how many of those evaluations were
-    consumed before an arbitrary handoff.
-    """
     continuation_consumed_default = bool(
-        config.dense_evaluations == 1
-        and _flow_progressive_high_continuation(options)
+        config.dense_evaluations == 1 and _flow_progressive_high_continuation(options)
     )
-    return bool(
-        evaluation < config.dense_evaluations
-        and not continuation_consumed_default
-    )
+    return bool(evaluation < config.dense_evaluations and not continuation_consumed_default)
 
 
 def _freeze_history_value(value):
-    """Turn small provider config/state into a stable hashable history identity."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, dict):
-        return tuple(sorted(
-            (str(key), _freeze_history_value(item)) for key, item in value.items()))
+        return tuple(sorted((str(key), _freeze_history_value(item)) for key, item in value.items()))
     if isinstance(value, (tuple, list)):
         return tuple(_freeze_history_value(item) for item in value)
     if isinstance(value, (set, frozenset)):
@@ -95,15 +103,83 @@ def _closure_values(function):
     return values
 
 
-def _vdn_history_identity(forward, options, layout):
-    """Describe known VDN routing without requiring VDN to own hybrid.py metadata.
+def _mapped_vdn_history_identity(forward, options, layout):
+    """Describe provider-v4 geometry without allocating CUDA metadata."""
+    describe = getattr(forward, "vdn_query_position_plan_v1", None)
+    if not callable(describe):
+        return False, None
+    summary = describe(options, layout)
+    if summary is None:
+        return True, None
+    if (
+        getattr(summary, "tag", None) != "vdn_query_position_plan_v1"
+        or type(getattr(summary, "schema", None)) is not int
+        or getattr(summary, "schema", None) != 1
+        or getattr(summary, "mode", None) not in {"native", "grouped"}
+        or not isinstance(getattr(summary, "owner_generation", None), str)
+        or not getattr(summary, "owner_generation", "")
+        or not isinstance(getattr(summary, "plan_digest", None), str)
+        or not isinstance(getattr(summary, "groups", None), tuple)
+    ):
+        return True, None
 
-    Newer/older VDN builds may publish ``attention_history_v1`` directly; prefer it.
-    The stack-compatible VDN overlay deliberately does not edit ``hybrid.py`` because
-    the audio-fidelity overlay owns that file. For the audited closure shape, grouped
-    routing is still deterministic from its captured config/backend, so expose that
-    identity here. Any unknown closure or Flex routing remains opaque/actual-only.
-    """
+    common_identity = (
+        summary.owner_generation,
+        summary.plan_digest,
+        getattr(summary, "seq_len", None),
+        getattr(summary, "video_start", None),
+        getattr(summary, "video_end", None),
+        getattr(summary, "num_frames", None),
+        getattr(summary, "tokens_per_frame", None),
+        getattr(summary, "anchor_frames", None),
+    )
+    if summary.mode == "native":
+        if summary.groups:
+            return True, None
+        return True, ("vdn_h3_native_query_position_plan_v1", *common_identity)
+
+    from .mapped_neighbors import MappingUnavailable, POLICY, compile_descriptor, validate_wire_map
+
+    group_identities = []
+    for wire in summary.groups:
+        try:
+            if not isinstance(wire, tuple) or len(wire) != 9:
+                return True, None
+            validated = validate_wire_map(
+                wire, q_rows=wire[5], kv_rows=wire[6], sink_rows=wire[7]
+            )
+            descriptor = compile_descriptor(validated)
+        except MappingUnavailable:
+            # A bounded mapping fallback is actual-only in history-v1.
+            return True, None
+        if validated.owner_generation != summary.owner_generation or validated.plan_digest != summary.plan_digest:
+            return True, None
+        route_class = "ordinal_existing" if descriptor is None else "mapped_neighbor_additive"
+        group_identities.append(
+            (
+                validated.group_index,
+                validated.q_rows,
+                validated.kv_rows,
+                validated.sink_rows,
+                validated.map_digest,
+                None if descriptor is None else descriptor.descriptor_digest,
+                route_class,
+            )
+        )
+    return True, (
+        "vdn_h3_grouped_query_positions_v1",
+        *common_identity,
+        POLICY,
+        tuple(group_identities),
+    )
+
+
+def _vdn_history_identity(forward, options, layout):
+    """Describe known VDN routing, preferring the explicit provider-v4 plan hook."""
+    has_mapped_hook, mapped = _mapped_vdn_history_identity(forward, options, layout)
+    if has_mapped_hook:
+        return mapped
+
     describe = getattr(forward, "attention_history_v1", None)
     if callable(describe):
         return describe(options, layout)
@@ -116,9 +192,6 @@ def _vdn_history_identity(forward, options, layout):
     base_branch = values.get("base_branch")
     backend = getattr(state, "softmax_backend", None)
     if backend != "grouped" or not isinstance(cfg, dict):
-        # Flex can fail into grouped at runtime, so its next numerical route is not
-        # preflight-provable. Unknown backends likewise execute actuals rather than
-        # being rejected or forecast across an opaque transition.
         return None
     if state is None or getattr(state, "cfg", cfg) is not cfg:
         return None
@@ -136,14 +209,6 @@ def _vdn_history_identity(forward, options, layout):
 
 
 def _diffaid_runtime_identity(options):
-    """Return stable Diff-Aid instance identities published to transformer options.
-
-    Diff-Aid's Spectrum compatibility layer publishes one runtime entry per active
-    MiniMax-H3 patch instance before Spectrum preflights attention history. The
-    normalized sigma in that payload is intentionally excluded: Spectrum already
-    owns patch-regime transitions, while Sol-H3 only needs proof that a known
-    activation-only replacement is the wrapper around its block patch.
-    """
     raw = options.get(SPECTRUM_EXTERNAL_RUNTIME_KEY)
     if raw is None:
         return ()
@@ -162,13 +227,6 @@ def _diffaid_runtime_identity(options):
 
 
 def _diffaid_replacement_identity(patch, options):
-    """Recognize the audited MiniMax-H3 Diff-Aid activation-only block wrapper.
-
-    This deliberately requires Diff-Aid's per-call Spectrum runtime declaration.
-    A same-named or structurally similar wrapper without that declaration remains
-    opaque. The replacement itself only modulates ``args['img']`` and delegates to
-    ``existing_patch``/``original_block``; it does not own attention routing.
-    """
     if type(patch).__name__ != "MiniMaxH3BlockReplacePatch":
         return None
     runtime_identity = _diffaid_runtime_identity(options)
@@ -176,8 +234,13 @@ def _diffaid_replacement_identity(patch, options):
         return None
     config = getattr(patch, "config", None)
     fields = (
-        "strength", "sigma_start", "sigma_end", "sigma_ramp",
-        "token_weight_mode", "token_tail", "cond_only",
+        "strength",
+        "sigma_start",
+        "sigma_end",
+        "sigma_ramp",
+        "token_weight_mode",
+        "token_tail",
+        "cond_only",
     )
     if config is None or any(not hasattr(config, name) for name in fields):
         return None
@@ -189,15 +252,6 @@ def _diffaid_replacement_identity(patch, options):
 
 
 def _flow_layout_replacement_identity(patch, block_index):
-    """Recognize Flow v0.3.x's marked generic H3 layout/context wrapper.
-
-    ``patch_flow_model`` installs this wrapper around block 0 even when Flow's
-    optional attention modes are disabled. The wrapper only publishes the already
-    known packed layout/layer as temporary transformer context, records metrics,
-    delegates to the previous replacement, and restores the prior context. Flow
-    explicitly marks the wrapper and its previous link. Validate both those public
-    markers and the real closure captures so same-named lookalikes remain opaque.
-    """
     module = str(getattr(patch, "__module__", ""))
     qualname = str(getattr(patch, "__qualname__", ""))
     if not (
@@ -237,16 +291,6 @@ def _flow_layout_replacement_identity(patch, block_index):
 
 
 def _flow_mixed_grid_replacement_identity(patch, block_index):
-    """Recognize Flow v0.3.x's audited exact-prefix mixed-grid block wrapper.
-
-    Flow constructs one wrapper per H3 block immediately outside the existing DiT
-    replacement chain. The wrapper deterministically changes only the block-local
-    packed geometry/RoPE/modulation metadata, publishes VDN external-sequence API 2,
-    and then delegates to the previous replacement. Spectrum preflights before the
-    wrapper executes, so treating this known closure as opaque would turn every
-    scheduler forecast into an actual transformer NFE. Describe the geometry here
-    without executing the wrapper; unknown or malformed closures remain opaque.
-    """
     module = str(getattr(patch, "__module__", ""))
     qualname = str(getattr(patch, "__qualname__", ""))
     if not (
@@ -330,12 +374,6 @@ def _flow_mixed_grid_replacement_identity(patch, block_index):
 
 
 def _replacement_history_identity(patch, block_index, config, options):
-    """Describe one proven-transparent replacement chain containing Sol-H3 once.
-
-    Unknown replacement wrappers remain opaque. This is intentionally stricter
-    than merely observing a previous successful receipt: a forecast skips the
-    transformer and therefore cannot discover a later wrapper-owned route change.
-    """
     from .runtime import BlockPatch
 
     current = patch
@@ -374,12 +412,12 @@ class HistoryPolicy:
     config: object
 
     def __call__(self, *, layout, options, model):
-        # Called BEFORE Spectrum decides whether to use an anchor. Never advances
-        # actual counters. A policy that cannot prove its next routing returns None;
-        # Spectrum executes that call and does not forecast across opaque routing.
         from .runtime import _REQUEST
+
         state = _REQUEST.get()
         if state is None:
+            return None
+        if options.get(ATTENTION_MEASURE_KEY) is not None:
             return None
         replacements = options.get("patches_replace", {}).get("dit", {})
         replacement_identity = []
@@ -398,25 +436,146 @@ class HistoryPolicy:
                     return None
                 vdn.append(identity)
         signature = getattr(layout, "signature", None)
-        phase = "dense" if dense_evaluation_warmup(
-            self.config, state.evaluations, options
-        ) else "sol"
-        return (self.config.metadata()["fingerprint"], phase, repr(signature),
-                getattr(layout, "seq_len", None), tuple(getattr(layout, "segments", ())),
-                str(getattr(model, "dtype", None)), tuple(replacement_identity),
-                provider_identity(
-                    options.get("optimized_attention_override"),
-                    state.disabled_dense_providers,
-                ), tuple(vdn))
+        phase = "dense" if dense_evaluation_warmup(self.config, state.evaluations, options) else "sol"
+        return (
+            self.config.metadata()["fingerprint"],
+            phase,
+            repr(signature),
+            getattr(layout, "seq_len", None),
+            tuple(getattr(layout, "segments", ())),
+            str(getattr(model, "dtype", None)),
+            tuple(replacement_identity),
+            provider_identity(
+                options.get("optimized_attention_override"),
+                state.disabled_dense_providers,
+            ),
+            tuple(vdn),
+        )
 
     def accept_receipts(self, receipts):
-        return bool(receipts) and all(
-            len(item) == 3 and item[0] == "sol_h3" and item[2] in (
-                "sol", "sol_external_mixed", "sol_external_mixed_measure", "dense_warmup",
-                "vdn_local_sol", "vdn_dense_warmup",
-                "vdn_local_native", "vdn_global_native", "vdn_anchor_native",
-                "vdn_flex_masked_native", "external_sequence_native")
-            for item in receipts)
+        if not receipts:
+            return False
+        plain_routes = {
+            "sol",
+            "sol_external_mixed",
+            "sol_external_mixed_measure",
+            "dense_warmup",
+            "vdn_local_sol",
+            "vdn_dense_warmup",
+            "vdn_local_native",
+            "vdn_global_native",
+            "vdn_anchor_native",
+            "vdn_flex_masked_native",
+            "external_sequence_native",
+        }
+        from . import weighted_measure
+        from .mapped_neighbors import POLICY, RECEIPT_TAG
+        from .runtime import _REQUEST
+
+        state = _REQUEST.get()
+        owned_mapped = getattr(state, "mapped_validated_receipts", set()) if state is not None else set()
+
+        for item in receipts:
+            if not isinstance(item, tuple) or len(item) not in {3, 4} or item[0] != "sol_h3":
+                return False
+            if type(item[1]) is not int or item[1] < 0:
+                return False
+            route = item[2]
+            if not isinstance(route, str):
+                return False
+            if len(item) == 3:
+                # Mapping fallbacks are deliberately actual-only in history v1.
+                if route.startswith("vdn_local_native_mapping:"):
+                    return False
+                if route not in plain_routes:
+                    return False
+                continue
+
+            fields = item[3]
+            if route == "vdn_local_sol_mapped_v1":
+                if not isinstance(fields, tuple) or len(fields) != 12:
+                    return False
+                (
+                    key,
+                    owner_generation,
+                    plan_digest,
+                    group_index,
+                    q_rows,
+                    kv_rows,
+                    sink_rows,
+                    map_digest,
+                    descriptor_digest,
+                    policy,
+                    kernel_contract,
+                    completed,
+                ) = fields
+                if (
+                    key != RECEIPT_TAG
+                    or not isinstance(owner_generation, str) or not owner_generation
+                    or not isinstance(plan_digest, str) or len(plan_digest) != 64
+                    or type(group_index) is not int or group_index < 0
+                    or type(q_rows) is not int or q_rows <= 0
+                    or type(kv_rows) is not int or kv_rows <= 0
+                    or type(sink_rows) is not int or not 0 <= sink_rows <= kv_rows
+                    or not isinstance(map_digest, str) or len(map_digest) != 64
+                    or not isinstance(descriptor_digest, str) or len(descriptor_digest) != 64
+                    or policy != POLICY
+                    or not isinstance(kernel_contract, str) or not kernel_contract
+                    or completed is not True
+                    or (item[1], fields) not in owned_mapped
+                ):
+                    return False
+                continue
+
+            if route == "sol_external_mixed_weighted_measure":
+                expected_profile = weighted_measure.SPARSE_IMPLEMENTATION_PROFILE
+                expected_route = weighted_measure.SPARSE_NUMERICAL_ROUTE
+            elif route == "dense_warmup" or route.startswith("kernel_unavailable:"):
+                expected_profile = weighted_measure.DENSE_IMPLEMENTATION_PROFILE
+                expected_route = weighted_measure.DENSE_NUMERICAL_ROUTE
+            else:
+                return False
+
+            if not isinstance(fields, tuple) or len(fields) != 11:
+                return False
+            (
+                key,
+                call_token,
+                owner_generation,
+                semantic_digest,
+                implementation_profile,
+                numerical_route,
+                q_rows,
+                kv_rows,
+                exact_range_digest,
+                preprocess_digest,
+                completed,
+            ) = fields
+            if (
+                key != ATTENTION_MEASURE_KEY
+                or not isinstance(call_token, tuple)
+                or len(call_token) != 2
+                or call_token[0] != "sol_h3_evaluation"
+                or type(call_token[1]) is not int
+                or call_token[1] < 0
+                or not isinstance(owner_generation, str)
+                or not owner_generation
+                or not isinstance(semantic_digest, str)
+                or not semantic_digest
+                or implementation_profile != expected_profile
+                or numerical_route != expected_route
+                or type(q_rows) is not int
+                or q_rows <= 0
+                or type(kv_rows) is not int
+                or kv_rows <= 0
+                or not isinstance(exact_range_digest, str)
+                or not exact_range_digest
+                or not isinstance(preprocess_digest, str)
+                or not preprocess_digest
+                or completed is not True
+            ):
+                return False
+        return True
 
 
 def provider_identity(provider, disabled_dense_providers=()):
