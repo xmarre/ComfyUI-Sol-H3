@@ -28,8 +28,9 @@ def test_sm120_weighted_cache_separates_specialization_and_rebinds_bias_buffer(m
     compiles = []
     launches = []
 
-    def compile_(key, tensors, scale, start, end, stream, key_bias_enabled):
-        compiles.append((key, key_bias_enabled, start, end))
+    def compile_(key, tensors, scale, start, end, stream,
+                 key_bias_enabled, mapped_neighbors_enabled):
+        compiles.append((key, key_bias_enabled, mapped_neighbors_enabled, start, end))
 
         def compiled(*args, **kwargs):
             launches.append(args)
@@ -64,9 +65,12 @@ def test_sm120_weighted_cache_separates_specialization_and_rebinds_bias_buffer(m
     # Biased and unweighted kernels are different CuTe specializations, but
     # changing only values in an identically laid-out immutable bias vector
     # reuses the compiled weighted descriptor and passes the current buffer.
-    assert [(enabled, start, end) for _, enabled, start, end in compiles] == [
-        (True, 0, 3),
-        (False, 0, 3),
+    assert [
+        (bias_enabled, mapped_enabled, start, end)
+        for _, bias_enabled, mapped_enabled, start, end in compiles
+    ] == [
+        (True, False, 0, 3),
+        (False, False, 0, 3),
     ]
     assert launches[0][7] is bias_a
     assert launches[1][7] is bias_b
