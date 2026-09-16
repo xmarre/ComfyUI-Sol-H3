@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sol_h3 import mapped_neighbors
 from sol_h3._vendor.sol_attn import interface
 from sol_h3.contracts import Config
-from sol_h3 import mapped_neighbors
 from sol_h3.mapped_neighbors import (
     MappingUnavailable,
     POLICY,
