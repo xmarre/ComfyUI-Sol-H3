@@ -258,7 +258,9 @@ def device_descriptor(state: Any, plan: DescriptorPlan, device: Any):
 
     CUDA cache hits are synchronized to the current stream with the creation
     event. CPU descriptors use the same request-local cache without touching any
-    CUDA API, which keeps CPU oracle/integration paths valid.
+    CUDA API, which keeps CPU oracle/integration paths valid. CUDA current-device
+    state is scoped to the descriptor device so graph-capture checks and event
+    creation cannot observe an unrelated current GPU.
     """
     import torch
 
@@ -267,17 +269,24 @@ def device_descriptor(state: Any, plan: DescriptorPlan, device: Any):
     key = descriptor_cache_key(plan, device)
     hit = cache.get(key)
     if device.type == "cuda":
-        current = torch.cuda.current_stream(device)
-        if hit is not None:
-            cache.move_to_end(key)
-            tensor, event, _size = hit
-            if event is None:
-                raise RuntimeError("CUDA mapped-neighbor descriptor cache entry is missing its stream event")
-            current.wait_event(event)
+        with torch.cuda.device(device):
+            current = torch.cuda.current_stream()
+            if hit is not None:
+                cache.move_to_end(key)
+                tensor, event, _size = hit
+                if event is None:
+                    raise RuntimeError("CUDA mapped-neighbor descriptor cache entry is missing its stream event")
+                current.wait_event(event)
+                tensor.record_stream(current)
+                return tensor
+            if torch.cuda.is_current_stream_capturing():
+                raise MappingUnavailable("backend")
+            tensor = torch.tensor(plan.intervals, dtype=torch.int32, device=device).contiguous()
+            if tensor.ndim != 2 or tensor.shape[1] != 2:
+                raise RuntimeError("mapped-neighbor descriptor tensor has an invalid shape")
+            event = torch.cuda.Event()
+            event.record(current)
             tensor.record_stream(current)
-            return tensor
-        if torch.cuda.is_current_stream_capturing():
-            raise MappingUnavailable("backend")
     else:
         current = None
         if hit is not None:
@@ -286,15 +295,11 @@ def device_descriptor(state: Any, plan: DescriptorPlan, device: Any):
             if event is not None:
                 raise RuntimeError("non-CUDA mapped-neighbor descriptor cache entry has a CUDA stream event")
             return tensor
+        tensor = torch.tensor(plan.intervals, dtype=torch.int32, device=device).contiguous()
+        if tensor.ndim != 2 or tensor.shape[1] != 2:
+            raise RuntimeError("mapped-neighbor descriptor tensor has an invalid shape")
+        event = None
 
-    tensor = torch.tensor(plan.intervals, dtype=torch.int32, device=device).contiguous()
-    if tensor.ndim != 2 or tensor.shape[1] != 2:
-        raise RuntimeError("mapped-neighbor descriptor tensor has an invalid shape")
-    event = None
-    if current is not None:
-        event = torch.cuda.Event()
-        event.record(current)
-        tensor.record_stream(current)
     size = int(tensor.numel()) * int(tensor.element_size())
     if size > MAX_DEVICE_CACHE_BYTES:
         raise MappingUnavailable("metadata_budget")
