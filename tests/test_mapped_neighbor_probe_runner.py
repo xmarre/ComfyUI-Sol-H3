@@ -1,15 +1,19 @@
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tools.run_mapped_neighbor_probe import (
+    CAPTURE_ID,
     EXPECTED_RUNTIME,
     EXPECTED_SOL_BLOBS,
     EXPECTED_VDN_BLOBS,
+    _child_report_matches_request,
     _extract_final_json,
     _git_blob_sha,
     _require_preserved_runtime,
+    _require_preserved_tau,
     _source_gate,
 )
 
@@ -47,6 +51,36 @@ def test_preserved_runtime_gate_is_exact():
     changed["cutlass_dsl"] = "4.7.2"
     with pytest.raises(RuntimeError, match="preserved M runtime"):
         _require_preserved_runtime(changed)
+
+
+def test_preserved_tau_gate_rejects_same_input_drift():
+    assert _require_preserved_tau(1.0) == 1.0
+    for value in (0.9, 1.1, float("nan"), True, "1.0"):
+        with pytest.raises(ValueError, match="requires tau=1.0"):
+            _require_preserved_tau(value)
+
+
+def test_child_report_must_match_requested_capture_block_group_and_tau():
+    args = SimpleNamespace(block=2, group=10, tau=1.0)
+    report = {
+        "production_same_input_gate_pass": True,
+        "capture_id": CAPTURE_ID,
+        "block_index": 2,
+        "group_index": 10,
+        "tau": 1.0,
+    }
+    assert _child_report_matches_request(report, args) is True
+
+    for key, value in (
+        ("capture_id", "wrong"),
+        ("block_index", 3),
+        ("group_index", 2),
+        ("tau", 0.9),
+        ("production_same_input_gate_pass", False),
+    ):
+        changed = dict(report)
+        changed[key] = value
+        assert _child_report_matches_request(changed, args) is False
 
 
 def test_git_blob_sha_matches_git_object_formula(tmp_path):
