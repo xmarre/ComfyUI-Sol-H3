@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -28,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sol_h3.provenance import CONTRACT, REVISION, verify_source  # noqa: E402
 
 CAPTURE_ID = "234ed062128e43ed8d5ec63e27517b22"
+PRESERVED_TAU = 1.0
 EXPECTED_RUNTIME = {
     "torch": "2.10.0+cu130",
     "torch_cuda": "13.0",
@@ -129,6 +131,12 @@ def _require_preserved_runtime(identity: dict[str, Any]) -> None:
         )
 
 
+def _require_preserved_tau(value: Any) -> float:
+    if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) != PRESERVED_TAU:
+        raise ValueError(f"production same-input comparison requires tau={PRESERVED_TAU}, got {value!r}")
+    return PRESERVED_TAU
+
+
 def _extract_final_json(stdout: str) -> dict[str, Any]:
     lines = stdout.splitlines()
     for index in range(len(lines) - 1, -1, -1):
@@ -142,6 +150,17 @@ def _extract_final_json(stdout: str) -> dict[str, Any]:
         if isinstance(value, dict) and value.get("kind") == "production_mapped_neighbor_same_input_probe_v1":
             return value
     raise RuntimeError("mapped-neighbor probe stdout did not end with the expected JSON report")
+
+
+def _child_report_matches_request(report: Any, args: Any) -> bool:
+    return bool(
+        isinstance(report, dict)
+        and report.get("production_same_input_gate_pass") is True
+        and report.get("capture_id") == CAPTURE_ID
+        and report.get("block_index") == args.block
+        and report.get("group_index") == args.group
+        and report.get("tau") == args.tau
+    )
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -191,12 +210,16 @@ def main() -> None:
     parser.add_argument("--group", type=int, choices=(0, 2, 10), default=10)
     parser.add_argument("--block", type=int, default=2)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--tau", type=float, default=PRESERVED_TAU)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     args = parser.parse_args()
     if min(args.warmup, args.repeats) < 1:
         parser.error("--warmup and --repeats must be positive")
+    try:
+        args.tau = _require_preserved_tau(args.tau)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     sol_root = Path(__file__).resolve().parents[1]
     probe = sol_root / "tools" / "mapped_neighbor_probe.py"
@@ -258,11 +281,11 @@ def main() -> None:
         "stderr_sha256": _sha256_file(stderr_path),
         "child_report_parse_error": parse_error,
         "child_report": child_report,
+        "child_report_matches_request": _child_report_matches_request(child_report, args),
         "complete": bool(
             completed.returncode == 0
             and parse_error is None
-            and isinstance(child_report, dict)
-            and child_report.get("production_same_input_gate_pass") is True
+            and _child_report_matches_request(child_report, args)
         ),
     }
     encoded = json.dumps(envelope, indent=2, sort_keys=True, default=str).encode("utf-8")
@@ -276,7 +299,7 @@ def main() -> None:
     if completed.returncode != 0:
         raise SystemExit(completed.returncode)
     if not envelope["complete"]:
-        raise RuntimeError(f"production mapped-neighbor probe did not produce a complete report: {parse_error}")
+        raise RuntimeError(f"production mapped-neighbor probe did not produce a complete matched report: {parse_error}")
 
 
 if __name__ == "__main__":
