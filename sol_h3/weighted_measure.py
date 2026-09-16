@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass, replace
+import dis
 import hashlib
 import importlib
 import marshal
 import threading
+import types
 import uuid
 import weakref
 
@@ -25,6 +28,9 @@ _ROUTE_PROFILES = {
 }
 _OWNER_GENERATIONS = {}
 _OWNER_GENERATIONS_LOCK = threading.Lock()
+_GLOBAL_IDENTITY_MAX_ITEMS = 64
+_GLOBAL_IDENTITY_MAX_DEPTH = 4
+_MISSING = object()
 
 
 def _core(required=True):
@@ -46,14 +52,151 @@ def _provider_name(provider):
     return f"{getattr(provider, '__module__', '<unknown>')}.{getattr(provider, '__qualname__', type(provider).__name__)}"
 
 
-def _stateless_function_identity(provider):
-    """Return a stable implementation identity for a genuinely stateless function.
+def _code_digest(code):
+    return hashlib.sha256(marshal.dumps(code)).hexdigest()
 
-    Attention preprocess factories may create a fresh function object for every
-    model invocation. Object identity is not numerical identity in that case and
-    would grow the request-scoped weighted-plan cache once per evaluation. Only
-    functions with no closure/default state qualify for code identity; anything
-    stateful falls back to concrete owner-generation tracking below.
+
+def _loaded_global_names(code):
+    return tuple(
+        sorted(
+            {
+                instruction.argval
+                for instruction in dis.get_instructions(code)
+                if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"} and isinstance(instruction.argval, str)
+            }
+        )
+    )
+
+
+def _semantic_value_identity(value, *, depth, seen):
+    """Return bounded semantic identity for code-reachable global state.
+
+    Unsupported state deliberately returns ``None``. Callers then use a volatile
+    identity rather than reusing a weighted plan whose preprocessing semantics
+    cannot be proven stable.
+    """
+    if value is None or type(value) in {bool, int, float, complex, str, bytes}:
+        return (type(value).__name__, value)
+    if isinstance(value, types.ModuleType):
+        return ("module_v1", getattr(value, "__name__", "<unknown>"))
+    if isinstance(value, type):
+        return ("type_v1", getattr(value, "__module__", "<unknown>"), getattr(value, "__qualname__", repr(value)))
+    if isinstance(value, (types.BuiltinFunctionType, types.BuiltinMethodType)):
+        return (
+            "builtin_v1",
+            getattr(value, "__module__", "builtins"),
+            getattr(value, "__qualname__", getattr(value, "__name__", repr(value))),
+        )
+
+    if isinstance(value, types.FunctionType):
+        code = getattr(value, "__code__", None)
+        if code is None:
+            return None
+        base = ("function_v2", _provider_name(value), _code_digest(code))
+        if depth <= 0:
+            return base
+        owner_id = id(value)
+        if owner_id in seen:
+            return base + (("cycle",),)
+        nested_seen = set(seen)
+        nested_seen.add(owner_id)
+
+        defaults = getattr(value, "__defaults__", None)
+        defaults_identity = _semantic_value_identity(defaults, depth=depth - 1, seen=nested_seen)
+        if defaults is not None and defaults_identity is None:
+            return None
+        kwdefaults = getattr(value, "__kwdefaults__", None)
+        kwdefaults_identity = _semantic_value_identity(kwdefaults, depth=depth - 1, seen=nested_seen)
+        if kwdefaults is not None and kwdefaults_identity is None:
+            return None
+        closure = getattr(value, "__closure__", None)
+        if closure is None:
+            closure_identity = None
+        else:
+            closure_values = []
+            for cell in closure:
+                try:
+                    cell_value = cell.cell_contents
+                except ValueError:
+                    return None
+                cell_identity = _semantic_value_identity(cell_value, depth=depth - 1, seen=nested_seen)
+                if cell_identity is None:
+                    return None
+                closure_values.append(cell_identity)
+            closure_identity = tuple(closure_values)
+
+        globals_dict = getattr(value, "__globals__", None)
+        if not isinstance(globals_dict, dict):
+            return None
+        global_identity = []
+        for name in _loaded_global_names(code):
+            if name in globals_dict:
+                source = "global"
+                dependency = globals_dict[name]
+            else:
+                dependency = getattr(builtins, name, _MISSING)
+                if dependency is _MISSING:
+                    return None
+                source = "builtin"
+            dependency_identity = _semantic_value_identity(
+                dependency,
+                depth=depth - 1,
+                seen=nested_seen,
+            )
+            if dependency_identity is None:
+                return None
+            global_identity.append((source, name, dependency_identity))
+        return base + (defaults_identity, kwdefaults_identity, closure_identity, tuple(global_identity))
+
+    if isinstance(value, (tuple, list, frozenset, set)):
+        if len(value) > _GLOBAL_IDENTITY_MAX_ITEMS:
+            return None
+        owner_id = id(value)
+        if owner_id in seen:
+            return ("container_cycle_v1", type(value).__name__)
+        nested_seen = set(seen)
+        nested_seen.add(owner_id)
+        items = []
+        for item in value:
+            identity = _semantic_value_identity(item, depth=depth - 1, seen=nested_seen)
+            if identity is None:
+                return None
+            items.append(identity)
+        if isinstance(value, (set, frozenset)):
+            items.sort(key=repr)
+        return (type(value).__name__, tuple(items))
+
+    if isinstance(value, dict):
+        if len(value) > _GLOBAL_IDENTITY_MAX_ITEMS:
+            return None
+        owner_id = id(value)
+        if owner_id in seen:
+            return ("dict_cycle_v1",)
+        nested_seen = set(seen)
+        nested_seen.add(owner_id)
+        items = []
+        for key, item in value.items():
+            key_identity = _semantic_value_identity(key, depth=depth - 1, seen=nested_seen)
+            item_identity = _semantic_value_identity(item, depth=depth - 1, seen=nested_seen)
+            if key_identity is None or item_identity is None:
+                return None
+            items.append((key_identity, item_identity))
+        items.sort(key=repr)
+        return ("dict", tuple(items))
+
+    return None
+
+
+def _stateless_function_identity(provider):
+    """Return stable code+global identity for a provably stateless function.
+
+    Fresh factory-created preprocess functions should share one request-cache
+    identity when their numerical semantics are equal. Code bytes alone are not
+    sufficient because ``LOAD_GLOBAL`` can observe mutable module state. We
+    therefore include a bounded semantic snapshot of code-reachable globals and
+    helper functions. If any reachable value cannot be represented safely, the
+    identity becomes deliberately volatile so stale weighted plans cannot be
+    reused.
     """
     code = getattr(provider, "__code__", None)
     if code is None:
@@ -64,8 +207,16 @@ def _stateless_function_identity(provider):
         return None
     if getattr(provider, "__kwdefaults__", None):
         return None
-    digest = hashlib.sha256(marshal.dumps(code)).hexdigest()
-    return ("stateless_function_v1", _provider_name(provider), digest)
+    code_digest = _code_digest(code)
+    semantic = _semantic_value_identity(
+        provider,
+        depth=_GLOBAL_IDENTITY_MAX_DEPTH,
+        seen=set(),
+    )
+    if semantic is None:
+        return ("volatile_global_function_v1", _provider_name(provider), code_digest, uuid.uuid4().hex)
+    semantic_digest = hashlib.sha256(repr(semantic).encode("utf-8")).hexdigest()
+    return ("stateless_function_v2", _provider_name(provider), code_digest, semantic_digest)
 
 
 def _owner_identity(provider):
@@ -107,10 +258,12 @@ def _owner_identity(provider):
 def preprocess_digest(provider):
     """Hash numerical preprocessing semantics plus concrete stateful ownership.
 
-    Closure-free/default-free function preprocessors are identified by immutable
-    code so equivalent factory-created wrappers share one numerical identity.
-    Stateful callables retain concrete weakref-bound generations so replacement
-    cannot inherit a cached plan through CPython address reuse.
+    Closure-free/default-free function preprocessors use code plus bounded
+    code-reachable global semantics, allowing equivalent factory-created wrappers
+    to share one identity without ignoring ``LOAD_GLOBAL`` state. Unsupported
+    reachable global state is deliberately volatile. Stateful callables retain
+    concrete weakref-bound generations so replacement cannot inherit a cached
+    plan through CPython address reuse.
     """
     chain = []
     seen = set()
