@@ -90,8 +90,11 @@ def _candidate_geometry(candidate_report: dict[str, Any]) -> dict[str, Any]:
     if q_rows <= 0 or kv_rows <= 0 or not 0 <= sink_rows <= kv_rows:
         raise RuntimeError("candidate geometry Q/KV/sink rows are invalid")
     query_sha = geometry.get("query_positions_sha256")
+    descriptor_sha = geometry.get("diagnostic_descriptor_sha256")
     if not isinstance(query_sha, str) or len(query_sha) != 64:
         raise RuntimeError("candidate geometry query-position digest is invalid")
+    if not isinstance(descriptor_sha, str) or len(descriptor_sha) != 64:
+        raise RuntimeError("candidate geometry descriptor digest is invalid")
     intervals = geometry.get("mapped_neighbor_intervals")
     if not isinstance(intervals, list) or not intervals:
         raise RuntimeError("candidate geometry is missing mapped-neighbor intervals")
@@ -111,7 +114,7 @@ def _candidate_geometry(candidate_report: dict[str, Any]) -> dict[str, Any]:
         "sink_rows": sink_rows,
         "query_positions_sha256": query_sha,
         "mapped_neighbor_intervals": intervals,
-        "diagnostic_descriptor_sha256": geometry.get("diagnostic_descriptor_sha256"),
+        "diagnostic_descriptor_sha256": descriptor_sha,
     }
 
 
@@ -176,6 +179,13 @@ def _persist_process(root: Path, stem: str, completed: subprocess.CompletedProce
 
 def _write_report(path: Path, report: dict[str, Any]) -> None:
     _atomic_write(path, json.dumps(report, indent=2, sort_keys=True, default=str).encode("utf-8"))
+
+
+def _fail_report(report: dict[str, Any], report_path: Path, message: str) -> None:
+    report["failure"] = message
+    report["complete"] = False
+    report["performance_gate_pass"] = False
+    _write_report(report_path, report)
 
 
 def main() -> None:
@@ -245,8 +255,7 @@ def main() -> None:
     }
 
     if candidate_process.returncode != 0:
-        report["failure"] = "candidate production probe failed"
-        _write_report(report_path, report)
+        _fail_report(report, report_path, "candidate production probe failed")
         sys.stdout.write(candidate_process.stdout)
         sys.stderr.write(candidate_process.stderr)
         print(json.dumps({"result_path": str(report_path), "complete": False, "performance_gate_pass": False}))
@@ -266,9 +275,9 @@ def main() -> None:
         report["candidate_result_sha256"] = _sha256_file(candidate_result_path)
         report["candidate_verified_geometry"] = candidate_geometry
     except (OSError, json.JSONDecodeError, RuntimeError) as exc:
-        report["failure"] = f"candidate production result could not be validated: {exc}"
-        _write_report(report_path, report)
-        raise RuntimeError(report["failure"]) from exc
+        message = f"candidate production result could not be validated: {exc}"
+        _fail_report(report, report_path, message)
+        raise RuntimeError(message) from exc
 
     historical_command = [
         sys.executable,
@@ -287,40 +296,45 @@ def main() -> None:
     historical_process_record = _persist_process(output_root, f"{stem}.historical-m", historical_process)
     report["historical_process"] = historical_process_record
     if historical_process.returncode != 0:
-        report["failure"] = "historical M probe failed"
-        _write_report(report_path, report)
+        _fail_report(report, report_path, "historical M probe failed")
         sys.stdout.write(historical_process.stdout)
         sys.stderr.write(historical_process.stderr)
         print(json.dumps({"result_path": str(report_path), "complete": False, "performance_gate_pass": False}))
         raise SystemExit(historical_process.returncode)
 
-    historical_report = _extract_historical_report(historical_process.stdout)
-    if historical_report.get("historical_m_same_input_gate_pass") is not True:
-        raise RuntimeError("historical M report is not marked passed")
+    try:
+        historical_report = _extract_historical_report(historical_process.stdout)
+        if historical_report.get("historical_m_same_input_gate_pass") is not True:
+            raise RuntimeError("historical M report is not marked passed")
 
-    candidate_runtime = candidate_envelope.get("runtime")
-    historical_runtime = historical_report.get("runtime")
-    if not isinstance(candidate_runtime, dict) or not isinstance(historical_runtime, dict):
-        raise RuntimeError("candidate/historical runtime provenance is incomplete")
-    runtime_mismatches = {
-        field: [candidate_runtime.get(field), historical_runtime.get(field)]
-        for field in _RUNTIME_MATCH_FIELDS
-        if candidate_runtime.get(field) != historical_runtime.get(field)
-    }
-    if runtime_mismatches:
-        raise RuntimeError(f"candidate and historical M did not execute on the same runtime/device: {runtime_mismatches}")
-    if candidate_report.get("e_evidence_sha256") != historical_report.get("e_evidence_sha256"):
-        raise RuntimeError("candidate and historical M did not consume the same E evidence")
-    if candidate_report.get("m_report_sha256") != historical_report.get("m_report_sha256"):
-        raise RuntimeError("candidate and historical M did not consume the same M report")
-    if candidate_geometry["diagnostic_descriptor_sha256"] != historical_report.get("descriptor_sha256"):
-        raise RuntimeError("candidate and historical M descriptor identities differ")
-    if candidate_geometry["query_positions_sha256"] != historical_report.get("query_positions_sha256"):
-        raise RuntimeError("candidate and historical M query-position identities differ")
+        candidate_runtime = candidate_envelope.get("runtime")
+        historical_runtime = historical_report.get("runtime")
+        if not isinstance(candidate_runtime, dict) or not isinstance(historical_runtime, dict):
+            raise RuntimeError("candidate/historical runtime provenance is incomplete")
+        runtime_mismatches = {
+            field: [candidate_runtime.get(field), historical_runtime.get(field)]
+            for field in _RUNTIME_MATCH_FIELDS
+            if candidate_runtime.get(field) != historical_runtime.get(field)
+        }
+        if runtime_mismatches:
+            raise RuntimeError(f"candidate and historical M did not execute on the same runtime/device: {runtime_mismatches}")
+        if candidate_report.get("e_evidence_sha256") != historical_report.get("e_evidence_sha256"):
+            raise RuntimeError("candidate and historical M did not consume the same E evidence")
+        if candidate_report.get("m_report_sha256") != historical_report.get("m_report_sha256"):
+            raise RuntimeError("candidate and historical M did not consume the same M report")
+        if candidate_geometry["diagnostic_descriptor_sha256"] != historical_report.get("descriptor_sha256"):
+            raise RuntimeError("candidate and historical M descriptor identities differ")
+        if candidate_geometry["query_positions_sha256"] != historical_report.get("query_positions_sha256"):
+            raise RuntimeError("candidate and historical M query-position identities differ")
 
-    candidate_timing = (candidate_report.get("warmed_kernel_timing") or {}).get("mapped")
-    historical_timing = historical_report.get("warmed_m_timing")
-    comparison = evaluate_performance_gate(candidate_timing, historical_timing)
+        candidate_timing = (candidate_report.get("warmed_kernel_timing") or {}).get("mapped")
+        historical_timing = historical_report.get("warmed_m_timing")
+        comparison = evaluate_performance_gate(candidate_timing, historical_timing)
+    except (json.JSONDecodeError, RuntimeError, TypeError, ValueError) as exc:
+        message = f"candidate/historical performance comparison could not be validated: {exc}"
+        _fail_report(report, report_path, message)
+        raise RuntimeError(message) from exc
+
     report.update(
         {
             "runtime_match_fields": list(_RUNTIME_MATCH_FIELDS),
