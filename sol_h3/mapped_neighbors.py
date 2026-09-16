@@ -72,7 +72,7 @@ def validate_wire_map(value: Any, *, q_rows: int, kv_rows: int, sink_rows: int) 
     if not isinstance(value, tuple) or len(value) != 9:
         raise MappingUnavailable("missing" if value is None else "schema")
     tag, schema, owner, plan_digest, group_index, wire_q, wire_kv, wire_sink, raw_runs = value
-    if tag != WIRE_TAG or schema != WIRE_SCHEMA:
+    if tag != WIRE_TAG or type(schema) is not int or schema != WIRE_SCHEMA:
         raise MappingUnavailable("schema")
     if not isinstance(owner, str) or not owner or not _digest(plan_digest):
         raise MappingUnavailable("owner")
@@ -104,8 +104,6 @@ def validate_wire_map(value: Any, *, q_rows: int, kv_rows: int, sink_rows: int) 
             raise MappingUnavailable("domain")
         if kv_begin <= previous_position:
             raise MappingUnavailable("domain")
-        # Every represented row is affine with slope one. This implies strict
-        # increase inside the run; the boundary check above proves it across runs.
         previous_position = kv_begin + span - 1
         identity_aligned = identity_aligned and kv_begin == q_begin
         runs.append((q_begin, q_end, kv_begin))
@@ -139,24 +137,28 @@ def validate_wire_map(value: Any, *, q_rows: int, kv_rows: int, sink_rows: int) 
     )
 
 
-def _position_for_row(runs: tuple[tuple[int, int, int], ...], row: int, run_index: int):
-    while run_index < len(runs) and row >= runs[run_index][1]:
-        run_index += 1
-    if run_index >= len(runs):
-        raise MappingUnavailable("schema")
-    q_begin, q_end, kv_begin = runs[run_index]
-    if not q_begin <= row < q_end:
-        raise MappingUnavailable("schema")
-    return kv_begin + row - q_begin, run_index
+def _merge_block_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping/adjacent half-open integer block intervals exactly."""
+    if not intervals:
+        return []
+    ordered = sorted(intervals)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        previous_start, previous_end = merged[-1]
+        if start <= previous_end:
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def compile_descriptor(validated: ValidatedMap) -> DescriptorPlan | None:
     """Compile exact +/-1 physical K64 neighbors for each requested Q64 tile.
 
-    We never take the hull of disjoint sets.  A Q tile is accepted only when its
-    exact union is one non-empty contiguous interval of at most four K64 blocks.
-    Identity-aligned square maps return ``None`` so the established ordinal route
-    remains byte-for-byte the ordinary path.
+    Affine wire runs are intersected with each Q64 tile and converted directly to
+    K64 block intervals.  No per-row position vector is expanded.  The exact
+    neighbor union is accepted only when it is one nonempty interval no wider
+    than four blocks; disjoint sets are never replaced by their hull.
     """
     if validated.identity_aligned:
         return None
@@ -165,23 +167,34 @@ def compile_descriptor(validated: ValidatedMap) -> DescriptorPlan | None:
     intervals: list[tuple[int, int]] = []
     run_index = 0
     for tile in range(q_tiles):
-        q_begin = tile * BLOCK_SIZE
-        q_end = min(validated.q_rows, q_begin + BLOCK_SIZE)
-        represented: set[int] = set()
-        for row in range(q_begin, q_end):
-            position, run_index = _position_for_row(validated.runs, row, run_index)
-            represented.add(position // BLOCK_SIZE)
-        selected: set[int] = set()
-        for block in represented:
-            for candidate in (block - 1, block, block + 1):
-                if 0 <= candidate < k_blocks:
-                    selected.add(candidate)
-        if not selected:
+        tile_q_begin = tile * BLOCK_SIZE
+        tile_q_end = min(validated.q_rows, tile_q_begin + BLOCK_SIZE)
+        while run_index < len(validated.runs) and validated.runs[run_index][1] <= tile_q_begin:
+            run_index += 1
+        scan = run_index
+        selected_ranges: list[tuple[int, int]] = []
+        while scan < len(validated.runs):
+            run_q_begin, run_q_end, run_kv_begin = validated.runs[scan]
+            if run_q_begin >= tile_q_end:
+                break
+            overlap_begin = max(tile_q_begin, run_q_begin)
+            overlap_end = min(tile_q_end, run_q_end)
+            if overlap_begin < overlap_end:
+                first_position = run_kv_begin + overlap_begin - run_q_begin
+                last_position = run_kv_begin + overlap_end - run_q_begin - 1
+                first_block = first_position // BLOCK_SIZE
+                last_block = last_position // BLOCK_SIZE
+                selected_ranges.append(
+                    (max(0, first_block - 1), min(k_blocks, last_block + 2))
+                )
+            scan += 1
+
+        merged = _merge_block_intervals(selected_ranges)
+        if not merged or len(merged) != 1:
             raise MappingUnavailable("fragmented")
-        ordered = sorted(selected)
-        if ordered != list(range(ordered[0], ordered[-1] + 1)):
+        start, end = merged[0]
+        if end <= start:
             raise MappingUnavailable("fragmented")
-        start, end = ordered[0], ordered[-1] + 1
         if end - start > MAX_INTERVAL_WIDTH:
             raise MappingUnavailable("interval_width")
         intervals.append((start, end))
@@ -202,7 +215,12 @@ def validate_preflight_summary(summary: Any, wire: tuple[Any, ...], plan: Descri
     """Require the current VDN forward's pure preflight summary to own this map."""
     if summary is None:
         return False
-    if getattr(summary, "tag", None) != "vdn_query_position_plan_v1" or getattr(summary, "schema", None) != 1:
+    if (
+        getattr(summary, "tag", None) != "vdn_query_position_plan_v1"
+        or type(getattr(summary, "schema", None)) is not int
+        or getattr(summary, "schema", None) != 1
+        or getattr(summary, "mode", None) != "grouped"
+    ):
         return False
     if getattr(summary, "owner_generation", None) != wire[2] or getattr(summary, "plan_digest", None) != wire[3]:
         return False
