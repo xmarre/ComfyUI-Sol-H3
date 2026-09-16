@@ -24,6 +24,21 @@ def provider_name(provider):
 
 
 def receipt(options, block, route, *, measure_plan=None, call_token=None, fields=None):
+    if fields is not None and route == "vdn_local_sol_mapped_v1":
+        # This is called only after the mapped kernel returns successfully. Keep a
+        # small immutable proof on the request even if its device descriptor is
+        # later evicted from the bounded LRU; receipt acceptance must not rely on
+        # the current cache contents.
+        from .runtime import _REQUEST
+
+        state = _REQUEST.get()
+        if state is not None:
+            owned = getattr(state, "mapped_validated_receipts", None)
+            if owned is None:
+                owned = set()
+                state.mapped_validated_receipts = owned
+            owned.add((block, fields))
+
     sink = options.get(RECEIPTS_KEY)
     if sink is None:
         return
@@ -98,13 +113,30 @@ def _mapped_vdn_history_identity(forward, options, layout):
         return True, None
     if (
         getattr(summary, "tag", None) != "vdn_query_position_plan_v1"
+        or type(getattr(summary, "schema", None)) is not int
         or getattr(summary, "schema", None) != 1
+        or getattr(summary, "mode", None) not in {"native", "grouped"}
         or not isinstance(getattr(summary, "owner_generation", None), str)
         or not getattr(summary, "owner_generation", "")
         or not isinstance(getattr(summary, "plan_digest", None), str)
         or not isinstance(getattr(summary, "groups", None), tuple)
     ):
         return True, None
+
+    common_identity = (
+        summary.owner_generation,
+        summary.plan_digest,
+        getattr(summary, "seq_len", None),
+        getattr(summary, "video_start", None),
+        getattr(summary, "video_end", None),
+        getattr(summary, "num_frames", None),
+        getattr(summary, "tokens_per_frame", None),
+        getattr(summary, "anchor_frames", None),
+    )
+    if summary.mode == "native":
+        if summary.groups:
+            return True, None
+        return True, ("vdn_h3_native_query_position_plan_v1", *common_identity)
 
     from .mapped_neighbors import MappingUnavailable, POLICY, compile_descriptor, validate_wire_map
 
@@ -136,14 +168,7 @@ def _mapped_vdn_history_identity(forward, options, layout):
         )
     return True, (
         "vdn_h3_grouped_query_positions_v1",
-        summary.owner_generation,
-        summary.plan_digest,
-        getattr(summary, "seq_len", None),
-        getattr(summary, "video_start", None),
-        getattr(summary, "video_end", None),
-        getattr(summary, "num_frames", None),
-        getattr(summary, "tokens_per_frame", None),
-        getattr(summary, "anchor_frames", None),
+        *common_identity,
         POLICY,
         tuple(group_identities),
     )
@@ -445,9 +470,15 @@ class HistoryPolicy:
         }
         from . import weighted_measure
         from .mapped_neighbors import POLICY, RECEIPT_TAG
+        from .runtime import _REQUEST
+
+        state = _REQUEST.get()
+        owned_mapped = getattr(state, "mapped_validated_receipts", set()) if state is not None else set()
 
         for item in receipts:
             if not isinstance(item, tuple) or len(item) not in {3, 4} or item[0] != "sol_h3":
+                return False
+            if type(item[1]) is not int or item[1] < 0:
                 return False
             route = item[2]
             if not isinstance(route, str):
@@ -491,6 +522,7 @@ class HistoryPolicy:
                     or policy != POLICY
                     or not isinstance(kernel_contract, str) or not kernel_contract
                     or completed is not True
+                    or (item[1], fields) not in owned_mapped
                 ):
                     return False
                 continue
