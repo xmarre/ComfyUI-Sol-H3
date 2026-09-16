@@ -1,13 +1,19 @@
 diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/interface.py
-index c49f1ad..951b93c 100644
+index c49f1ad..e68660b 100644
 --- a/sol_h3/_vendor/sol_attn/interface.py
 +++ b/sol_h3/_vendor/sol_attn/interface.py
-@@ -1,3 +1,4 @@
+@@ -1,8 +1,10 @@
 +# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
  """Public Sol-Attn interface."""
  
  from __future__ import annotations
-@@ -28,9 +29,10 @@ def _validate_inputs(
+ 
+ import functools
++import math
+ 
+ import torch
+ 
+@@ -28,9 +30,10 @@ def _validate_inputs(
      sink_tokens=0,
      sink_start=None,
  ):
@@ -21,7 +27,7 @@ index c49f1ad..951b93c 100644
          raise ValueError("Sol-Attn requires T > 0 and head dimension 128")
      if any(x.dtype != torch.bfloat16 for x in (q, k, v)):
          raise TypeError("q, k, and v must use torch.bfloat16")
-@@ -47,15 +49,15 @@ def _validate_inputs(
+@@ -47,15 +50,15 @@ def _validate_inputs(
          raise ValueError("thresh_type must be 'diag' or 'exact'")
      if not isinstance(sink_tokens, int):
          raise TypeError("sink_tokens must be an integer")
@@ -43,7 +49,28 @@ index c49f1ad..951b93c 100644
      return tuple(torch.cuda.get_device_capability(q.device))
  
  
-@@ -236,7 +238,8 @@ def _sol_attn_cute(
+@@ -198,12 +201,13 @@ def _compile_sm120(
+     sink_start_block,
+     sink_end_block,
+     stream,
++    key_bias_enabled,
+ ):
+     import cutlass.cute as cute
+ 
+     from .sm120 import make_kernel
+ 
+-    operator = make_kernel()
++    operator = make_kernel(key_bias_enabled=key_bias_enabled)
+     args = _to_cute_tensors(tensors)
+     compiled = cute.compile(
+         operator,
+@@ -231,12 +235,14 @@ def _sol_attn_cute(
+     sink_tokens,
+     sink_start,
+     valid_tokens=None,
++    key_bias=None,
+ ):
+     from .preprocess import prepare
  
      batch, capacity_tokens, heads, _ = q.shape
      tokens = capacity_tokens if valid_tokens is None else int(valid_tokens)
@@ -53,7 +80,7 @@ index c49f1ad..951b93c 100644
  
      with torch.cuda.device(q.device):
          kc, vc, threshold = prepare(
-@@ -247,8 +250,9 @@ def _sol_attn_cute(
+@@ -247,8 +253,9 @@ def _sol_attn_cute(
              tau=tau,
              thresh_type=thresh_type,
              valid_tokens=tokens,
@@ -64,12 +91,15 @@ index c49f1ad..951b93c 100644
          lse = torch.empty(
              (batch, capacity_tokens, heads),
              device=q.device,
-@@ -259,12 +263,12 @@ def _sol_attn_cute(
+@@ -259,12 +266,15 @@ def _sol_attn_cute(
          # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
          # descriptor for a strided view (or vice versa).
          layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v))
 -        key = (q.device.index, arch, batch, capacity_tokens, heads, kv_splits, layout_key)
-+        key = (q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits, layout_key)
++        key = (
++            q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,
++            layout_key, key_bias is not None,
++        )
  
          if arch == (9, 0):
              if sink_tokens:
@@ -79,7 +109,7 @@ index c49f1ad..951b93c 100644
                      sink_start,
                      sink_tokens,
                  )
-@@ -308,7 +312,7 @@ def _sol_attn_cute(
+@@ -308,7 +318,7 @@ def _sol_attn_cute(
              )
          elif arch in ((10, 0), (10, 3)):
              sink_start_block, sink_end_block = _sink_block_range(
@@ -88,7 +118,7 @@ index c49f1ad..951b93c 100644
                  sink_start,
                  sink_tokens,
              )
-@@ -338,7 +342,7 @@ def _sol_attn_cute(
+@@ -338,11 +348,12 @@ def _sol_attn_cute(
              )
          else:
              sink_start_block, sink_end_block = _sink_block_range(
@@ -97,16 +127,48 @@ index c49f1ad..951b93c 100644
                  sink_start,
                  sink_tokens,
              )
-@@ -449,6 +453,8 @@ def sol_attn(
+-            tensors = [q, k, v, output, kc, vc, threshold, lse]
++            key_bias_arg = key_bias if key_bias is not None else threshold
++            tensors = [q, k, v, output, kc, vc, threshold, key_bias_arg, lse]
+             compiled = _compiled.get(key)
+             if compiled is None:
+                 compiled, args = _compile_sm120(
+@@ -352,6 +363,7 @@ def _sol_attn_cute(
+                     sink_start_block,
+                     sink_end_block,
+                     stream,
++                    key_bias is not None,
+                 )
+             else:
+                 args = _to_cute_tensors(tensors)
+@@ -430,6 +442,7 @@ def sol_attn(
+     sink_tokens: int = 0,
+     sink_start: int | None = None,
+     compile_bucket_size: int | None = None,
++    key_bias: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
+ 
+@@ -449,6 +462,18 @@ def sol_attn(
      if kv_splits not in (1, 2, 4):
          raise ValueError("kv_splits must be 1, 2, or 4")
      backend = _backend_for_arch(arch)
++    if key_bias is not None:
++        if backend != "cute_sm120":
++            raise ValueError("key_bias is currently supported by cute_sm120 only")
++        if (not torch.is_tensor(key_bias) or key_bias.ndim != 1
++                or key_bias.shape[0] != k.shape[1] or key_bias.device != q.device
++                or key_bias.dtype != torch.float32 or not key_bias.is_contiguous()):
++            raise ValueError("key_bias must be contiguous float32 with one natural-log value per K/V row")
++        weighted_scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
++        if not math.isfinite(weighted_scale) or weighted_scale <= 0.0:
++            raise ValueError("weighted Sol-Attn requires a finite positive attention scale")
 +    if q.shape[1] != k.shape[1] and backend != "cute_sm120":
 +        raise ValueError("Rectangular attention currently requires cute_sm120")
      valid_tokens = q.shape[1]
      if compile_bucket_size is not None:
          if backend != "cute_sm100":
-@@ -476,7 +482,7 @@ def sol_attn(
+@@ -476,7 +501,7 @@ def sol_attn(
              sink_start=sink_start,
          )
  
@@ -115,6 +177,14 @@ index c49f1ad..951b93c 100644
      return _sol_attn_cute(
          q,
          k,
+@@ -489,6 +514,7 @@ def sol_attn(
+         sink_tokens=sink_tokens,
+         sink_start=sink_start,
+         valid_tokens=valid_tokens,
++        key_bias=key_bias,
+     )
+ 
+ 
 diff --git a/sol_h3/_vendor/sol_attn/preprocess.py b/sol_h3/_vendor/sol_attn/preprocess.py
 index cad8d2a..ace53ba 100644
 --- a/sol_h3/_vendor/sol_attn/preprocess.py
@@ -208,8 +278,26 @@ index cad8d2a..ace53ba 100644
              return_q_bar=return_q_bar,
          )
          if return_q_bar:
+diff --git a/sol_h3/_vendor/sol_attn/sm120/kernel.py b/sol_h3/_vendor/sol_attn/sm120/kernel.py
+index 1af031b..2128eb4 100644
+--- a/sol_h3/_vendor/sol_attn/sm120/kernel.py
++++ b/sol_h3/_vendor/sol_attn/sm120/kernel.py
+@@ -8,11 +8,13 @@ def make_kernel(
+     debug_route_trace: bool = False,
+     prefetch_first_exact_k: bool = True,
+     prefetch_next_route_k: bool = True,
++    key_bias_enabled: bool = False,
+ ):
+     return SolAttnForwardSm120(
+         debug_route_trace=debug_route_trace,
+         prefetch_first_exact_k=prefetch_first_exact_k,
+         prefetch_next_route_k=prefetch_next_route_k,
++        key_bias_enabled=key_bias_enabled,
+     )
+ 
+ 
 diff --git a/sol_h3/_vendor/sol_attn/sm120/mainloop.py b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
-index e96fa06..fe77b43 100644
+index e96fa06..55310f9 100644
 --- a/sol_h3/_vendor/sol_attn/sm120/mainloop.py
 +++ b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
 @@ -1,4 +1,4 @@
@@ -218,7 +306,31 @@ index e96fa06..fe77b43 100644
  # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
  # SPDX-License-Identifier: Apache-2.0
  """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
-@@ -96,7 +96,7 @@ class SolAttnForwardSm120:
+@@ -45,6 +45,7 @@ class SolAttnForwardSm120:
+         debug_route_trace: bool = False,
+         prefetch_first_exact_k: bool = True,
+         prefetch_next_route_k: bool = True,
++        key_bias_enabled: bool = False,
+     ):
+         self.dtype = cutlass.BFloat16
+         self.acc_dtype = cutlass.Float32
+@@ -56,6 +57,7 @@ class SolAttnForwardSm120:
+         self.debug_route_trace = debug_route_trace
+         self.prefetch_first_exact_k = prefetch_first_exact_k
+         self.prefetch_next_route_k = prefetch_next_route_k
++        self.key_bias_enabled = key_bias_enabled
+ 
+     @cute.kernel
+     def kernel(
+@@ -67,6 +69,7 @@ class SolAttnForwardSm120:
+         mKC: cute.Tensor,
+         mVC: cute.Tensor,
+         mThreshold: cute.Tensor,
++        mKeyBias: cute.Tensor,
+         mLSE: cute.Tensor,
+         tma_atom_Q: cute.CopyAtom,
+         tma_atom_K: cute.CopyAtom,
+@@ -96,7 +99,7 @@ class SolAttnForwardSm120:
          num_blocks = mKC.shape[0]
          num_route_groups = cute.ceil_div(num_blocks, N)
          q_start = q_tile_idx * M
@@ -227,3 +339,63 @@ index e96fa06..fe77b43 100644
          if q_len > M:
              q_len = cutlass.Int32(M)
          threshold = cutlass.Float32(
+@@ -611,6 +614,11 @@ class SolAttnForwardSm120:
+                 if block_len > N:
+                     block_len = cutlass.Int32(N)
+                 mask_exact_scores(tSrS, tScS, block_len, q_len)
++                if cutlass.const_expr(self.key_bias_enabled):
++                    add_exact_key_bias(
++                        tSrS, tScS, mKeyBias, exact_block, block_len, q_len,
++                        cutlass.Float32(1.4426950408889634) / scale_softmax_log2e,
++                    )
+                 row_scale = online_softmax(
+                     tSrS, max_m, sum_m, scale_softmax_log2e
+                 )
+@@ -698,6 +706,7 @@ class SolAttnForwardSm120:
+         kc: cute.Tensor,
+         vc: cute.Tensor,
+         threshold: cute.Tensor,
++        key_bias: cute.Tensor,
+         lse: cute.Tensor,
+         softmax_scale: cutlass.Float32,
+         sink_start_block: cutlass.Int32,
+@@ -872,6 +881,7 @@ class SolAttnForwardSm120:
+             tma_tensor_KC,
+             tma_tensor_VC,
+             threshold,
++            key_bias,
+             lse_target,
+             tma_atom_Q,
+             tma_atom_K,
+@@ -1034,6 +1044,31 @@ def mask_exact_scores(
+                 scores_mn[m, n] = -cutlass.Float32.inf
+ 
+ 
++@cute.jit
++def add_exact_key_bias(
++    scores: cute.Tensor,
++    coords: cute.Tensor,
++    key_bias: cute.Tensor,
++    exact_block: cutlass.Int32,
++    block_len: cutlass.Int32,
++    q_len: cutlass.Int32,
++    inv_softmax_scale: cutlass.Float32,
++):
++    """Add natural-log key measure as b/scale to valid exact raw QK scores."""
++    scores_mn = layout_utils.reshape_acc_to_mn(scores)
++    coords_mn = layout_utils.reshape_acc_to_mn(coords)
++    for m in cutlass.range_constexpr(cute.size(scores_mn, mode=[0])):
++        valid_row = coords_mn[m, 0][0] < q_len
++        for n in cutlass.range_constexpr(cute.size(scores_mn, mode=[1])):
++            local_col = coords_mn[m, n][1]
++            if valid_row and local_col < block_len:
++                absolute_col = exact_block * cutlass.Int32(N) + local_col
++                scores_mn[m, n] = (
++                    cutlass.Float32(scores_mn[m, n])
++                    + cutlass.Float32(key_bias[absolute_col]) * inv_softmax_scale
++                )
++
++
+ @cute.jit
+ def online_softmax(
+     scores: cute.Tensor,

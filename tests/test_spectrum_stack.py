@@ -131,22 +131,26 @@ def test_real_spectrum_capture_and_actual_warmup_both_wrapper_orders(monkeypatch
             counts.append((state.evaluations, spectrum.stats.actual_transformer_calls,
                            spectrum.stats.forecast_model_calls, state.sparse_calls))
             assert state.evaluations == spectrum.stats.actual_transformer_calls
-            assert state.sparse_calls > 0
-            if vdn_mode in (None, "full"):
-                assert state.dense_calls == 3
-            else:
-                assert state.vdn_local_sol_calls > 0
-                assert state.vdn_rectangular_sol_calls > 0
-                assert state.vdn_square_expanded_calls == 0
-                assert state.vdn_kernel_q_rows == state.vdn_requested_q_rows > 0
-                assert state.fallbacks["vdn_global_native"] > 0
             if vdn_mode == "flex":
-                # Flex can fail into grouped at runtime and the stack-compatible VDN
-                # overlay intentionally does not own hybrid.py, so preflight cannot
-                # prove that route. Spectrum must execute actuals rather than forecast
-                # across an opaque transition; the grouped fallback still consumes SOL.
+                # VDN v4 deliberately keeps Flex opaque to preflight. If Flex fails
+                # into grouped during an execution, map ownership still cannot be
+                # proven, so the v4 provider must fail closed to native grouped SDPA.
+                assert state.sparse_calls == 0
+                assert state.vdn_local_sol_calls == 0
+                assert state.vdn_mapped_sol_calls == 0
+                assert state.vdn_rectangular_sol_calls == 0
+                assert state.fallbacks["vdn_local_native_mapping:owner"] > 0
                 assert spectrum.stats.forecast_model_calls == 0
             else:
+                assert state.sparse_calls > 0
+                if vdn_mode in (None, "full"):
+                    assert state.dense_calls == 3
+                else:
+                    assert state.vdn_local_sol_calls > 0
+                    assert state.vdn_rectangular_sol_calls > 0
+                    assert state.vdn_square_expanded_calls == 0
+                    assert state.vdn_kernel_q_rows == state.vdn_requested_q_rows > 0
+                    assert state.fallbacks["vdn_global_native"] > 0
                 assert spectrum.stats.forecast_model_calls > 0
         with torch.no_grad():
             SamplingWrapper(cfg)(sample)
