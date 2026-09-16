@@ -2,8 +2,8 @@
 
 This helper is intentionally isolated from the production Sol package. It imports
 an exact checkout of diagnostic PR #13 head, verifies that checkout and the frozen
-E/M artifacts, reconstructs the preserved M descriptor from the durable M report,
-and measures the warmed diagnostic-M path on the saved same-input tensors.
+E/M artifacts, reconstructs the preserved M descriptor from the durable M route
+record, and measures the warmed diagnostic-M path on the saved same-input tensors.
 
 It does not run H3, modify production dispatch, or regenerate R/W/E/M.
 """
@@ -120,21 +120,28 @@ def _iter_records(value: Any, kind: str):
             yield from _iter_records(item, kind)
 
 
-def _operator_witness(payload: Any, block_index: int, group_index: int) -> dict[str, Any]:
+def _single_record(value: Any, kind: str, block_index: int, group_index: int, label: str) -> dict[str, Any]:
     matches = [
         item
-        for item in _iter_records(payload, "operator_witness")
+        for item in _iter_records(value, kind)
         if item.get("block_index") == block_index and item.get("group_index") == group_index
     ]
     if len(matches) != 1:
         raise RuntimeError(
-            f"E evidence must contain exactly one operator_witness for block {block_index}/group {group_index}; "
-            f"found {len(matches)}"
+            f"{label} must contain exactly one {kind} for block {block_index}/group {group_index}; found {len(matches)}"
         )
     return matches[0]
 
 
-def _m_report_record(report: dict[str, Any], block_index: int, group_index: int) -> dict[str, Any]:
+def _operator_witness(payload: Any, block_index: int, group_index: int) -> dict[str, Any]:
+    return _single_record(payload, "operator_witness", block_index, group_index, "E evidence")
+
+
+def _m_route_record(report: dict[str, Any], block_index: int, group_index: int) -> dict[str, Any]:
+    return _single_record(report, "mapped_neighbor_route", block_index, group_index, "M durable JSON")
+
+
+def _m_summary_record(report: dict[str, Any], block_index: int, group_index: int) -> dict[str, Any]:
     witnesses = report.get("operator_witnesses")
     records = witnesses.get("reports") if isinstance(witnesses, dict) else None
     if not isinstance(records, list):
@@ -148,7 +155,7 @@ def _m_report_record(report: dict[str, Any], block_index: int, group_index: int)
     ]
     if len(matches) != 1:
         raise RuntimeError(
-            f"M JSON must contain exactly one report for block {block_index}/group {group_index}; found {len(matches)}"
+            f"M JSON must contain exactly one summary for block {block_index}/group {group_index}; found {len(matches)}"
         )
     return matches[0]
 
@@ -195,6 +202,29 @@ def _timings(function, warmup: int, repeats: int) -> dict[str, Any]:
     }
 
 
+def _validate_preserved_records(route_record: dict[str, Any], summary_record: dict[str, Any]) -> None:
+    if summary_record.get("valid") is not True:
+        raise RuntimeError("preserved M summary is not marked valid")
+    for name in (
+        "block_index",
+        "group_index",
+        "descriptor_sha256",
+        "query_positions_sha256",
+        "original_selected_pairs",
+        "added_selected_pairs",
+        "effective_selected_pairs",
+        "total_block_pairs",
+        "exact_work_increase_fraction",
+    ):
+        if route_record.get(name) != summary_record.get(name):
+            raise RuntimeError(
+                f"preserved M durable route and summary disagree for {name}: "
+                f"{route_record.get(name)!r} != {summary_record.get(name)!r}"
+            )
+    if route_record.get("additive_only") is not True or route_record.get("restricted_domain_unchanged") is not True:
+        raise RuntimeError("preserved M durable route does not assert additive-only restricted-domain semantics")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--historical-sol-path", type=Path, required=True)
@@ -238,16 +268,16 @@ def main() -> None:
     e_payload, e_sha = _load_evidence(args.e_evidence)
     m_report, m_sha = _load_m_report(args.m_report)
     witness = _operator_witness(e_payload, args.block, args.group)
-    m_record = _m_report_record(m_report, args.block, args.group)
-    if m_record.get("valid") is not True:
-        raise RuntimeError("preserved M route report is not marked valid")
+    route_record = _m_route_record(m_report, args.block, args.group)
+    summary_record = _m_summary_record(m_report, args.block, args.group)
+    _validate_preserved_records(route_record, summary_record)
 
-    intervals_raw = m_record.get("mapped_neighbor_intervals")
+    intervals_raw = route_record.get("mapped_neighbor_intervals")
     if not isinstance(intervals_raw, list):
-        raise RuntimeError("preserved M report is missing mapped_neighbor_intervals")
+        raise RuntimeError("preserved M durable route is missing mapped_neighbor_intervals")
     intervals = tuple((int(item[0]), int(item[1])) for item in intervals_raw)
     descriptor_sha = _descriptor_sha256(intervals)
-    if m_record.get("descriptor_sha256") != descriptor_sha:
+    if route_record.get("descriptor_sha256") != descriptor_sha:
         raise RuntimeError("preserved M descriptor digest does not match its interval payload")
 
     q_cpu, k_cpu, v_cpu = (witness.get(name) for name in ("q", "k", "v"))
@@ -257,12 +287,12 @@ def main() -> None:
         raise RuntimeError("E operator witness Q/K/V geometry is invalid")
     q_rows = int(q_cpu.shape[0])
     kv_rows = int(k_cpu.shape[0])
-    if q_rows != int(m_record.get("q_rows", -1)) or kv_rows != int(m_record.get("kv_rows", -1)):
-        raise RuntimeError("E Q/KV rows differ from the preserved M record")
+    if q_rows != int(route_record.get("q_rows", -1)) or kv_rows != int(route_record.get("kv_rows", -1)):
+        raise RuntimeError("E Q/KV rows differ from the preserved M durable route")
     sink_rows = int(witness.get("original_sink_rows", -1))
-    if sink_rows != int(m_record.get("original_sink_rows", -2)):
-        raise RuntimeError("E sink rows differ from the preserved M record")
-    query_sha = m_record.get("query_positions_sha256")
+    if sink_rows != int(route_record.get("original_sink_rows", -2)):
+        raise RuntimeError("E sink rows differ from the preserved M durable route")
+    query_sha = route_record.get("query_positions_sha256")
     if not isinstance(query_sha, str) or len(query_sha) != 64:
         raise RuntimeError("preserved M query-position digest is invalid")
 
@@ -302,19 +332,18 @@ def main() -> None:
         route = historical_m._route_evidence(group, qbar, kc, threshold)
         for name in (
             "original_selected_pairs",
+            "mapped_candidate_pairs",
             "added_selected_pairs",
             "effective_selected_pairs",
             "total_block_pairs",
+            "descriptor_sha256",
+            "query_positions_sha256",
         ):
-            expected = m_record.get(name)
-            if type(expected) is not int or route.get(name) != expected:
-                raise RuntimeError(f"historical M same-input route mismatch for {name}: {route.get(name)} != {expected}")
-        if route.get("descriptor_sha256") != m_record.get("descriptor_sha256"):
-            raise RuntimeError("historical M descriptor identity differs from the preserved M record")
-        if route.get("query_positions_sha256") != query_sha:
-            raise RuntimeError("historical M query-position identity differs from the preserved M record")
+            expected = route_record.get(name)
+            if route.get(name) != expected:
+                raise RuntimeError(f"historical M same-input route mismatch for {name}: {route.get(name)!r} != {expected!r}")
         fraction = route.get("exact_work_increase_fraction")
-        expected_fraction = m_record.get("exact_work_increase_fraction")
+        expected_fraction = route_record.get("exact_work_increase_fraction")
         if (
             type(fraction) is not float
             or type(expected_fraction) is not float
