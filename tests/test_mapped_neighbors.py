@@ -5,6 +5,8 @@ import pytest
 import torch
 
 from sol_h3._vendor.sol_attn import interface
+from sol_h3.contracts import Config
+from sol_h3 import mapped_neighbors
 from sol_h3.mapped_neighbors import (
     MappingUnavailable,
     POLICY,
@@ -12,6 +14,7 @@ from sol_h3.mapped_neighbors import (
     validate_preflight_summary,
     validate_wire_map,
 )
+from sol_h3.runtime import Request, _REQUEST
 
 
 DIGEST = "a" * 64
@@ -132,6 +135,84 @@ def test_runtime_counts_are_strict_ints_not_bool_aliases():
     ):
         with pytest.raises(MappingUnavailable, match="domain"):
             validate_wire_map(value, **counts)
+
+
+def test_request_local_cpu_plan_cache_reuses_validated_map_and_descriptor():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    value = wire(q_rows=64, kv_rows=256, sink_rows=1, runs=((0, 64, 65),))
+    first_state = Request(cfg)
+    first_token = _REQUEST.set(first_state)
+    try:
+        validated_a = validate_wire_map(value, q_rows=64, kv_rows=256, sink_rows=1)
+        descriptor_a = compile_descriptor(validated_a)
+        validated_b = validate_wire_map(value, q_rows=64, kv_rows=256, sink_rows=1)
+        descriptor_b = compile_descriptor(validated_b)
+        assert validated_b is validated_a
+        assert descriptor_b is descriptor_a
+        assert len(first_state._mapped_cpu_plan_cache) == 1
+    finally:
+        _REQUEST.reset(first_token)
+
+    second_state = Request(cfg)
+    second_token = _REQUEST.set(second_state)
+    try:
+        validated_c = validate_wire_map(value, q_rows=64, kv_rows=256, sink_rows=1)
+        descriptor_c = compile_descriptor(validated_c)
+        assert validated_c is not validated_a
+        assert descriptor_c is not descriptor_a
+        assert len(second_state._mapped_cpu_plan_cache) == 1
+    finally:
+        _REQUEST.reset(second_token)
+
+
+def test_request_local_cpu_plan_cache_is_bounded_lru():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    state = Request(cfg)
+    token = _REQUEST.set(state)
+    try:
+        first = None
+        for index in range(mapped_neighbors.MAX_CPU_PLAN_CACHE_ENTRIES + 1):
+            value = wire(
+                q_rows=64,
+                kv_rows=256,
+                sink_rows=1,
+                runs=((0, 64, 65),),
+                owner=f"owner-{index}",
+            )
+            validated = validate_wire_map(value, q_rows=64, kv_rows=256, sink_rows=1)
+            compile_descriptor(validated)
+            if index == 0:
+                first = validated
+        assert len(state._mapped_cpu_plan_cache) == mapped_neighbors.MAX_CPU_PLAN_CACHE_ENTRIES
+        first_key = mapped_neighbors._validated_cache_key(first)
+        assert first_key not in state._mapped_cpu_plan_cache
+    finally:
+        _REQUEST.reset(token)
+
+
+def test_unhashable_malformed_wire_bypasses_cache_and_keeps_schema_rejection():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    state = Request(cfg)
+    token = _REQUEST.set(state)
+    try:
+        value = (
+            "vdn_query_positions",
+            1,
+            OWNER,
+            DIGEST,
+            0,
+            64,
+            256,
+            1,
+            [(0, 64, 65)],
+        )
+        with pytest.raises(MappingUnavailable, match="schema"):
+            validate_wire_map(value, q_rows=64, kv_rows=256, sink_rows=1)
+        cache = getattr(state, "_mapped_cpu_plan_cache", None)
+        assert cache is not None
+        assert not cache
+    finally:
+        _REQUEST.reset(token)
 
 
 def test_preflight_requires_exact_owner_plan_group_and_wire_identity():
