@@ -7,6 +7,7 @@ from tools.run_mapped_neighbor_performance_gate import (
     _candidate_geometry,
     _extract_historical_report,
     _extract_runner_result,
+    _require_preserved_tau,
     evaluate_performance_gate,
 )
 
@@ -61,6 +62,13 @@ def test_performance_gate_reports_observed_range_overlap_separately_from_median(
 def test_performance_gate_rejects_invalid_timing():
     with pytest.raises(RuntimeError, match="median CUDA timing is invalid"):
         evaluate_performance_gate(_timing(0.0), _timing(1.0))
+
+
+def test_preserved_m_performance_gate_rejects_tau_drift():
+    assert _require_preserved_tau(1.0) == 1.0
+    for value in (0.9, 1.1, float("nan"), True, "1.0"):
+        with pytest.raises(ValueError, match="requires tau=1.0"):
+            _require_preserved_tau(value)
 
 
 def test_candidate_geometry_accepts_preserved_m_matched_descriptor():
