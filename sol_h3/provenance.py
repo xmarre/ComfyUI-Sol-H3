@@ -5,7 +5,7 @@ from pathlib import Path
 
 SOURCE = 'sana-sol-engine'
 REVISION = '2936c47637380842aaa4a4488fac5006cc542b70'
-CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-v2'
+CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4'
 
 
 def _manifest_name(path, source):
@@ -32,7 +32,11 @@ def _matches_packaged_hash(path, expected):
 def verify_source():
     root = Path(__file__).resolve().parent
     manifest = json.loads((root / 'sol_manifest.json').read_text(encoding='utf-8'))
-    if manifest['revision'] != REVISION or manifest['source'] != SOURCE:
+    if (
+        manifest.get('revision') != REVISION
+        or manifest.get('source') != SOURCE
+        or manifest.get('contract') != CONTRACT
+    ):
         raise RuntimeError('Packaged Sana source identity mismatch')
     source = root / '_vendor' / 'sol_attn'
     actual = {_manifest_name(p, source) for p in source.rglob('*')
@@ -45,7 +49,15 @@ def verify_source():
             'Packaged Sana source file set mismatch: '
             f'missing={missing or []}, unexpected={unexpected or []}'
         )
+    mismatches = []
     for name, hashes in manifest['files'].items():
-        if not _matches_packaged_hash(source / name, hashes['packaged_sha256']):
-            raise RuntimeError(f'Packaged Sana source hash mismatch: {name}')
+        path = source / name
+        if not _matches_packaged_hash(path, hashes['packaged_sha256']):
+            mismatches.append({
+                'path': name,
+                'expected': hashes['packaged_sha256'],
+                'actual': hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+    if mismatches:
+        raise RuntimeError(f'Packaged Sana source hash mismatch: {mismatches}')
     return manifest

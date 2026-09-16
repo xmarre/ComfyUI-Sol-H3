@@ -24,8 +24,7 @@ def test_sink_geometry_rejects_nonprefix_and_out_of_range():
     assert sparse._sink_blocks(0, 0, 130) == [0, 0]
     assert sparse._sink_blocks(0, 64, 130) == [0, 1]
     assert sparse._sink_blocks(0, 65, 130) == [0, 2]
-    with pytest.raises(RuntimeError, match="beginning at row zero"):
-        sparse._sink_blocks(64, 64, 130)
+    assert sparse._sink_blocks(64, 64, 130) == [1, 2]
     with pytest.raises(RuntimeError, match="outside"):
         sparse._sink_blocks(0, 131, 130)
 
@@ -147,3 +146,61 @@ def test_failed_arithmetic_never_counts_sparse(monkeypatch):
     with pytest.raises(RuntimeError, match="arithmetic gate failed"):
         sparse.attention(q, q, q, 1, state.config, state)
     assert state.sparse_calls == 0
+
+
+
+def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatch):
+    calls = []
+
+    def kernel(q, k, v, **kw):
+        calls.append(kw)
+        bias = kw.get("key_bias")
+        mask = None if bias is None else bias.view(1, 1, 1, -1)
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: kernel)
+    q, k, v = (torch.randn(1, 2, 260, 128).to(torch.bfloat16) for _ in range(3))
+    bias = torch.zeros(260, dtype=torch.float32)
+    bias[64:192] = torch.log(torch.tensor(0.5))
+    state = Request(Config(exact=False, backend="sol"))
+    out = sparse.attention(
+        q, k, v, 5, state.config, state,
+        key_bias=bias,
+        exact_k_blocks=(0, 3),
+        calibration_identity="measure-a",
+    )
+    assert out.shape == (1, 260, 256)
+    assert [c["sink_tokens"] for c in calls] == [260, 192]
+    assert all(c["sink_start"] == 0 for c in calls)
+    assert all(c["key_bias"] is bias for c in calls)
+    assert len(state.gates) == 1
+
+    sparse.attention(
+        q, k, v, 5, state.config, state,
+        key_bias=bias,
+        exact_k_blocks=(0, 3),
+        calibration_identity="measure-a",
+    )
+    assert len(calls) == 3
+    assert len(state.gates) == 1
+
+    other = bias.clone()
+    other[64:192] = torch.log(torch.tensor(0.25))
+    sparse.attention(
+        q, k, v, 5, state.config, state,
+        key_bias=other,
+        exact_k_blocks=(0, 3),
+        calibration_identity="measure-b",
+    )
+    assert len(calls) == 5
+    assert len(state.gates) == 2
+
+
+def test_weighted_bridge_rejects_bias_without_bound_route_metadata(monkeypatch):
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: None)
+    q = torch.ones(1, 1, 65, 128, dtype=torch.bfloat16)
+    state = Request(Config(exact=False, backend="sol"))
+    with pytest.raises(RuntimeError, match="calibration identity"):
+        sparse.attention(q, q, q, 1, state.config, state, key_bias=torch.zeros(65))

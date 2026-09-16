@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
@@ -45,6 +45,8 @@ class SolAttnForwardSm120:
         debug_route_trace: bool = False,
         prefetch_first_exact_k: bool = True,
         prefetch_next_route_k: bool = True,
+        key_bias_enabled: bool = False,
+        mapped_neighbors_enabled: bool = False,
     ):
         self.dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
@@ -56,6 +58,8 @@ class SolAttnForwardSm120:
         self.debug_route_trace = debug_route_trace
         self.prefetch_first_exact_k = prefetch_first_exact_k
         self.prefetch_next_route_k = prefetch_next_route_k
+        self.key_bias_enabled = key_bias_enabled
+        self.mapped_neighbors_enabled = mapped_neighbors_enabled
 
     @cute.kernel
     def kernel(
@@ -67,6 +71,8 @@ class SolAttnForwardSm120:
         mKC: cute.Tensor,
         mVC: cute.Tensor,
         mThreshold: cute.Tensor,
+        mKeyBias: cute.Tensor,
+        mMappedNeighborIntervals: cute.Tensor,
         mLSE: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
@@ -102,6 +108,18 @@ class SolAttnForwardSm120:
         threshold = cutlass.Float32(
             mThreshold[batch_idx, q_tile_idx, head_idx]
         )
+        mapped_start_block = cutlass.Int32(0)
+        mapped_end_block = cutlass.Int32(0)
+        if cutlass.const_expr(self.mapped_neighbors_enabled):
+            if warp == 0:
+                # Every lane in routing warp 0 reads the same two endpoints once.
+                # They remain register-resident across all route groups for this CTA.
+                mapped_start_block = cutlass.Int32(
+                    mMappedNeighborIntervals[q_tile_idx, 0]
+                )
+                mapped_end_block = cutlass.Int32(
+                    mMappedNeighborIntervals[q_tile_idx, 1]
+                )
 
         storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
         if warp == 0 and lane == 0:
@@ -452,6 +470,11 @@ class SolAttnForwardSm120:
                             kv_block >= sink_start_block
                             and kv_block < sink_end_block
                         )
+                        if cutlass.const_expr(self.mapped_neighbors_enabled):
+                            exact = exact or (
+                                kv_block >= mapped_start_block
+                                and kv_block < mapped_end_block
+                            )
                     ballot = cutlass.Int32(
                         cute.arch.vote_ballot_sync(exact)
                     )
@@ -611,6 +634,11 @@ class SolAttnForwardSm120:
                 if block_len > N:
                     block_len = cutlass.Int32(N)
                 mask_exact_scores(tSrS, tScS, block_len, q_len)
+                if cutlass.const_expr(self.key_bias_enabled):
+                    add_exact_key_bias(
+                        tSrS, tScS, mKeyBias, exact_block, block_len, q_len,
+                        cutlass.Float32(1.4426950408889634) / scale_softmax_log2e,
+                    )
                 row_scale = online_softmax(
                     tSrS, max_m, sum_m, scale_softmax_log2e
                 )
@@ -698,6 +726,8 @@ class SolAttnForwardSm120:
         kc: cute.Tensor,
         vc: cute.Tensor,
         threshold: cute.Tensor,
+        key_bias: cute.Tensor,
+        mapped_neighbor_intervals: cute.Tensor,
         lse: cute.Tensor,
         softmax_scale: cutlass.Float32,
         sink_start_block: cutlass.Int32,
@@ -872,6 +902,8 @@ class SolAttnForwardSm120:
             tma_tensor_KC,
             tma_tensor_VC,
             threshold,
+            key_bias,
+            mapped_neighbor_intervals,
             lse_target,
             tma_atom_Q,
             tma_atom_K,
@@ -1032,6 +1064,31 @@ def mask_exact_scores(
         for n in cutlass.range_constexpr(cute.size(scores_mn, mode=[1])):
             if (not valid_row) or coords_mn[m, n][1] >= block_len:
                 scores_mn[m, n] = -cutlass.Float32.inf
+
+
+@cute.jit
+def add_exact_key_bias(
+    scores: cute.Tensor,
+    coords: cute.Tensor,
+    key_bias: cute.Tensor,
+    exact_block: cutlass.Int32,
+    block_len: cutlass.Int32,
+    q_len: cutlass.Int32,
+    inv_softmax_scale: cutlass.Float32,
+):
+    """Add natural-log key measure as b/scale to valid exact raw QK scores."""
+    scores_mn = layout_utils.reshape_acc_to_mn(scores)
+    coords_mn = layout_utils.reshape_acc_to_mn(coords)
+    for m in cutlass.range_constexpr(cute.size(scores_mn, mode=[0])):
+        valid_row = coords_mn[m, 0][0] < q_len
+        for n in cutlass.range_constexpr(cute.size(scores_mn, mode=[1])):
+            local_col = coords_mn[m, n][1]
+            if valid_row and local_col < block_len:
+                absolute_col = exact_block * cutlass.Int32(N) + local_col
+                scores_mn[m, n] = (
+                    cutlass.Float32(scores_mn[m, n])
+                    + cutlass.Float32(key_bias[absolute_col]) * inv_softmax_scale
+                )
 
 
 @cute.jit

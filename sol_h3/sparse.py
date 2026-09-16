@@ -8,12 +8,9 @@ import torch.nn.functional as F
 
 
 BLOCK_SIZE = 64
+MAPPED_ABI_VERSION = "sm120-mapped-neighbor-runtime-v4"
 ARITH_MEAN_ABS_LIMIT = 0.002
 ARITH_REL_L2_LIMIT = 0.005
-# The all-selected calibration is a numerical sanity check for an approximate
-# attention kernel, not a bitwise-parity test. Aggregate error is the primary
-# contract. A scale-aware peak guard remains only to catch gross finite
-# corruption that can be diluted by a very large tensor norm.
 ARITH_CATASTROPHIC_MAX_FLOOR = 0.5
 ARITH_CATASTROPHIC_REFERENCE_PEAK_MULTIPLIER = 4.0
 
@@ -23,21 +20,14 @@ class KernelUnavailable(RuntimeError):
 
 
 def _sink_blocks(start, tokens, rows):
-    """Validate an exact prefix interval and describe its overlapping 64-row blocks.
-
-    Sol-H3 only requests prefix sinks beginning at row zero. The final partial
-    block is intentionally rounded outward: this makes a few extra keys exact,
-    which is semantics-preserving and only slightly more expensive.
-    """
     if type(start) is not int or type(tokens) is not int or type(rows) is not int:
         raise RuntimeError("SOL sink geometry must use integer row counts")
-    if start != 0:
-        raise RuntimeError("Sol-H3 currently supports only a prefix sink beginning at row zero")
-    if tokens < 0 or tokens > rows:
-        raise RuntimeError("SOL sink row count is outside the current sequence")
+    if start < 0 or tokens < 0 or rows < 0 or start > rows or start + tokens > rows:
+        raise RuntimeError("SOL sink row range is outside the current sequence")
     if tokens == 0:
-        return [0, 0]
-    return [0, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
+        block = start // BLOCK_SIZE
+        return [block, block]
+    return [start // BLOCK_SIZE, (start + tokens + BLOCK_SIZE - 1) // BLOCK_SIZE]
 
 
 def load_kernel(device):
@@ -58,18 +48,22 @@ def load_kernel(device):
             raise RuntimeError(
                 f"Sana selected {backend}; SM120 requires CuTe (cutlass.cute and cuda.bindings.driver)"
             )
-        # Import lazy dependencies before returning a usable kernel. No compilation here.
         from ._vendor.sol_attn import preprocess  # noqa: F401
         from ._vendor.sol_attn.sm120 import make_kernel  # noqa: F401
     except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
         raise RuntimeError(f"Sana Sol-Attn initialization failed: {exc}") from exc
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
-               sink_start=0, sink_tokens=0):
-        _sink_blocks(sink_start, sink_tokens, k.shape[1])  # validate prefix geometry
-        return sol_attn(q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
-                        thresh_type=thresh_type, kv_splits=kv_splits,
-                        sink_start=sink_start, sink_tokens=sink_tokens)
+               sink_start=0, sink_tokens=0, key_bias=None,
+               mapped_neighbor_intervals=None):
+        _sink_blocks(sink_start, sink_tokens, k.shape[1])
+        return sol_attn(
+            q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
+            thresh_type=thresh_type, kv_splits=kv_splits,
+            sink_start=sink_start, sink_tokens=sink_tokens,
+            key_bias=key_bias,
+            mapped_neighbor_intervals=mapped_neighbor_intervals,
+        )
 
     kernel.backend_name = backend
     kernel.source_tree_verified = True
@@ -78,15 +72,6 @@ def load_kernel(device):
 
 
 def error_metrics(got, want):
-    """Return aggregate and scale-aware arithmetic calibration metrics.
-
-    Sana's SM120 implementation is explicitly a mixed approximate/exact
-    attention mainloop. In all-selected calibration mode, isolated BF16/CuTe
-    peaks can therefore be much larger than the tensor-wide error without
-    indicating a bad route or broken kernel. Mean absolute and relative L2
-    error are the primary contract; max error remains telemetry plus a broad
-    scale-aware corruption guard.
-    """
     got_f = got.float()
     want_f = want.float()
     delta = got_f - want_f
@@ -124,7 +109,6 @@ def error_metrics(got, want):
 
 
 def arithmetic_gate_passes(metrics):
-    """Accept close aggregate arithmetic while rejecting broad/gross corruption."""
     return bool(
         metrics.get("finite")
         and metrics["mean_abs"] <= ARITH_MEAN_ABS_LIMIT
@@ -133,23 +117,43 @@ def arithmetic_gate_passes(metrics):
     )
 
 
-def _dense_reference(q, k, v, dense_attention):
+def _dense_reference(q, k, v, dense_attention, key_bias=None):
     if dense_attention is not None:
         out = dense_attention(q, k, v)
         expected = (q.shape[0], q.shape[2], q.shape[1], q.shape[3])
         if out.shape != expected:
             raise RuntimeError(f"Dense SOL reference returned {tuple(out.shape)}, expected {expected}")
         return out
-    return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
+    bias = None if key_bias is None else key_bias.to(dtype=q.dtype).view(1, 1, 1, -1)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=bias).transpose(1, 2)
 
 
 def _bthd_layout_key(*tensors):
-    """Describe the exact BTHD layouts consumed by CuTe for calibration identity."""
     return tuple((tuple(x.shape), tuple(x.stride())) for x in tensors)
 
 
+def _validate_mapped_descriptor(mapped, q, k):
+    if mapped is None:
+        return False
+    q_tiles = (q.shape[2] + BLOCK_SIZE - 1) // BLOCK_SIZE
+    if (
+        not torch.is_tensor(mapped)
+        or mapped.ndim != 2
+        or tuple(mapped.shape) != (q_tiles, 2)
+        or mapped.dtype != torch.int32
+        or mapped.device != q.device
+        or not mapped.is_contiguous()
+    ):
+        raise RuntimeError(
+            "mapped SOL requires contiguous int32 [ceil(Tq/64), 2] metadata on the QKV device"
+        )
+    return True
+
+
 def attention(q, k, v, prefix, config, state, dense_attention=None,
-              recompute_prefix_queries=True):
+              recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,
+              calibration_identity=None, mapped_neighbor_intervals=None,
+              mapped_calibration_identity=None):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
             or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
             or q.shape[0] != 1 or q.shape[-1] != 128
@@ -160,6 +164,32 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         raise RuntimeError("Prefix query recomputation exceeds the available Q rows")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
+
+    mapped_enabled = _validate_mapped_descriptor(mapped_neighbor_intervals, q, k)
+    if mapped_enabled:
+        if key_bias is not None or exact_k_blocks is not None or calibration_identity is not None:
+            raise RuntimeError("weighted/exact-range SOL cannot be combined with mapped-neighbor metadata")
+        if mapped_calibration_identity is not None and not isinstance(mapped_calibration_identity, str):
+            raise RuntimeError("mapped SOL calibration identity must be a string when supplied")
+    elif mapped_calibration_identity is not None:
+        raise RuntimeError("mapped SOL calibration identity was supplied without metadata")
+
+    if key_bias is not None:
+        if (not torch.is_tensor(key_bias) or key_bias.ndim != 1
+                or key_bias.shape[0] != k.shape[2] or key_bias.device != q.device
+                or key_bias.dtype != torch.float32 or not key_bias.is_contiguous()):
+            raise RuntimeError("weighted SOL requires contiguous FP32 key_bias with one value per K row")
+        if not isinstance(calibration_identity, str) or not calibration_identity:
+            raise RuntimeError("weighted SOL requires a semantic calibration identity")
+        if (not isinstance(exact_k_blocks, (tuple, list)) or len(exact_k_blocks) != 2
+                or any(type(x) is not int for x in exact_k_blocks)):
+            raise RuntimeError("weighted SOL requires one exact K block interval")
+        max_blocks = (k.shape[2] + BLOCK_SIZE - 1) // BLOCK_SIZE
+        if exact_k_blocks[0] < 0 or exact_k_blocks[1] < exact_k_blocks[0] or exact_k_blocks[1] > max_blocks:
+            raise RuntimeError("weighted SOL exact K block interval is out of range")
+    elif not mapped_enabled and (exact_k_blocks is not None or calibration_identity is not None):
+        raise RuntimeError("weighted SOL routing metadata was supplied without key_bias")
+
     kernel_loader_s = 0.0
     if state.kernel is None:
         failure = getattr(state, "kernel_failure", None)
@@ -176,23 +206,24 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
 
-    # CuTe accepts innermost-contiguous strided BTHD tensors. Preserve the exact
-    # transposed views instead of materialising Q/K/V copies on every SOL call.
     qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
 
     layout_key = _bthd_layout_key(qb, kb, vb)
-    key = (q.device, q.dtype, layout_key)
+    # Descriptor values are intentionally absent: every map with this layout reuses
+    # one compiled mapped ABI. The runtime tensor remains a kernel argument.
+    mapped_identity = (MAPPED_ABI_VERSION, True) if mapped_enabled else (MAPPED_ABI_VERSION, False)
+    key = (q.device, q.dtype, layout_key, calibration_identity, mapped_identity)
     calibrating = key not in state.sparse_verified
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
-        # The all-selected gate now validates the exact strided layout that the
-        # hot path will reuse. error_metrics() already performs scalar reads, so
-        # this adds no new steady-state synchronization point.
-        got = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-                           sink_start=0, sink_tokens=kb.shape[1])
-        want = _dense_reference(q, k, v, None)
+        got = state.kernel(
+            qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
+            sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
+            mapped_neighbor_intervals=mapped_neighbor_intervals,
+        )
+        want = _dense_reference(q, k, v, None, key_bias=key_bias)
         metrics = error_metrics(got, want)
         gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(metrics):
@@ -202,6 +233,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             "shape": list(q.shape),
             "kv_shape": list(k.shape),
             "backend": getattr(state.kernel, "backend_name", "test_substitute"),
+            "mapped_neighbor_abi": mapped_enabled,
+            "mapped_abi_version": MAPPED_ABI_VERSION,
             "kernel_loader_s": kernel_loader_s,
             "gate_wall_s": gate_wall_s,
             "materialized_qkv_bytes": 0,
@@ -210,11 +243,21 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             **metrics,
         })
         del got, want
-    out = state.kernel(qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-                       sink_start=0, sink_tokens=prefix)
-    # Normal H3 replaces non-video query rows with the inherited dense provider.
-    # VDN local Q contains only requested rows; sink_rows describes K/V only.
+
+    if exact_k_blocks is None:
+        sink_start, sink_tokens = 0, prefix
+    else:
+        sink_start = exact_k_blocks[0] * BLOCK_SIZE
+        sink_end = min(k.shape[2], exact_k_blocks[1] * BLOCK_SIZE)
+        sink_tokens = max(0, sink_end - sink_start)
+    out = state.kernel(
+        qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
+        sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias,
+        mapped_neighbor_intervals=mapped_neighbor_intervals,
+    )
     if prefix and recompute_prefix_queries:
-        out[:, :prefix] = _dense_reference(q[:, :, :prefix], k, v, dense_attention)
+        out[:, :prefix] = _dense_reference(
+            q[:, :, :prefix], k, v, dense_attention, key_bias=key_bias
+        )
     state.sparse_calls += 1
     return out.reshape(1, q.shape[2], -1)
