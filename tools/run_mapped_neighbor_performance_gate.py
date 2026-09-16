@@ -2,8 +2,9 @@
 
 The candidate and historical M execute in separate fresh subprocesses on the same
 GPU/runtime and consume the same frozen E Q/K/V plus M report. The historical
-subprocess imports exact diagnostic PR #13 head. This runner persists both raw
-transcripts and a combined comparison report before returning pass/fail.
+subprocess imports exact diagnostic PR #13 head and receives only geometry already
+verified by the production probe against preserved M identities. This runner
+persists both raw transcripts and a combined comparison report before pass/fail.
 
 It does not run H3 and does not regenerate R/W/E/M.
 """
@@ -75,6 +76,43 @@ def _extract_historical_report(stdout: str) -> dict[str, Any]:
         if isinstance(value, dict) and value.get("kind") == "historical_m_same_input_timing_probe_v1":
             return value
     raise RuntimeError("historical M probe did not end with the expected JSON report")
+
+
+def _candidate_geometry(candidate_report: dict[str, Any]) -> dict[str, Any]:
+    geometry = candidate_report.get("geometry")
+    if not isinstance(geometry, dict) or geometry.get("matches_preserved_m_geometry") is not True:
+        raise RuntimeError("candidate production report lacks preserved-M-matched geometry")
+    q_rows = geometry.get("q_rows")
+    kv_rows = geometry.get("kv_rows")
+    sink_rows = geometry.get("sink_rows")
+    if any(type(value) is not int for value in (q_rows, kv_rows, sink_rows)):
+        raise RuntimeError("candidate geometry Q/KV/sink rows are not integers")
+    if q_rows <= 0 or kv_rows <= 0 or not 0 <= sink_rows <= kv_rows:
+        raise RuntimeError("candidate geometry Q/KV/sink rows are invalid")
+    query_sha = geometry.get("query_positions_sha256")
+    if not isinstance(query_sha, str) or len(query_sha) != 64:
+        raise RuntimeError("candidate geometry query-position digest is invalid")
+    intervals = geometry.get("mapped_neighbor_intervals")
+    if not isinstance(intervals, list) or not intervals:
+        raise RuntimeError("candidate geometry is missing mapped-neighbor intervals")
+    for item in intervals:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or any(type(value) is not int for value in item)
+            or not 0 <= item[0] < item[1] <= math.ceil(kv_rows / 64)
+        ):
+            raise RuntimeError(f"candidate geometry contains an invalid mapped-neighbor interval: {item!r}")
+    if len(intervals) != math.ceil(q_rows / 64):
+        raise RuntimeError("candidate geometry descriptor length does not match its Q64 domain")
+    return {
+        "q_rows": q_rows,
+        "kv_rows": kv_rows,
+        "sink_rows": sink_rows,
+        "query_positions_sha256": query_sha,
+        "mapped_neighbor_intervals": intervals,
+        "diagnostic_descriptor_sha256": geometry.get("diagnostic_descriptor_sha256"),
+    }
 
 
 def _positive_median(timing: Any, label: str) -> float:
@@ -223,8 +261,10 @@ def main() -> None:
         candidate_report = candidate_envelope.get("child_report")
         if not isinstance(candidate_report, dict) or candidate_report.get("production_same_input_gate_pass") is not True:
             raise RuntimeError("candidate production probe result is missing its passed child report")
+        candidate_geometry = _candidate_geometry(candidate_report)
         report["candidate_result_path"] = str(candidate_result_path)
         report["candidate_result_sha256"] = _sha256_file(candidate_result_path)
+        report["candidate_verified_geometry"] = candidate_geometry
     except (OSError, json.JSONDecodeError, RuntimeError) as exc:
         report["failure"] = f"candidate production result could not be validated: {exc}"
         _write_report(report_path, report)
@@ -234,6 +274,12 @@ def main() -> None:
         sys.executable,
         str(historical_probe),
         "--historical-sol-path", str(args.historical_sol_path.resolve()),
+        "--mapped-neighbor-intervals-json",
+        json.dumps(candidate_geometry["mapped_neighbor_intervals"], separators=(",", ":")),
+        "--query-positions-sha256", candidate_geometry["query_positions_sha256"],
+        "--q-rows", str(candidate_geometry["q_rows"]),
+        "--kv-rows", str(candidate_geometry["kv_rows"]),
+        "--sink-rows", str(candidate_geometry["sink_rows"]),
         *common,
     ]
     report["historical_command"] = historical_command
@@ -267,6 +313,10 @@ def main() -> None:
         raise RuntimeError("candidate and historical M did not consume the same E evidence")
     if candidate_report.get("m_report_sha256") != historical_report.get("m_report_sha256"):
         raise RuntimeError("candidate and historical M did not consume the same M report")
+    if candidate_geometry["diagnostic_descriptor_sha256"] != historical_report.get("descriptor_sha256"):
+        raise RuntimeError("candidate and historical M descriptor identities differ")
+    if candidate_geometry["query_positions_sha256"] != historical_report.get("query_positions_sha256"):
+        raise RuntimeError("candidate and historical M query-position identities differ")
 
     candidate_timing = (candidate_report.get("warmed_kernel_timing") or {}).get("mapped")
     historical_timing = historical_report.get("warmed_m_timing")
