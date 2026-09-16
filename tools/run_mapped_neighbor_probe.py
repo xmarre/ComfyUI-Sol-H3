@@ -11,6 +11,7 @@ It does not execute H3 and does not regenerate R/W/E/M.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import importlib.metadata
 import json
@@ -36,6 +37,7 @@ EXPECTED_SOL_BLOBS = {
     "sol_h3/mapped_neighbors.py": "6a527beb80b4072cb2b611019655ae50be0195d5",
     "sol_h3/sparse.py": "b37892cab6ed75736f70b23dcd2690a6649b060f",
     "sol_h3/provenance.py": "e3d0e3341d18e21080c33bf0f6fae4b8ebe0e237",
+    "sol_h3/sol_manifest.json": "1dfd622bd102aa9f66db00f5dc49aa627560173e",
     "tools/mapped_neighbor_probe.py": "77517bcc0fd2c2b9db9debf461923828e92496aa",
 }
 EXPECTED_VDN_BLOBS = {
@@ -214,10 +216,14 @@ def main() -> None:
     completed = subprocess.run(command, text=True, capture_output=True, check=False)
 
     output_root = args.output_dir.resolve()
-    stem = f"{CAPTURE_ID}-block{args.block}-group{args.group}-production-mapped-neighbor"
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    stem = f"{CAPTURE_ID}-block{args.block}-group{args.group}-{run_stamp}-production-mapped-neighbor"
     stdout_path = output_root / f"{stem}.stdout.txt"
     stderr_path = output_root / f"{stem}.stderr.txt"
     result_path = output_root / f"{stem}.json"
+    for path in (stdout_path, stderr_path, result_path):
+        if path.exists():
+            raise RuntimeError(f"refusing to overwrite existing production probe evidence: {path}")
     _atomic_write(stdout_path, completed.stdout.encode("utf-8"))
     _atomic_write(stderr_path, completed.stderr.encode("utf-8"))
 
@@ -228,17 +234,19 @@ def main() -> None:
     except RuntimeError as exc:
         parse_error = str(exc)
 
+    manifest_path = sol_root / "sol_h3" / "sol_manifest.json"
     envelope = {
         "schema_version": 1,
         "kind": "production_mapped_neighbor_probe_run_v1",
         "capture_id": CAPTURE_ID,
+        "run_stamp_utc": run_stamp,
         "source_gate_complete": True,
         "sources": source_reports,
         "vendor": {
             "source": vendor.get("source"),
             "revision": vendor.get("revision"),
             "contract": vendor.get("contract"),
-            "manifest_sha256": vendor.get("manifest_sha256"),
+            "manifest_sha256": _sha256_file(manifest_path),
         },
         "runtime": runtime,
         "preserved_runtime_exact": True,
