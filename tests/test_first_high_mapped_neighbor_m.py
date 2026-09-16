@@ -30,7 +30,7 @@ def test_m_overlay_retargets_exact_e_request_mode_only():
 
 
 def test_interval_contract_is_one_bounded_interval_per_q64_tile():
-    assert m._validate_intervals(128, 320, ((0, 3), (2, 6))) == ((0, 3), (2, 6))
+    assert m._validate_intervals(128, 384, ((0, 3), (2, 6))) == ((0, 3), (2, 6))
     with pytest.raises(RuntimeError, match="one bounded"):
         m._validate_intervals(128, 320, ((0, 3),))
     with pytest.raises(RuntimeError, match="reviewed.*bound"):
