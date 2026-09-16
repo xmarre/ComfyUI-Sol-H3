@@ -12,7 +12,7 @@ def test_detailed_metric_payload_satisfies_production_arithmetic_gate_schema():
     want = torch.zeros((1, 4, 2, 3), dtype=torch.float32)
     want[0, 1, 0, 2] = 18.125
     got = want.clone()
-    got[0, 2, 1, 1] = 0.0625
+    got[0, 2, 1, 1] = 0.01
 
     metrics = e._detailed_bthd_metrics(got, want)
 
