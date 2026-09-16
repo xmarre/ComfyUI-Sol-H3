@@ -45,7 +45,15 @@ def verify_source():
             'Packaged Sana source file set mismatch: '
             f'missing={missing or []}, unexpected={unexpected or []}'
         )
+    mismatches = []
     for name, hashes in manifest['files'].items():
-        if not _matches_packaged_hash(source / name, hashes['packaged_sha256']):
-            raise RuntimeError(f'Packaged Sana source hash mismatch: {name}')
+        path = source / name
+        if not _matches_packaged_hash(path, hashes['packaged_sha256']):
+            mismatches.append({
+                'path': name,
+                'expected': hashes['packaged_sha256'],
+                'actual': hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+    if mismatches:
+        raise RuntimeError(f'Packaged Sana source hash mismatch: {mismatches}')
     return manifest
