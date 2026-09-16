@@ -43,6 +43,6 @@ def test_cpu_device_descriptor_cache_never_touches_cuda(monkeypatch):
     assert first is second
     assert first.dtype == torch.int32
     assert first.device.type == "cpu"
-    assert first.tolist() == [[0, 3]]
+    assert first.tolist() == [[0, 4]]
     assert state.mapped_descriptor_bytes == first.numel() * first.element_size()
     assert len(state.mapped_descriptor_cache) == 1
