@@ -31,6 +31,7 @@ CAPTURE_ID = "234ed062128e43ed8d5ec63e27517b22"
 E_FULL_SHA256 = "e25ff53bb3e6f7d6c1780ba9a1bb44288be1b3e095e87166a77b152971e8a6d5"
 E_GROUP10_SHA256 = "7abacbb03407a7486329ce05bcb4ed2a2778f9eb090c6f08ec890a658bf3f9ec"
 M_JSON_SHA256 = "1914990091be84bf01c382820b1b12e7f73a9886db114ce0f820fced4122b0ba"
+PRESERVED_TAU = 1.0
 EXPECTED_RUNTIME = {
     "torch": "2.10.0+cu130",
     "torch_cuda": "13.0",
@@ -106,6 +107,12 @@ def _runtime_identity(device: torch.device) -> dict[str, Any]:
     if mismatches:
         raise RuntimeError("historical M runtime differs from the preserved comparison runtime: " + "; ".join(mismatches))
     return identity
+
+
+def _require_preserved_tau(value: Any) -> float:
+    if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) != PRESERVED_TAU:
+        raise ValueError(f"historical M comparison requires tau={PRESERVED_TAU}, got {value!r}")
+    return PRESERVED_TAU
 
 
 def _iter_records(value: Any, kind: str):
@@ -209,14 +216,16 @@ def main() -> None:
     parser.add_argument("--group", type=int, choices=WITNESS_GROUPS, default=10)
     parser.add_argument("--block", type=int, default=2)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--tau", type=float, default=PRESERVED_TAU)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
     if min(args.warmup, args.repeats) < 1:
         parser.error("--warmup and --repeats must be positive")
-    if not math.isfinite(args.tau) or args.tau <= 0.0:
-        parser.error("--tau must be a finite positive value")
+    try:
+        args.tau = _require_preserved_tau(args.tau)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.q_rows <= 0 or args.kv_rows <= 0 or not 0 <= args.sink_rows <= args.kv_rows:
         parser.error("candidate-verified Q/KV/sink geometry is invalid")
     if len(args.query_positions_sha256) != 64:
