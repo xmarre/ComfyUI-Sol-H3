@@ -38,7 +38,7 @@ EXPECTED_SOL_BLOBS = {
     "sol_h3/sparse.py": "b37892cab6ed75736f70b23dcd2690a6649b060f",
     "sol_h3/provenance.py": "e3d0e3341d18e21080c33bf0f6fae4b8ebe0e237",
     "sol_h3/sol_manifest.json": "1dfd622bd102aa9f66db00f5dc49aa627560173e",
-    "tools/mapped_neighbor_probe.py": "77517bcc0fd2c2b9db9debf461923828e92496aa",
+    "tools/mapped_neighbor_probe.py": "445055a66699e66d33da52242749248b2abcae4d",
 }
 EXPECTED_VDN_BLOBS = {
     "vdn_h3/query_positions.py": "cadb2ad93da16cdc11365f2c4008527d2ccdbb4d",
