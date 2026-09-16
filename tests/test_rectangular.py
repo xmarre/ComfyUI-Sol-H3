@@ -77,8 +77,9 @@ def test_cute_host_output_lse_sink_and_compile_cache(monkeypatch):
         prepares.append((q.shape[1], k.shape[1], kw))
         kc = torch.empty(1, (k.shape[1] + 63)//64, 2, 128)
         return kc, kc, torch.empty(1, (q.shape[1] + 63)//64, 2)
-    def compile_(key, tensors, scale, start, end, stream, key_bias_enabled):
-        compiles.append((key, [t.shape for t in tensors], start, end, key_bias_enabled))
+    def compile_(key, tensors, scale, start, end, stream, key_bias_enabled, mapped_neighbors_enabled):
+        compiles.append((key, [t.shape for t in tensors], start, end,
+                         key_bias_enabled, mapped_neighbors_enabled))
         def compiled(*args, **kwargs):
             args[3].copy_(args[0])
         interface._compiled[key] = compiled
@@ -93,10 +94,11 @@ def test_cute_host_output_lse_sink_and_compile_cache(monkeypatch):
                     valid_tokens=tq)
         assert got.shape == q.shape
     assert len(compiles) == 3
-    for _, shapes, start, end, key_bias_enabled in compiles:
+    for _, shapes, start, end, key_bias_enabled, mapped_neighbors_enabled in compiles:
         assert shapes[3] == shapes[0]
         assert shapes[8] == shapes[0][:3]  # LSE: [B,Tq,H]
         assert key_bias_enabled is False
+        assert mapped_neighbors_enabled is False
         assert start == 0 and end == (shapes[1][1] + 63)//64
     assert all(kw['valid_tokens'] == tq and kw['valid_kv_tokens'] == tk
                for tq, tk, kw in prepares)
@@ -124,28 +126,26 @@ def test_diag_threshold_uses_all_kv_blocks(monkeypatch):
     assert threshold.calls[0][1][6:9] == (65, 2, 2)
 
 
-def test_v2_direct_q_ignores_square_payload_and_preserves_domain(monkeypatch):
+def test_v2_rectangular_local_uses_native_even_with_square_payload(monkeypatch):
     cfg = Config(exact=False, backend='sol', dense_evaluations=0, dense_layers=0)
     state = Request(cfg)
     token = _FORWARD.set((SimpleNamespace(blocks=[object()]), state, 0, set(), []))
     monkeypatch.setattr(runtime, '_shape_reason', lambda *a, **kw: None)
     q = torch.randn(3, 2, 128, dtype=torch.bfloat16)
     k, v = (torch.randn(193, 2, 128, dtype=q.dtype) for _ in range(2))
-    def attention(qc, kc, vc, sink, config, request, **kw):
-        assert torch.equal(qc[0].transpose(0, 1), q)
-        assert torch.equal(kc[0].transpose(0, 1), k)
-        assert torch.equal(vc[0].transpose(0, 1), v)
-        assert sink == 65 and kw['recompute_prefix_queries'] is False
-        request.sparse_calls += 1
-        return q.reshape(1, 3, -1)
-    monkeypatch.setattr(sparse, 'attention', attention)
+
+    def unexpected_attention(*args, **kwargs):
+        raise AssertionError('v2 non-aligned local must not infer a mapped sparse route')
+
+    monkeypatch.setattr(sparse, 'attention', unexpected_attention)
+    native_calls = []
     def block(args):
         provider = args['transformer_options'][VDN_KEY_V2]
-        def native():
-            raise AssertionError('unexpected fallback')
         for payload in ({}, {'square_q': object(), 'query_positions': object()}):
-            assert torch.equal(provider(native, q, k, v, kind='local', scale=128**-.5,
-                                        sink_rows=65, **payload), q)
+            assert provider(
+                lambda: native_calls.append('local') or q,
+                q, k, v, kind='local', scale=128**-.5, sink_rows=65, **payload,
+            ) is q
         for kind in ('global', 'anchor', 'flex_masked'):
             assert provider(lambda: kind, q, k, v, kind=kind, scale=128**-.5) == kind
         return {}
@@ -153,8 +153,9 @@ def test_v2_direct_q_ignores_square_payload_and_preserves_domain(monkeypatch):
         BlockPatch(0, cfg)({'transformer_options': {}}, {'original_block': block})
     finally:
         _FORWARD.reset(token)
-    assert state.vdn_rectangular_sol_calls == 2
-    assert state.vdn_kernel_q_rows == state.vdn_requested_q_rows == 6
+    assert native_calls == ['local', 'local']
+    assert state.vdn_rectangular_sol_calls == 0
+    assert state.vdn_kernel_q_rows == state.vdn_requested_q_rows == 0
     assert state.vdn_square_expanded_calls == state.vdn_square_kernel_rows == 0
 
 
