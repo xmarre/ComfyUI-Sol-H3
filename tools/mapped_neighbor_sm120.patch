@@ -1,8 +1,7 @@
 diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/interface.py
-index e68660b..adcb144 100644
 --- a/sol_h3/_vendor/sol_attn/interface.py
 +++ b/sol_h3/_vendor/sol_attn/interface.py
-@@ -1,10 +1,11 @@
+@@ -1,14 +1,16 @@
 -# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
 +# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
  """Public Sol-Attn interface."""
@@ -15,7 +14,12 @@ index e68660b..adcb144 100644
  
  import torch
  
-@@ -20,6 +21,7 @@
+ BLOCK_SIZE = 64
++MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"
+ _CUTE_BACKENDS = {
+     (9, 0): "cute_sm90",
+     (10, 0): "cute_sm100",
+@@ -20,6 +22,7 @@
      (12, 0): "cute_sm120",
  }
  _compiled = {}
@@ -23,7 +27,7 @@ index e68660b..adcb144 100644
  
  
  def _validate_inputs(
-@@ -202,12 +204,16 @@ def _compile_sm120(
+@@ -202,12 +205,16 @@ def _compile_sm120(
      sink_end_block,
      stream,
      key_bias_enabled,
@@ -41,7 +45,7 @@ index e68660b..adcb144 100644
      args = _to_cute_tensors(tensors)
      compiled = cute.compile(
          operator,
-@@ -236,6 +242,7 @@ def _sol_attn_cute(
+@@ -236,6 +243,7 @@ def _sol_attn_cute(
      sink_start,
      valid_tokens=None,
      key_bias=None,
@@ -49,39 +53,43 @@ index e68660b..adcb144 100644
  ):
      from .preprocess import prepare
  
-@@ -264,11 +271,12 @@ def _sol_attn_cute(
+@@ -262,13 +270,16 @@ def _sol_attn_cute(
+             dtype=torch.float32,
+         )
          stream = _stream(q.device)
-         # CuTe specializes tensor layouts.  Shape alone is insufficient now that a caller may
-         # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
+-        # CuTe specializes tensor layouts.  Shape alone is insufficient now that a caller may
+-        # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
 -        # descriptor for a strided view (or vice versa).
-+        # descriptor for a strided view (or vice versa). Runtime mapped-neighbor interval values
-+        # are deliberately absent from this key; only the structural mapped ABI is specialized.
++        # CuTe specializes tensor layouts. Shape alone is insufficient now that a caller may
++        # supply views into an interleaved packed QKV buffer. Mapped descriptor values remain
++        # runtime data; the compile key carries only the structural ABI/source contract.
          layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v))
++        mapped_profile = (
++            MAPPED_NEIGHBOR_CONTRACT if mapped_neighbor_intervals is not None else None
++        )
          key = (
              q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,
 -            layout_key, key_bias is not None,
-+            layout_key, key_bias is not None, mapped_neighbor_intervals is not None,
++            layout_key, key_bias is not None, mapped_profile,
          )
  
          if arch == (9, 0):
-@@ -352,19 +360,37 @@ def _sol_attn_cute(
-                 sink_start,
+@@ -353,18 +364,36 @@ def _sol_attn_cute(
                  sink_tokens,
              )
--            key_bias_arg = key_bias if key_bias is not None else threshold
+             key_bias_arg = key_bias if key_bias is not None else threshold
 -            tensors = [q, k, v, output, kc, vc, threshold, key_bias_arg, lse]
-+            # The existing SM120 key-bias tensor slot is mutually exclusive with
-+            # mapped routing. Reusing it avoids any ordinary-path argument or
-+            # allocation change while still passing the descriptor as a runtime
-+            # CuTe tensor in the mapped specialization.
-+            route_metadata_arg = (
-+                key_bias
-+                if key_bias is not None
-+                else mapped_neighbor_intervals
++            mapped_arg = (
++                mapped_neighbor_intervals
 +                if mapped_neighbor_intervals is not None
 +                else threshold
 +            )
-+            tensors = [q, k, v, output, kc, vc, threshold, route_metadata_arg, lse]
++            # Disabled optional arguments reuse the already-live threshold tensor;
++            # ordinary and weighted calls allocate no mapped metadata.
++            tensors = [
++                q, k, v, output, kc, vc, threshold,
++                key_bias_arg, mapped_arg, lse,
++            ]
              compiled = _compiled.get(key)
              if compiled is None:
 -                compiled, args = _compile_sm120(
@@ -93,8 +101,8 @@ index e68660b..adcb144 100644
 -                    stream,
 -                    key_bias is not None,
 -                )
-+                # CuTe's global compiled cache is shared by concurrent calls. Serialize
-+                # only first compilation for one structural key and recheck under lock.
++                # CuTe's compiled cache is process-global. Serialize only first
++                # compilation for one structural key and recheck under the lock.
 +                with _compile_lock:
 +                    compiled = _compiled.get(key)
 +                    if compiled is None:
@@ -113,7 +121,25 @@ index e68660b..adcb144 100644
              else:
                  args = _to_cute_tensors(tensors)
              compiled(
-@@ -443,6 +469,7 @@ def sol_attn(
+@@ -397,7 +426,7 @@ def _pad_to_bucket(q, k, v, bucket_size: int):
+     )
+     padded = packed.split(q.shape[3], dim=-1)
+     # Ulysses produces Q/K/V by splitting one contiguous [..., Q | K | V]
+-    # allocation.  Recover that packed view and copy it in one launch.  The
++    # allocation. Recover that packed view and copy it in one launch. The
+     # fallback retains support for callers that supply independent tensors.
+     head_dim = q.shape[3]
+     same_storage = (
+@@ -424,7 +453,7 @@ def _pad_to_bucket(q, k, v, bucket_size: int):
+     else:
+         for destination, source in zip(padded, (q, k, v)):
+             destination[:, :tokens].copy_(source)
+-    # Only the bucket tail is unwritten.  Clearing it after copying avoids the
++    # Only the bucket tail is unwritten. Clearing it after copying avoids the
+     # old full-capacity memset while preserving exactly the same padded values.
+     packed[:, tokens:].zero_()
+     return padded
+@@ -443,6 +472,7 @@ def sol_attn(
      sink_start: int | None = None,
      compile_bucket_size: int | None = None,
      key_bias: torch.Tensor | None = None,
@@ -121,7 +147,7 @@ index e68660b..adcb144 100644
  ) -> torch.Tensor:
      """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
  
-@@ -472,6 +499,24 @@ def sol_attn(
+@@ -472,6 +502,24 @@ def sol_attn(
          weighted_scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
          if not math.isfinite(weighted_scale) or weighted_scale <= 0.0:
              raise ValueError("weighted Sol-Attn requires a finite positive attention scale")
@@ -146,7 +172,7 @@ index e68660b..adcb144 100644
      if q.shape[1] != k.shape[1] and backend != "cute_sm120":
          raise ValueError("Rectangular attention currently requires cute_sm120")
      valid_tokens = q.shape[1]
-@@ -515,6 +560,7 @@ def sol_attn(
+@@ -515,6 +563,7 @@ def sol_attn(
          sink_start=sink_start,
          valid_tokens=valid_tokens,
          key_bias=key_bias,
@@ -155,10 +181,9 @@ index e68660b..adcb144 100644
  
  
 diff --git a/sol_h3/_vendor/sol_attn/sm120/kernel.py b/sol_h3/_vendor/sol_attn/sm120/kernel.py
-index 2128eb4..57feb6f 100644
 --- a/sol_h3/_vendor/sol_attn/sm120/kernel.py
 +++ b/sol_h3/_vendor/sol_attn/sm120/kernel.py
-@@ -9,10 +9,12 @@ def make_kernel(
+@@ -9,13 +9,15 @@ def make_kernel(
      prefetch_first_exact_k: bool = True,
      prefetch_next_route_k: bool = True,
      key_bias_enabled: bool = False,
@@ -173,8 +198,10 @@ index 2128eb4..57feb6f 100644
      )
  
  
+-__all__ = ["make_kernel"]
++__all__ = ["make_kernel"]
+\ No newline at end of file
 diff --git a/sol_h3/_vendor/sol_attn/sm120/mainloop.py b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
-index 55310f9..4862256 100644
 --- a/sol_h3/_vendor/sol_attn/sm120/mainloop.py
 +++ b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
 @@ -1,4 +1,4 @@
@@ -199,23 +226,34 @@ index 55310f9..4862256 100644
  
      @cute.kernel
      def kernel(
-@@ -423,6 +425,15 @@ def kernel(
-             cute.arch.sync_threads()
+@@ -70,6 +72,7 @@ def kernel(
+         mVC: cute.Tensor,
+         mThreshold: cute.Tensor,
+         mKeyBias: cute.Tensor,
++        mMappedNeighborIntervals: cute.Tensor,
+         mLSE: cute.Tensor,
+         tma_atom_Q: cute.CopyAtom,
+         tma_atom_K: cute.CopyAtom,
+@@ -105,6 +108,18 @@ def kernel(
+         threshold = cutlass.Float32(
+             mThreshold[batch_idx, q_tile_idx, head_idx]
+         )
++        mapped_start_block = cutlass.Int32(0)
++        mapped_end_block = cutlass.Int32(0)
++        if cutlass.const_expr(self.mapped_neighbors_enabled):
++            if warp == 0:
++                # Every lane in routing warp 0 reads the same two endpoints once.
++                # They remain register-resident across all route groups for this CTA.
++                mapped_start_block = cutlass.Int32(
++                    mMappedNeighborIntervals[q_tile_idx, 0]
++                )
++                mapped_end_block = cutlass.Int32(
++                    mMappedNeighborIntervals[q_tile_idx, 1]
++                )
  
-             if warp == 0:
-+                mapped_start_block = cutlass.Int32(0)
-+                mapped_end_block = cutlass.Int32(0)
-+                if cutlass.const_expr(self.mapped_neighbors_enabled):
-+                    mapped_start_block = cutlass.Int32(
-+                        mKeyBias[q_tile_idx, 0]
-+                    )
-+                    mapped_end_block = cutlass.Int32(
-+                        mKeyBias[q_tile_idx, 1]
-+                    )
-                 preceding = cutlass.Int32(0)
-                 lane_mask_lt = cutlass.Int32(0x7FFFFFFF) >> (
-                     cutlass.Int32(31) - lane
-@@ -455,6 +466,11 @@ def kernel(
+         storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
+         if warp == 0 and lane == 0:
+@@ -455,6 +470,11 @@ def kernel(
                              kv_block >= sink_start_block
                              and kv_block < sink_end_block
                          )
@@ -227,3 +265,19 @@ index 55310f9..4862256 100644
                      ballot = cutlass.Int32(
                          cute.arch.vote_ballot_sync(exact)
                      )
+@@ -707,6 +727,7 @@ def __call__(
+         vc: cute.Tensor,
+         threshold: cute.Tensor,
+         key_bias: cute.Tensor,
++        mapped_neighbor_intervals: cute.Tensor,
+         lse: cute.Tensor,
+         softmax_scale: cutlass.Float32,
+         sink_start_block: cutlass.Int32,
+@@ -882,6 +903,7 @@ class SharedStorage:
+             tma_tensor_VC,
+             threshold,
+             key_bias,
++            mapped_neighbor_intervals,
+             lse_target,
+             tma_atom_Q,
+             tma_atom_K,
