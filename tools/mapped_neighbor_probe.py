@@ -556,16 +556,20 @@ def main() -> None:
         if not sparse.arithmetic_gate_passes(arithmetic):
             raise RuntimeError(f"mapped same-route arithmetic gate failed: {arithmetic}")
 
-        ordinary = lambda: kernel(q, k, v, tau=args.tau, sink_start=0, sink_tokens=validated.sink_rows)
-        mapped_call = lambda: kernel(
-            q,
-            k,
-            v,
-            tau=args.tau,
-            sink_start=0,
-            sink_tokens=validated.sink_rows,
-            mapped_neighbor_intervals=mapped,
-        )
+        def ordinary():
+            return kernel(q, k, v, tau=args.tau, sink_start=0, sink_tokens=validated.sink_rows)
+
+        def mapped_call():
+            return kernel(
+                q,
+                k,
+                v,
+                tau=args.tau,
+                sink_start=0,
+                sink_tokens=validated.sink_rows,
+                mapped_neighbor_intervals=mapped,
+            )
+
         timing = _timings({"ordinary": ordinary, "mapped": mapped_call}, args.warmup, args.repeats)
         provenance = verify_source()
         report = {
