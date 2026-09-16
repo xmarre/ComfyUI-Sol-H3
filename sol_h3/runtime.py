@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 import json
@@ -12,6 +12,7 @@ from .interop import (
     VDN_KEY,
     VDN_KEY_V2,
     VDN_KEY_V3,
+    VDN_KEY_V4,
     VDN_PREPROCESS_KEY,
     HistoryPolicy,
     dense_evaluation_warmup,
@@ -44,7 +45,10 @@ class Request:
     external_mixed_weighted_measure_kv_rows: int = 0
     measure_plans: dict = field(default_factory=dict)
     measure_biases: dict = field(default_factory=dict)
+    mapped_descriptor_cache: OrderedDict = field(default_factory=OrderedDict)
+    mapped_descriptor_bytes: int = 0
     vdn_local_sol_calls: int = 0
+    vdn_mapped_sol_calls: int = 0
     vdn_rectangular_sol_calls: int = 0
     vdn_requested_q_rows: int = 0
     vdn_kernel_q_rows: int = 0
@@ -107,9 +111,12 @@ class SamplingWrapper:
                         "compatibility_fallbacks": dict(state.fallbacks),
                         "dense_provider_failures": dict(state.dense_provider_failures),
                         "vdn_local_sol_calls": state.vdn_local_sol_calls,
+                        "vdn_mapped_sol_calls": state.vdn_mapped_sol_calls,
                         "vdn_rectangular_sol_calls": state.vdn_rectangular_sol_calls,
                         "vdn_requested_q_rows": state.vdn_requested_q_rows,
                         "vdn_kernel_q_rows": state.vdn_kernel_q_rows,
+                        "mapped_descriptor_cache_entries": len(state.mapped_descriptor_cache),
+                        "mapped_descriptor_cache_bytes": state.mapped_descriptor_bytes,
                         "vdn_square_expanded_calls": state.vdn_square_expanded_calls,
                         "vdn_square_requested_rows": state.vdn_square_requested_rows,
                         "vdn_square_kernel_rows": state.vdn_square_kernel_rows,
@@ -182,7 +189,6 @@ def _shape_reason(q, k, v, heads, mask, kw, *, rectangular=False):
 
 
 def _preprocess_chain(provider, q, k, v, heads, kw):
-    """Apply only explicit QKV transforms and return the remaining dense leaf."""
     seen = set()
     while hasattr(provider, "attention_preprocess_v1"):
         if id(provider) in seen:
@@ -201,7 +207,6 @@ def _preprocess_chain(provider, q, k, v, heads, kw):
 
 
 def _provider_leaf(provider):
-    """Return the dense leaf without executing preprocessing transforms."""
     seen = set()
     while hasattr(provider, "attention_preprocess_v1"):
         if id(provider) in seen:
@@ -212,7 +217,6 @@ def _provider_leaf(provider):
 
 
 def _provider_unavailable_reason(exc):
-    """Classify optional-provider loader failures; never absorb compute errors."""
     if not isinstance(exc, (ImportError, OSError)):
         return None
     message = str(exc)
@@ -226,39 +230,24 @@ def _provider_unavailable_reason(exc):
 
 
 def _external_sequence_prefix(contract, layout, rows):
-    """Validate Flow mixed-grid API 2 and return its exact global-prefix sink rows."""
     if not isinstance(contract, dict) or contract.get("api") != 2:
         return None, "external_sequence_native"
     if contract.get("mode") != "dense_gate_no_linear" or contract.get("topology") != "mixed_grid_low_suffix":
         return None, "external_sequence_native"
     names = (
-        "native_sequence_rows",
-        "sequence_rows",
-        "video_start",
-        "temporal",
-        "prefix_t",
-        "source_rows_per_frame",
-        "prefix_rows_per_frame",
+        "native_sequence_rows", "sequence_rows", "video_start", "temporal", "prefix_t",
+        "source_rows_per_frame", "prefix_rows_per_frame",
     )
     if any(type(contract.get(name)) is not int for name in names):
         return None, "external_sequence_contract"
     native, actual, start, temporal, prefix_t, source_rows, prefix_rows = (contract[name] for name in names)
     if (
-        actual != rows
-        or not 0 < start < actual
-        or not 0 < prefix_t < temporal
+        actual != rows or not 0 < start < actual or not 0 < prefix_t < temporal
         or not 0 < source_rows < prefix_rows
         or native != start + temporal * source_rows
         or actual != start + prefix_t * prefix_rows + (temporal - prefix_t) * source_rows
     ):
         return None, "external_sequence_contract"
-
-    # Flow's mixed-grid wrapper deliberately keeps the native low-grid carrier
-    # layout in the model payload while each wrapped transformer block executes
-    # a larger mixed hidden stream. Depending on wrapper ordering, Sol-H3 may
-    # therefore see either the mixed block layout (`actual`) or the native
-    # carrier layout (`native`). Both are valid evidence as long as the packed
-    # prefix agrees with the explicit API-2 contract.
     layout_rows = getattr(layout, "seq_len", None)
     if layout_rows not in {native, actual}:
         return None, "external_sequence_layout"
@@ -272,7 +261,6 @@ def _external_sequence_prefix(contract, layout, rows):
 
 
 def _vdn_provider_api():
-    """Return the installed VDN softmax-provider capability without owning hybrid.py."""
     try:
         from vdn_h3.softmax_provider import PROVIDER_API_VERSION
     except (ImportError, AttributeError):
@@ -302,9 +290,12 @@ class BlockPatch:
         forwarded = {**args, "transformer_options": options}
         route_start = len(routes)
 
-        def record(route, fallback=False, measure_plan=None):
+        def record(route, fallback=False, measure_plan=None, fields=None):
             routes.append((self.index, route))
-            receipt(options, self.index, route, measure_plan=measure_plan, call_token=evaluation)
+            receipt(
+                options, self.index, route,
+                measure_plan=measure_plan, call_token=evaluation, fields=fields,
+            )
             if fallback:
                 state.fallbacks[route] += 1
 
@@ -349,9 +340,7 @@ class BlockPatch:
                                 log.warning(
                                     "Sol-H3 inherited dense provider %s unavailable (%s); "
                                     "demoting it to the original Comfy attention for this request: %s",
-                                    name,
-                                    reason,
-                                    exc,
+                                    name, reason, exc,
                                 )
                         else:
                             state.dense_attention_backends.add(provider_name(leaf))
@@ -391,10 +380,6 @@ class BlockPatch:
                     except RuntimeError:
                         reason = "packed_layout_not_representable"
 
-                # The legacy representative-KV contract is coupled to VDN API 2
-                # because that contract describes its gather domain. The generic key-measure
-                # contract is not: it binds to the actual all-row H3 layout and only cross-checks
-                # VDN API 2 when that optional contract is present.
                 if legacy_measure_contract is not None and (reason is not None or not external_mixed):
                     raise RuntimeError(
                         "Legacy Flow mixed-grid attention-measure contract requires a valid external mixed sequence"
@@ -425,35 +410,21 @@ class BlockPatch:
                     }
                     if warmup:
                         measure_plan = weighted_measure.prepare(
-                            state,
-                            current_options,
-                            generic_measure_contract,
-                            **bind_kwargs,
+                            state, current_options, generic_measure_contract, **bind_kwargs,
                             implementation_profile=weighted_measure.DENSE_IMPLEMENTATION_PROFILE,
                             numerical_route=weighted_measure.DENSE_NUMERICAL_ROUTE,
                         )
                     else:
                         measure_plan = weighted_measure.prepare(
-                            state,
-                            current_options,
-                            generic_measure_contract,
-                            **bind_kwargs,
+                            state, current_options, generic_measure_contract, **bind_kwargs,
                             implementation_profile=weighted_measure.SPARSE_IMPLEMENTATION_PROFILE,
                             numerical_route=weighted_measure.SPARSE_NUMERICAL_ROUTE,
                         )
-                    # Bind against the original mixed coordinates, then run the
-                    # full-domain preprocessing chain exactly once.
                     q, k, v, dense_provider = _preprocess_chain(dense_provider, q, k, v, heads, kw)
 
                     def weighted_dense_result(plan, *, output_heads=False, qd=q, kd=k, vd=v):
                         return weighted_measure.dense(
-                            qd,
-                            kd,
-                            vd,
-                            heads,
-                            plan,
-                            scale=kw.get("scale"),
-                            output_heads=output_heads,
+                            qd, kd, vd, heads, plan, scale=kw.get("scale"), output_heads=output_heads,
                         )
 
                     if warmup:
@@ -472,15 +443,9 @@ class BlockPatch:
                         return out.transpose(1, 2)
 
                     from .sparse import attention, KernelUnavailable
-
                     try:
                         result = attention(
-                            q,
-                            k,
-                            v,
-                            prefix,
-                            config,
-                            state,
+                            q, k, v, prefix, config, state,
                             dense_attention=weighted_prefix_dense,
                             key_bias=measure_plan.key_log_measure,
                             exact_k_blocks=measure_plan.exact_k_block_range,
@@ -488,10 +453,7 @@ class BlockPatch:
                         )
                     except KernelUnavailable as exc:
                         dense_plan = weighted_measure.prepare(
-                            state,
-                            current_options,
-                            generic_measure_contract,
-                            **bind_kwargs,
+                            state, current_options, generic_measure_contract, **bind_kwargs,
                             implementation_profile=weighted_measure.DENSE_IMPLEMENTATION_PROFILE,
                             numerical_route=weighted_measure.DENSE_NUMERICAL_ROUTE,
                         )
@@ -514,19 +476,12 @@ class BlockPatch:
                 measure_stats = None
                 if legacy_measure_contract is not None:
                     measure_validated = validate_measure_contract(
-                        legacy_measure_contract,
-                        external_contract,
-                        q_rows=int(q.shape[2]),
-                        kv_rows=int(k.shape[2]),
+                        legacy_measure_contract, external_contract,
+                        q_rows=int(q.shape[2]), kv_rows=int(k.shape[2]),
                     )
 
                 state.eligible_calls += 1
                 if measure_validated is not None:
-                    # Full-domain preprocessing (notably Untwist) must execute
-                    # before K/V selection because its metadata uses original
-                    # packed-row coordinates. Rebinding dense_provider to the leaf
-                    # also prevents the dense warmup/reference from preprocessing
-                    # the already-reduced rectangular domain a second time.
                     q, k, v, dense_provider = _preprocess_chain(dense_provider, q, k, v, heads, kw)
                     k, v, measure_stats = reduce_kv(k, v, measure_validated)
                     if warmup:
@@ -547,7 +502,6 @@ class BlockPatch:
                     return out.transpose(1, 2)
 
                 from .sparse import attention, KernelUnavailable
-
                 try:
                     result = attention(q, k, v, prefix, config, state, dense_attention=dense_attention)
                 except KernelUnavailable as exc:
@@ -573,22 +527,16 @@ class BlockPatch:
                     record("sol")
                 return result
 
-            def vdn_provider_v1(native, q, k, v, *, kind, scale, square_aligned=False):
-                if not square_aligned or q.shape != k.shape or q.shape != v.shape:
-                    record("vdn_" + kind + "_native", True)
-                    return native()
-                return vdn_provider_v2(native, q, k, v, kind=kind, scale=scale, square_aligned=square_aligned)
-
-            def vdn_provider_v2(
-                native, q, k, v, *, kind, scale, square_aligned=False, square_q=None, query_positions=None, sink_rows=0
-            ):
+            def _vdn_legacy_local(native, q, k, v, *, kind, scale, square_aligned, sink_rows):
+                # New Sol-H3 never interprets non-aligned v1/v2/v3 locals as physical
+                # query positions. Old providers remain callable for square/aligned
+                # consumers; v4 is the only rectangular mapped-neighbor contract.
                 if kind != "local":
                     record("vdn_" + kind + "_native", True)
                     return native()
-
-                # API v2 owns gathering and supplies the exact restricted KV domain.
-                # square_q/query_positions remain accepted for existing VDN #11 callers;
-                # neither is needed to evaluate the requested Q rows directly.
+                if not square_aligned or q.shape != k.shape or q.shape != v.shape:
+                    record("vdn_local_native", True)
+                    return native()
                 if any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape or q.shape[1:] != k.shape[1:]:
                     record("vdn_local_domain", True)
                     return native()
@@ -596,7 +544,7 @@ class BlockPatch:
                 reason = _shape_reason(qc, kc, vc, q.shape[1], None, {"skip_reshape": True}, rectangular=True)
                 if scale != q.shape[-1] ** -0.5:
                     reason = "vdn_scale"
-                if not isinstance(sink_rows, int) or not 0 <= sink_rows <= k.shape[0]:
+                if type(sink_rows) is not int or not 0 <= sink_rows <= k.shape[0]:
                     reason = "vdn_sink_rows"
                 if reason:
                     record(reason, True)
@@ -607,9 +555,126 @@ class BlockPatch:
                     record("vdn_dense_warmup")
                     return native()
                 from .sparse import attention, KernelUnavailable
-
                 try:
                     result = attention(qc, kc, vc, sink_rows, config, state, recompute_prefix_queries=False)
+                except KernelUnavailable as exc:
+                    record("kernel_unavailable:" + str(exc), True)
+                    return native()
+                result = result.reshape(q.shape[0], q.shape[1], q.shape[2])
+                state.vdn_requested_q_rows += q.shape[0]
+                state.vdn_kernel_q_rows += qc.shape[2]
+                state.vdn_local_sol_calls += 1
+                record("vdn_local_sol")
+                return result
+
+            def vdn_provider_v1(native, q, k, v, *, kind, scale, square_aligned=False):
+                return _vdn_legacy_local(
+                    native, q, k, v, kind=kind, scale=scale,
+                    square_aligned=square_aligned, sink_rows=0,
+                )
+
+            def vdn_provider_v2(
+                native, q, k, v, *, kind, scale, square_aligned=False,
+                square_q=None, query_positions=None, sink_rows=0,
+            ):
+                return _vdn_legacy_local(
+                    native, q, k, v, kind=kind, scale=scale,
+                    square_aligned=square_aligned, sink_rows=sink_rows,
+                )
+
+            def vdn_provider_v3(native, q, k, v, *, kind, scale, square_aligned=False, sink_rows=0):
+                return _vdn_legacy_local(
+                    native, q, k, v, kind=kind, scale=scale,
+                    square_aligned=square_aligned, sink_rows=sink_rows,
+                )
+
+            def vdn_provider_v4(
+                native, q, k, v, *, kind, scale, square_aligned=False,
+                sink_rows=0, query_position_map=None,
+            ):
+                if kind != "local":
+                    record("vdn_" + kind + "_native", True)
+                    return native()
+                if any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape or q.shape[1:] != k.shape[1:]:
+                    record("vdn_local_native_mapping:domain", True)
+                    return native()
+                qc, kc, vc = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
+                reason = _shape_reason(qc, kc, vc, q.shape[1], None, {"skip_reshape": True}, rectangular=True)
+                if scale != q.shape[-1] ** -0.5:
+                    reason = "vdn_scale"
+                if type(sink_rows) is not int or not 0 <= sink_rows <= k.shape[0]:
+                    reason = "vdn_sink_rows"
+                if reason:
+                    record(reason, True)
+                    return native()
+                # Weighted/external routes retain their established owners. The v4
+                # mapped policy is only for VDN's native grouped restricted domain.
+                if (
+                    options.get(weighted_measure.ATTENTION_MEASURE_KEY) is not None
+                    or options.get(FLOW_MIXED_MEASURE_KEY) is not None
+                    or options.get("vdn_h3_external_sequence_v1") is not None
+                ):
+                    record("vdn_local_native_mapping:backend", True)
+                    return native()
+
+                from .mapped_neighbors import (
+                    MappingUnavailable,
+                    compile_descriptor,
+                    device_descriptor,
+                    receipt_fields as mapped_receipt_fields,
+                    validate_preflight_summary,
+                    validate_wire_map,
+                )
+                try:
+                    validated = validate_wire_map(
+                        query_position_map,
+                        q_rows=int(q.shape[0]),
+                        kv_rows=int(k.shape[0]),
+                        sink_rows=sink_rows,
+                    )
+                    descriptor = compile_descriptor(validated)
+                except MappingUnavailable as exc:
+                    record("vdn_local_native_mapping:" + exc.reason, True)
+                    return native()
+
+                # Identity-aligned square calls intentionally remain on the old
+                # selector path; v4 must not perturb ordinary square consumers.
+                if descriptor is None:
+                    return _vdn_legacy_local(
+                        native, q, k, v, kind=kind, scale=scale,
+                        square_aligned=square_aligned, sink_rows=sink_rows,
+                    )
+
+                current_forward = getattr(getattr(model.blocks[self.index], "attn", None), "forward", None)
+                describe = getattr(current_forward, "vdn_query_position_plan_v1", None)
+                layout = options.get("minimax_h3_layout", args.get("layout"))
+                if not callable(describe):
+                    record("vdn_local_native_mapping:owner", True)
+                    return native()
+                summary = describe(options, layout)
+                if not validate_preflight_summary(summary, query_position_map, descriptor):
+                    record("vdn_local_native_mapping:owner", True)
+                    return native()
+
+                state.eligible_calls += 1
+                if warmup:
+                    state.dense_calls += 1
+                    record("vdn_dense_warmup")
+                    return native()
+                try:
+                    mapped_tensor = device_descriptor(state, descriptor, qc.device)
+                except MappingUnavailable as exc:
+                    record("vdn_local_native_mapping:" + exc.reason, True)
+                    return native()
+
+                from .sparse import attention, KernelUnavailable
+                try:
+                    result = attention(
+                        qc, kc, vc, sink_rows, config, state,
+                        recompute_prefix_queries=False,
+                        mapped_neighbor_intervals=mapped_tensor,
+                        mapped_calibration_identity=descriptor.descriptor_digest,
+                    )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
@@ -619,20 +684,13 @@ class BlockPatch:
                 if q.shape[0] != k.shape[0]:
                     state.vdn_rectangular_sol_calls += 1
                 state.vdn_local_sol_calls += 1
-                record("vdn_local_sol")
-                return result
-
-            def vdn_provider_v3(native, q, k, v, *, kind, scale, square_aligned=False, sink_rows=0):
-                return vdn_provider_v2(
-                    native,
-                    q,
-                    k,
-                    v,
-                    kind=kind,
-                    scale=scale,
-                    square_aligned=square_aligned,
-                    sink_rows=sink_rows,
+                state.vdn_mapped_sol_calls += 1
+                from .provenance import CONTRACT
+                record(
+                    "vdn_local_sol_mapped_v1",
+                    fields=mapped_receipt_fields(descriptor, kernel_contract=CONTRACT),
                 )
+                return result
 
             def vdn_preprocess(q, k, v, heads, mask=None, **kw):
                 dense_kw = {**kw, "_inside_attn_wrapper": True}
@@ -645,6 +703,7 @@ class BlockPatch:
             options[VDN_KEY] = vdn_provider_v1
             options[VDN_KEY_V2] = vdn_provider_v2
             options[VDN_KEY_V3] = vdn_provider_v3
+            options[VDN_KEY_V4] = vdn_provider_v4
             if hasattr(previous, "attention_preprocess_v1"):
                 options[VDN_PREPROCESS_KEY] = vdn_preprocess
 
@@ -652,11 +711,9 @@ class BlockPatch:
             block = model.blocks[self.index]
             if config.exact:
                 from .exact import execute_block, ineligible_reason
-
                 reason = ineligible_reason(block, call_args)
                 if reason is None and not state.native_verified and state.native_reason is None:
                     from .native_contract import verify_native
-
                     try:
                         verify_native()
                         state.native_verified = True
@@ -737,8 +794,7 @@ def install(model, config):
             api = _vdn_provider_api()
             log.info(
                 "Sol-H3 detected VDN object patches=%d; softmax-provider module API=%s",
-                vdn_patches,
-                api if api is not None else "missing",
+                vdn_patches, api if api is not None else "missing",
             )
     log.info("Sol-H3 active: %s; AdaLN precompute=%s", config.metadata(), adaln_status(inner))
     return cloned
