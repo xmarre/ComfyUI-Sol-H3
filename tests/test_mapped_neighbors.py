@@ -218,6 +218,6 @@ def test_sm120_mapped_compile_key_ignores_descriptor_values(monkeypatch):
         (False, True),
         (False, False),
     ]
-    assert launches[0][7] is mapped_a
-    assert launches[1][7] is mapped_b
-    assert launches[2][7] is thresholds[2]
+    assert launches[0][8] is mapped_a
+    assert launches[1][8] is mapped_b
+    assert launches[2][8] is thresholds[2]
