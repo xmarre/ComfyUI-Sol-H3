@@ -1,3 +1,4 @@
+import ast
 import os
 from pathlib import Path
 
@@ -118,6 +119,30 @@ def test_operator_witness_accepts_full_payload_or_bounded_shard():
     assert _operator_witness(record, 2, 10) is record
     payload = {"schema_version": 1, "evidence": [{"kind": "other"}, record]}
     assert _operator_witness(payload, 2, 10) is record
+
+
+def test_same_input_report_serializes_effective_tau():
+    source = (Path(__file__).parents[1] / "tools" / "mapped_neighbor_probe.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    matching_reports = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        fields = {
+            key.value: value
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        kind = fields.get("kind")
+        if isinstance(kind, ast.Constant) and kind.value == "production_mapped_neighbor_same_input_probe_v1":
+            matching_reports.append(fields)
+
+    assert len(matching_reports) == 1
+    tau = matching_reports[0].get("tau")
+    assert isinstance(tau, ast.Attribute)
+    assert tau.attr == "tau"
+    assert isinstance(tau.value, ast.Name)
+    assert tau.value.id == "args"
 
 
 @pytest.mark.skipif(not os.environ.get("VDN_PATH"), reason="set VDN_PATH for production v4 geometry integration")
