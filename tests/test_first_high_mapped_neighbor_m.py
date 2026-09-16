@@ -8,13 +8,14 @@ import torch
 
 from sol_h3 import first_high_mapped_neighbor_diagnostic as m
 from sol_h3 import first_high_sol_local_diagnostic as e
+from sol_h3 import interop
 
 
-def _request():
+def _request(mode=m.MODE):
     return (
         ("api", 1),
         ("capture_id", "capture-m"),
-        ("mode", m.MODE),
+        ("mode", mode),
         ("stage", "high"),
         ("logical_call_limit", 1),
         ("sigma", 0.8780487775802612),
@@ -23,10 +24,19 @@ def _request():
     )
 
 
-def test_m_overlay_retargets_exact_e_request_mode_only():
-    parsed = e.parse_request({e.REQUEST_KEY: _request(), "h3_flow_stage": "high"})
-    assert parsed is not None
-    assert parsed["mode"] == "mapped_neighbor_m"
+def test_m_overlay_multiplexes_m_without_invalidating_e_request_mode():
+    parsed_m = e.parse_request({e.REQUEST_KEY: _request(), "h3_flow_stage": "high"})
+    assert parsed_m is not None
+    assert parsed_m["mode"] == "mapped_neighbor_m"
+
+    parsed_e = e.parse_request({e.REQUEST_KEY: _request("all_selected_e"), "h3_flow_stage": "high"})
+    assert parsed_e is not None
+    assert parsed_e["mode"] == "all_selected_e"
+
+
+def test_m_route_is_history_equivalent_to_ordinary_vdn_local_sol():
+    policy = object.__new__(interop.HistoryPolicy)
+    assert policy.accept_receipts([("sol_h3", 2, m.ROUTE)]) is True
 
 
 def test_interval_contract_is_one_bounded_interval_per_q64_tile():
