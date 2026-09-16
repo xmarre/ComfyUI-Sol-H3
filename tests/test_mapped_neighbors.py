@@ -141,6 +141,7 @@ def test_preflight_requires_exact_owner_plan_group_and_wire_identity():
     summary = SimpleNamespace(
         tag="vdn_query_position_plan_v1",
         schema=1,
+        mode="grouped",
         owner_generation=OWNER,
         plan_digest=DIGEST,
         groups=(wire(q_rows=1, kv_rows=1, runs=((0, 1, 0),), group_index=0), value),
@@ -148,6 +149,8 @@ def test_preflight_requires_exact_owner_plan_group_and_wire_identity():
     assert validate_preflight_summary(summary, value, descriptor)
 
     for changed in (
+        SimpleNamespace(**{**summary.__dict__, "schema": True}),
+        SimpleNamespace(**{**summary.__dict__, "mode": "native"}),
         SimpleNamespace(**{**summary.__dict__, "owner_generation": "other"}),
         SimpleNamespace(**{**summary.__dict__, "plan_digest": "b" * 64}),
         SimpleNamespace(**{**summary.__dict__, "groups": (summary.groups[0], wire(
