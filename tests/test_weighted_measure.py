@@ -77,9 +77,8 @@ def test_preprocess_digest_stabilizes_factory_recreated_stateless_functions():
     leaf = Leaf()
 
     def factory():
-        # Mirrors the reviewed Untwist H3 preprocessing shape: the wrapper
-        # function is recreated per model invocation, but the preprocessor itself
-        # carries no closure/default state and reads execution state from kwargs.
+        # Mirrors a no-global preprocessing shape: the wrapper function can be
+        # recreated per model invocation while all numerical state arrives in kwargs.
         def preprocess(q, k, v, heads, **kwargs):
             options = kwargs.get("transformer_options")
             return q, k, v if options is not None else v
@@ -91,6 +90,45 @@ def test_preprocess_digest_stabilizes_factory_recreated_stateless_functions():
     assert first.attention_preprocess_v1[0] is not second.attention_preprocess_v1[0]
     assert first.attention_preprocess_v1[0].__closure__ is None
     assert weighted_measure.preprocess_digest(first) == weighted_measure.preprocess_digest(second)
+
+
+def test_preprocess_digest_changes_when_loaded_mutable_global_changes():
+    class Leaf:
+        pass
+
+    leaf = Leaf()
+    namespace = {"STATE": {"scale": 1.0}}
+    exec(
+        "def preprocess(q, k, v, heads, **kwargs):\n"
+        "    return q, k * STATE['scale'], v\n",
+        namespace,
+    )
+    provider = SimpleNamespace(attention_preprocess_v1=(namespace["preprocess"], leaf))
+
+    first = weighted_measure.preprocess_digest(provider)
+    namespace["STATE"]["scale"] = 0.5
+    second = weighted_measure.preprocess_digest(provider)
+
+    assert first != second
+
+
+def test_preprocess_digest_makes_unsupported_loaded_global_volatile():
+    class Leaf:
+        pass
+
+    class MutableState:
+        pass
+
+    leaf = Leaf()
+    namespace = {"STATE": MutableState()}
+    exec(
+        "def preprocess(q, k, v, heads, **kwargs):\n"
+        "    return (q, k, v) if STATE is not None else (q, v, k)\n",
+        namespace,
+    )
+    provider = SimpleNamespace(attention_preprocess_v1=(namespace["preprocess"], leaf))
+
+    assert weighted_measure.preprocess_digest(provider) != weighted_measure.preprocess_digest(provider)
 
 
 def test_preprocess_digest_keeps_stateful_recreated_functions_owner_bound():
