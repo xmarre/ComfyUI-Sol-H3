@@ -25,6 +25,7 @@ from typing import Any
 import torch
 
 HISTORICAL_M_COMMIT = "b95ad7b3bc7028465547b22fc61300cda53eb110"
+HISTORICAL_SOURCE = "sana-sol-engine"
 HISTORICAL_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-v3"
 SANA_REVISION = "2936c47637380842aaa4a4488fac5006cc542b70"
 CAPTURE_ID = "234ed062128e43ed8d5ec63e27517b22"
@@ -113,6 +114,20 @@ def _require_preserved_tau(value: Any) -> float:
     if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) != PRESERVED_TAU:
         raise ValueError(f"historical M comparison requires tau={PRESERVED_TAU}, got {value!r}")
     return PRESERVED_TAU
+
+
+def _historical_vendor_identity_matches(vendor: Any) -> bool:
+    """Match the fields that actually exist in the frozen diagnostic-M manifest.
+
+    The v3 manifest predates the later explicit ``contract`` manifest field. The
+    contract is verified separately from the frozen checkout's provenance module;
+    the manifest itself proves its source/revision and every packaged file hash.
+    """
+    return bool(
+        isinstance(vendor, dict)
+        and vendor.get("source") == HISTORICAL_SOURCE
+        and vendor.get("revision") == SANA_REVISION
+    )
 
 
 def _iter_records(value: Any, kind: str):
@@ -255,8 +270,8 @@ def main() -> None:
             f"historical M source contract differs from preserved M: contract={CONTRACT!r}, revision={REVISION!r}"
         )
     vendor = verify_source()
-    if vendor.get("contract") != HISTORICAL_CONTRACT or vendor.get("revision") != SANA_REVISION:
-        raise RuntimeError("historical M packaged Sana manifest differs from the preserved source contract")
+    if not _historical_vendor_identity_matches(vendor):
+        raise RuntimeError("historical M packaged Sana manifest differs from the preserved source identity")
 
     e_payload, e_sha = _load_evidence(args.e_evidence)
     m_report, m_sha = _load_m_report(args.m_report)
