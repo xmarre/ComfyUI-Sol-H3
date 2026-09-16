@@ -16,6 +16,7 @@ from tools.mapped_neighbor_probe import (
     _query_positions_from_runs,
     _route_counts,
     _tensor_sha256,
+    _validate_preserved_route_counts,
     controlled_geometry_report,
 )
 
@@ -42,6 +43,52 @@ def test_route_union_is_additive_and_preserves_old_selection():
     assert counts["effective_selected_pairs"] == (
         counts["original_selected_pairs"] + counts["added_selected_pairs"]
     )
+
+
+def test_preserved_public_m_route_report_does_not_require_private_candidate_count():
+    counts = {
+        "original_selected_pairs": 88393,
+        "mapped_candidate_pairs": 3584,
+        "added_selected_pairs": 585,
+        "effective_selected_pairs": 88978,
+        "total_block_pairs": 158592,
+    }
+    witness = {"sparse_selected_block_pairs": 88393}
+    m_record = {
+        "valid": True,
+        "original_selected_pairs": 88393,
+        "added_selected_pairs": 585,
+        "effective_selected_pairs": 88978,
+        "total_block_pairs": 158592,
+        "exact_work_increase_fraction": 0.006618171122147682,
+    }
+
+    fraction = _validate_preserved_route_counts(counts, witness, m_record)
+
+    assert fraction == 585 / 88393
+    assert "mapped_candidate_pairs" not in m_record
+
+
+def test_preserved_route_count_validation_rejects_e_m_divergence():
+    counts = {
+        "original_selected_pairs": 88393,
+        "mapped_candidate_pairs": 3584,
+        "added_selected_pairs": 585,
+        "effective_selected_pairs": 88978,
+        "total_block_pairs": 158592,
+    }
+    witness = {"sparse_selected_block_pairs": 88392}
+    m_record = {
+        "valid": True,
+        "original_selected_pairs": 88393,
+        "added_selected_pairs": 585,
+        "effective_selected_pairs": 88978,
+        "total_block_pairs": 158592,
+        "exact_work_increase_fraction": 0.006618171122147682,
+    }
+
+    with pytest.raises(RuntimeError, match="preserved E witness"):
+        _validate_preserved_route_counts(counts, witness, m_record)
 
 
 def test_decode_route_trace_round_trip_two_words():
