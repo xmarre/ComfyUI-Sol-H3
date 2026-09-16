@@ -22,6 +22,7 @@ import argparse
 from collections import OrderedDict
 import hashlib
 import json
+import math
 from pathlib import Path
 import statistics
 import subprocess
@@ -259,6 +260,51 @@ def _route_counts(old: torch.Tensor, mapped: torch.Tensor) -> dict[str, int]:
     }
 
 
+def _validate_preserved_route_counts(
+    counts: dict[str, int],
+    witness: dict[str, Any],
+    m_record: dict[str, Any],
+) -> float:
+    """Cross-check route accounting against the public E and M durable reports.
+
+    The public M report intentionally omits ``mapped_candidate_pairs`` even though
+    the lower-level execution-contract evidence records it. Do not require a field
+    that is absent from the hash-pinned durable M JSON. Exact descriptor identity
+    plus the old/add/effective/total invariants already determine the same union.
+    """
+    if m_record.get("valid") is not True:
+        raise RuntimeError("preserved M route report is not marked valid")
+    e_original = witness.get("sparse_selected_block_pairs")
+    if type(e_original) is not int or counts["original_selected_pairs"] != e_original:
+        raise RuntimeError(
+            "current saved-E route count differs from the preserved E witness: "
+            f"{counts['original_selected_pairs']} != {e_original}"
+        )
+    for name in (
+        "original_selected_pairs",
+        "added_selected_pairs",
+        "effective_selected_pairs",
+        "total_block_pairs",
+    ):
+        expected = m_record.get(name)
+        if type(expected) is not int or counts[name] != expected:
+            raise RuntimeError(f"same-input route count mismatch for {name}: {counts[name]} != {expected}")
+    if counts["original_selected_pairs"] <= 0:
+        raise RuntimeError("preserved M route accounting has no original exact work")
+    fraction = float(counts["added_selected_pairs"]) / float(counts["original_selected_pairs"])
+    preserved_fraction = m_record.get("exact_work_increase_fraction")
+    if (
+        type(preserved_fraction) is not float
+        or not math.isfinite(preserved_fraction)
+        or not math.isclose(fraction, preserved_fraction, rel_tol=0.0, abs_tol=1.0e-15)
+    ):
+        raise RuntimeError(
+            "same-input exact-work increase differs from preserved M: "
+            f"{fraction} != {preserved_fraction}"
+        )
+    return fraction
+
+
 def _debug_mapped_launch(q, k, v, mapped, *, tau: float, sink_rows: int):
     import cutlass.cute as cute
 
@@ -491,6 +537,12 @@ def main() -> None:
         torch.cuda.synchronize()
         cold_candidate_ms = (time.perf_counter() - cold_started) * 1000.0
         after_first_keys = set(interface._compiled)
+        first_new_keys = after_first_keys - before_keys
+        if len(first_new_keys) != 1:
+            raise RuntimeError(
+                "first production mapped call must create exactly one structural CuTe cache key; "
+                f"created {len(first_new_keys)}"
+            )
 
         alternate = mapped.clone()
         alternate[0, 0] = 0
@@ -535,16 +587,7 @@ def main() -> None:
             raise RuntimeError(f"current production route differs from saved-E OR mapped contract at {mismatch_count} pairs")
 
         counts = _route_counts(old_routes, mapped_routes)
-        for name in (
-            "original_selected_pairs",
-            "mapped_candidate_pairs",
-            "added_selected_pairs",
-            "effective_selected_pairs",
-            "total_block_pairs",
-        ):
-            expected = m_record.get(name)
-            if type(expected) is not int or counts[name] != expected:
-                raise RuntimeError(f"same-input route count mismatch for {name}: {counts[name]} != {expected}")
+        exact_work_increase_fraction = _validate_preserved_route_counts(counts, witness, m_record)
 
         reference = _mixed_route_reference(
             q,
@@ -598,11 +641,12 @@ def main() -> None:
             "descriptor_cold_ms": descriptor_cold_ms,
             "descriptor_warm_host_us": descriptor_warm_host_us,
             "production_cold_first_mapped_ms": cold_candidate_ms,
-            "compile_cache_new_keys_first_descriptor": len(after_first_keys - before_keys),
+            "compile_cache_new_keys_first_descriptor": len(first_new_keys),
             "compile_cache_new_keys_value_change": len(after_second_keys - after_first_keys),
             "route_mismatch_count": mismatch_count,
             "route_counts": counts,
-            "route_counts_match_preserved_m": True,
+            "exact_work_increase_fraction": exact_work_increase_fraction,
+            "route_counts_match_preserved_e_and_m": True,
             "production_debug_arithmetic": production_debug_metrics,
             "production_debug_arithmetic_gate_pass": True,
             "same_route_arithmetic": arithmetic,
