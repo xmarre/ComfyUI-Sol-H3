@@ -6,9 +6,11 @@ SM120 kernel; descriptor values never enter a JIT specialization key.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
 import json
+import sys
 from typing import Any
 
 WIRE_TAG = "vdn_query_positions"
@@ -18,8 +20,10 @@ RECEIPT_TAG = "vdn_mapped_neighbor_v1"
 MAX_INTERVAL_WIDTH = 4
 BLOCK_SIZE = 64
 MAX_CACHE_ENTRIES = 64
+MAX_CPU_PLAN_CACHE_ENTRIES = 64
 MAX_DEVICE_CACHE_BYTES = 4 * 1024 * 1024
 _INT32_MAX = 2**31 - 1
+_UNCOMPILED = object()
 
 
 class MappingUnavailable(ValueError):
@@ -67,8 +71,105 @@ def _digest(value: str) -> bool:
     )
 
 
+def _active_request_plan_cache() -> OrderedDict | None:
+    """Return the current Sol request's CPU plan cache without importing runtime.
+
+    ``mapped_neighbors`` is also used by standalone CPU/source-contract tooling.
+    Looking up an already-loaded sibling module preserves that import boundary,
+    while normal sampling still keeps all validated-map/descriptor state on the
+    request object that SamplingWrapper retires at request teardown.
+    """
+    runtime = sys.modules.get(f"{__package__}.runtime")
+    request_var = getattr(runtime, "_REQUEST", None) if runtime is not None else None
+    if request_var is None:
+        return None
+    state = request_var.get()
+    if state is None:
+        return None
+    cache = getattr(state, "_mapped_cpu_plan_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        state._mapped_cpu_plan_cache = cache
+    if not isinstance(cache, OrderedDict):
+        raise RuntimeError("Sol mapped CPU plan cache ownership was replaced")
+    return cache
+
+
+def _safe_wire_cache_key(
+    value: Any,
+    *,
+    q_rows: Any,
+    kv_rows: Any,
+    sink_rows: Any,
+) -> tuple[Any, ...] | None:
+    """Build a hash-safe lookup identity without weakening strict validation.
+
+    Only primitive wire tuples reach the fast lookup. Malformed/unhashable inputs
+    intentionally bypass the cache and continue through ``validate_wire_map`` so
+    they retain the same bounded rejection reason as a cold call.
+    """
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 9
+        or not isinstance(value[0], str)
+        or type(value[1]) is not int
+        or not isinstance(value[2], str)
+        or not isinstance(value[3], str)
+        or any(type(value[index]) is not int for index in (4, 5, 6, 7))
+        or not isinstance(value[8], tuple)
+        or any(
+            not isinstance(run, tuple)
+            or len(run) != 3
+            or any(type(item) is not int for item in run)
+            for run in value[8]
+        )
+        or any(type(item) is not int for item in (q_rows, kv_rows, sink_rows))
+    ):
+        return None
+    return (value, q_rows, kv_rows, sink_rows, POLICY)
+
+
+def _validated_cache_key(validated: ValidatedMap) -> tuple[Any, ...]:
+    value = (
+        WIRE_TAG,
+        WIRE_SCHEMA,
+        validated.owner_generation,
+        validated.plan_digest,
+        validated.group_index,
+        validated.q_rows,
+        validated.kv_rows,
+        validated.sink_rows,
+        validated.runs,
+    )
+    return (value, validated.q_rows, validated.kv_rows, validated.sink_rows, POLICY)
+
+
+def _cache_store(
+    cache: OrderedDict,
+    key: tuple[Any, ...],
+    validated: ValidatedMap,
+    descriptor: DescriptorPlan | None | object,
+) -> None:
+    cache[key] = (validated, descriptor)
+    cache.move_to_end(key)
+    while len(cache) > MAX_CPU_PLAN_CACHE_ENTRIES:
+        cache.popitem(last=False)
+
+
 def validate_wire_map(value: Any, *, q_rows: int, kv_rows: int, sink_rows: int) -> ValidatedMap:
     """Validate the immutable v4 wire tuple without importing VDN."""
+    cache = _active_request_plan_cache()
+    cache_key = _safe_wire_cache_key(
+        value,
+        q_rows=q_rows,
+        kv_rows=kv_rows,
+        sink_rows=sink_rows,
+    )
+    if cache is not None and cache_key is not None and cache_key in cache:
+        validated, descriptor = cache.pop(cache_key)
+        cache[cache_key] = (validated, descriptor)
+        return validated
+
     if not isinstance(value, tuple) or len(value) != 9:
         raise MappingUnavailable("missing" if value is None else "schema")
     tag, schema, owner, plan_digest, group_index, wire_q, wire_kv, wire_sink, raw_runs = value
@@ -124,7 +225,7 @@ def validate_wire_map(value: Any, *, q_rows: int, kv_rows: int, sink_rows: int) 
             "runs": runs,
         }
     )
-    return ValidatedMap(
+    validated = ValidatedMap(
         owner_generation=owner,
         plan_digest=plan_digest,
         group_index=group_index,
@@ -135,6 +236,9 @@ def validate_wire_map(value: Any, *, q_rows: int, kv_rows: int, sink_rows: int) 
         map_digest=map_digest,
         identity_aligned=identity_aligned,
     )
+    if cache is not None and cache_key is not None:
+        _cache_store(cache, cache_key, validated, _UNCOMPILED)
+    return validated
 
 
 def _merge_block_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -160,55 +264,70 @@ def compile_descriptor(validated: ValidatedMap) -> DescriptorPlan | None:
     neighbor union is accepted only when it is one nonempty interval no wider
     than four blocks; disjoint sets are never replaced by their hull.
     """
+    cache = _active_request_plan_cache()
+    cache_key = _validated_cache_key(validated)
+    if cache is not None and cache_key in cache:
+        cached_validated, cached_descriptor = cache.pop(cache_key)
+        cache[cache_key] = (cached_validated, cached_descriptor)
+        if cached_validated != validated:
+            raise RuntimeError("Sol mapped CPU plan cache identity changed")
+        if cached_descriptor is not _UNCOMPILED:
+            return cached_descriptor
+
     if validated.identity_aligned:
-        return None
-    k_blocks = (validated.kv_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
-    q_tiles = (validated.q_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
-    intervals: list[tuple[int, int]] = []
-    run_index = 0
-    for tile in range(q_tiles):
-        tile_q_begin = tile * BLOCK_SIZE
-        tile_q_end = min(validated.q_rows, tile_q_begin + BLOCK_SIZE)
-        while run_index < len(validated.runs) and validated.runs[run_index][1] <= tile_q_begin:
-            run_index += 1
-        scan = run_index
-        selected_ranges: list[tuple[int, int]] = []
-        while scan < len(validated.runs):
-            run_q_begin, run_q_end, run_kv_begin = validated.runs[scan]
-            if run_q_begin >= tile_q_end:
-                break
-            overlap_begin = max(tile_q_begin, run_q_begin)
-            overlap_end = min(tile_q_end, run_q_end)
-            if overlap_begin < overlap_end:
-                first_position = run_kv_begin + overlap_begin - run_q_begin
-                last_position = run_kv_begin + overlap_end - run_q_begin - 1
-                first_block = first_position // BLOCK_SIZE
-                last_block = last_position // BLOCK_SIZE
-                selected_ranges.append(
-                    (max(0, first_block - 1), min(k_blocks, last_block + 2))
-                )
-            scan += 1
+        descriptor = None
+    else:
+        k_blocks = (validated.kv_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+        q_tiles = (validated.q_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+        intervals: list[tuple[int, int]] = []
+        run_index = 0
+        for tile in range(q_tiles):
+            tile_q_begin = tile * BLOCK_SIZE
+            tile_q_end = min(validated.q_rows, tile_q_begin + BLOCK_SIZE)
+            while run_index < len(validated.runs) and validated.runs[run_index][1] <= tile_q_begin:
+                run_index += 1
+            scan = run_index
+            selected_ranges: list[tuple[int, int]] = []
+            while scan < len(validated.runs):
+                run_q_begin, run_q_end, run_kv_begin = validated.runs[scan]
+                if run_q_begin >= tile_q_end:
+                    break
+                overlap_begin = max(tile_q_begin, run_q_begin)
+                overlap_end = min(tile_q_end, run_q_end)
+                if overlap_begin < overlap_end:
+                    first_position = run_kv_begin + overlap_begin - run_q_begin
+                    last_position = run_kv_begin + overlap_end - run_q_begin - 1
+                    first_block = first_position // BLOCK_SIZE
+                    last_block = last_position // BLOCK_SIZE
+                    selected_ranges.append(
+                        (max(0, first_block - 1), min(k_blocks, last_block + 2))
+                    )
+                scan += 1
 
-        merged = _merge_block_intervals(selected_ranges)
-        if not merged or len(merged) != 1:
-            raise MappingUnavailable("fragmented")
-        start, end = merged[0]
-        if end <= start:
-            raise MappingUnavailable("fragmented")
-        if end - start > MAX_INTERVAL_WIDTH:
-            raise MappingUnavailable("interval_width")
-        intervals.append((start, end))
+            merged = _merge_block_intervals(selected_ranges)
+            if not merged or len(merged) != 1:
+                raise MappingUnavailable("fragmented")
+            start, end = merged[0]
+            if end <= start:
+                raise MappingUnavailable("fragmented")
+            if end - start > MAX_INTERVAL_WIDTH:
+                raise MappingUnavailable("interval_width")
+            intervals.append((start, end))
 
-    descriptor_digest = _sha256_json(
-        {
-            "policy": POLICY,
-            "map_digest": validated.map_digest,
-            "q_rows": validated.q_rows,
-            "kv_rows": validated.kv_rows,
-            "intervals": intervals,
-        }
-    )
-    return DescriptorPlan(validated, tuple(intervals), descriptor_digest)
+        descriptor_digest = _sha256_json(
+            {
+                "policy": POLICY,
+                "map_digest": validated.map_digest,
+                "q_rows": validated.q_rows,
+                "kv_rows": validated.kv_rows,
+                "intervals": intervals,
+            }
+        )
+        descriptor = DescriptorPlan(validated, tuple(intervals), descriptor_digest)
+
+    if cache is not None:
+        _cache_store(cache, cache_key, validated, descriptor)
+    return descriptor
 
 
 def validate_preflight_summary(summary: Any, wire: tuple[Any, ...], plan: DescriptorPlan | None) -> bool:
@@ -333,6 +452,7 @@ __all__ = [
     "BLOCK_SIZE",
     "DescriptorPlan",
     "MAX_CACHE_ENTRIES",
+    "MAX_CPU_PLAN_CACHE_ENTRIES",
     "MAX_DEVICE_CACHE_BYTES",
     "MappingUnavailable",
     "POLICY",
