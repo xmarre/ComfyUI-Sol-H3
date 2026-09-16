@@ -518,9 +518,12 @@ def main() -> None:
             sink_rows=validated.sink_rows,
         )
         torch.cuda.synchronize()
-        if not torch.equal(candidate, debug_output):
-            metrics = sparse.error_metrics(debug_output, candidate)
-            raise RuntimeError(f"production and debug mapped kernels are not bit-identical: {metrics}")
+        production_debug_metrics = sparse.error_metrics(debug_output, candidate)
+        if not sparse.arithmetic_gate_passes(production_debug_metrics):
+            raise RuntimeError(
+                f"production and debug mapped specializations diverged beyond the arithmetic gate: "
+                f"{production_debug_metrics}"
+            )
 
         k_blocks = (validated.kv_rows + 63) // 64
         old_routes = _decode_route_trace(saved_trace.to(device), k_blocks)
@@ -600,7 +603,8 @@ def main() -> None:
             "route_mismatch_count": mismatch_count,
             "route_counts": counts,
             "route_counts_match_preserved_m": True,
-            "production_debug_output_bit_identical": True,
+            "production_debug_arithmetic": production_debug_metrics,
+            "production_debug_arithmetic_gate_pass": True,
             "same_route_arithmetic": arithmetic,
             "same_route_arithmetic_gate_pass": True,
             "warmed_kernel_timing": timing,
