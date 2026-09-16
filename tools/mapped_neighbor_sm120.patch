@@ -1,0 +1,229 @@
+diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/interface.py
+index e68660b..adcb144 100644
+--- a/sol_h3/_vendor/sol_attn/interface.py
++++ b/sol_h3/_vendor/sol_attn/interface.py
+@@ -1,10 +1,11 @@
+-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
++# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
+ """Public Sol-Attn interface."""
+ 
+ from __future__ import annotations
+ 
+ import functools
+ import math
++import threading
+ 
+ import torch
+ 
+@@ -20,6 +21,7 @@
+     (12, 0): "cute_sm120",
+ }
+ _compiled = {}
++_compile_lock = threading.Lock()
+ 
+ 
+ def _validate_inputs(
+@@ -202,12 +204,16 @@ def _compile_sm120(
+     sink_end_block,
+     stream,
+     key_bias_enabled,
++    mapped_neighbors_enabled,
+ ):
+     import cutlass.cute as cute
+ 
+     from .sm120 import make_kernel
+ 
+-    operator = make_kernel(key_bias_enabled=key_bias_enabled)
++    operator = make_kernel(
++        key_bias_enabled=key_bias_enabled,
++        mapped_neighbors_enabled=mapped_neighbors_enabled,
++    )
+     args = _to_cute_tensors(tensors)
+     compiled = cute.compile(
+         operator,
+@@ -236,6 +242,7 @@ def _sol_attn_cute(
+     sink_start,
+     valid_tokens=None,
+     key_bias=None,
++    mapped_neighbor_intervals=None,
+ ):
+     from .preprocess import prepare
+ 
+@@ -264,11 +271,12 @@ def _sol_attn_cute(
+         stream = _stream(q.device)
+         # CuTe specializes tensor layouts.  Shape alone is insufficient now that a caller may
+         # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
+-        # descriptor for a strided view (or vice versa).
++        # descriptor for a strided view (or vice versa). Runtime mapped-neighbor interval values
++        # are deliberately absent from this key; only the structural mapped ABI is specialized.
+         layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v))
+         key = (
+             q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,
+-            layout_key, key_bias is not None,
++            layout_key, key_bias is not None, mapped_neighbor_intervals is not None,
+         )
+ 
+         if arch == (9, 0):
+@@ -352,19 +360,37 @@ def _sol_attn_cute(
+                 sink_start,
+                 sink_tokens,
+             )
+-            key_bias_arg = key_bias if key_bias is not None else threshold
+-            tensors = [q, k, v, output, kc, vc, threshold, key_bias_arg, lse]
++            # The existing SM120 key-bias tensor slot is mutually exclusive with
++            # mapped routing. Reusing it avoids any ordinary-path argument or
++            # allocation change while still passing the descriptor as a runtime
++            # CuTe tensor in the mapped specialization.
++            route_metadata_arg = (
++                key_bias
++                if key_bias is not None
++                else mapped_neighbor_intervals
++                if mapped_neighbor_intervals is not None
++                else threshold
++            )
++            tensors = [q, k, v, output, kc, vc, threshold, route_metadata_arg, lse]
+             compiled = _compiled.get(key)
+             if compiled is None:
+-                compiled, args = _compile_sm120(
+-                    key,
+-                    tensors,
+-                    scale,
+-                    sink_start_block,
+-                    sink_end_block,
+-                    stream,
+-                    key_bias is not None,
+-                )
++                # CuTe's global compiled cache is shared by concurrent calls. Serialize
++                # only first compilation for one structural key and recheck under lock.
++                with _compile_lock:
++                    compiled = _compiled.get(key)
++                    if compiled is None:
++                        compiled, args = _compile_sm120(
++                            key,
++                            tensors,
++                            scale,
++                            sink_start_block,
++                            sink_end_block,
++                            stream,
++                            key_bias is not None,
++                            mapped_neighbor_intervals is not None,
++                        )
++                    else:
++                        args = _to_cute_tensors(tensors)
+             else:
+                 args = _to_cute_tensors(tensors)
+             compiled(
+@@ -443,6 +469,7 @@ def sol_attn(
+     sink_start: int | None = None,
+     compile_bucket_size: int | None = None,
+     key_bias: torch.Tensor | None = None,
++    mapped_neighbor_intervals: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
+ 
+@@ -472,6 +499,24 @@ def sol_attn(
+         weighted_scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+         if not math.isfinite(weighted_scale) or weighted_scale <= 0.0:
+             raise ValueError("weighted Sol-Attn requires a finite positive attention scale")
++    if mapped_neighbor_intervals is not None:
++        expected = ((q.shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE, 2)
++        if backend != "cute_sm120":
++            raise ValueError("mapped_neighbor_intervals is currently supported by cute_sm120 only")
++        if key_bias is not None:
++            raise ValueError("mapped_neighbor_intervals cannot be combined with key_bias")
++        if (
++            q.shape[0] != 1
++            or not torch.is_tensor(mapped_neighbor_intervals)
++            or mapped_neighbor_intervals.ndim != 2
++            or tuple(mapped_neighbor_intervals.shape) != expected
++            or mapped_neighbor_intervals.dtype != torch.int32
++            or mapped_neighbor_intervals.device != q.device
++            or not mapped_neighbor_intervals.is_contiguous()
++        ):
++            raise ValueError(
++                "mapped_neighbor_intervals must be contiguous int32 [ceil(Tq/64), 2] on the QKV device for B=1"
++            )
+     if q.shape[1] != k.shape[1] and backend != "cute_sm120":
+         raise ValueError("Rectangular attention currently requires cute_sm120")
+     valid_tokens = q.shape[1]
+@@ -515,6 +560,7 @@ def sol_attn(
+         sink_start=sink_start,
+         valid_tokens=valid_tokens,
+         key_bias=key_bias,
++        mapped_neighbor_intervals=mapped_neighbor_intervals,
+     )
+ 
+ 
+diff --git a/sol_h3/_vendor/sol_attn/sm120/kernel.py b/sol_h3/_vendor/sol_attn/sm120/kernel.py
+index 2128eb4..57feb6f 100644
+--- a/sol_h3/_vendor/sol_attn/sm120/kernel.py
++++ b/sol_h3/_vendor/sol_attn/sm120/kernel.py
+@@ -9,10 +9,12 @@ def make_kernel(
+     prefetch_first_exact_k: bool = True,
+     prefetch_next_route_k: bool = True,
+     key_bias_enabled: bool = False,
++    mapped_neighbors_enabled: bool = False,
+ ):
+     return SolAttnForwardSm120(
+         debug_route_trace=debug_route_trace,
+         prefetch_first_exact_k=prefetch_first_exact_k,
+         prefetch_next_route_k=prefetch_next_route_k,
+         key_bias_enabled=key_bias_enabled,
++        mapped_neighbors_enabled=mapped_neighbors_enabled,
+     )
+ 
+ 
+diff --git a/sol_h3/_vendor/sol_attn/sm120/mainloop.py b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
+index 55310f9..4862256 100644
+--- a/sol_h3/_vendor/sol_attn/sm120/mainloop.py
++++ b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
+@@ -1,4 +1,4 @@
+-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
++# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
+ # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ # SPDX-License-Identifier: Apache-2.0
+ """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
+@@ -46,6 +46,7 @@ def __init__(
+         prefetch_first_exact_k: bool = True,
+         prefetch_next_route_k: bool = True,
+         key_bias_enabled: bool = False,
++        mapped_neighbors_enabled: bool = False,
+     ):
+         self.dtype = cutlass.BFloat16
+         self.acc_dtype = cutlass.Float32
+@@ -58,6 +59,7 @@ def __init__(
+         self.prefetch_first_exact_k = prefetch_first_exact_k
+         self.prefetch_next_route_k = prefetch_next_route_k
+         self.key_bias_enabled = key_bias_enabled
++        self.mapped_neighbors_enabled = mapped_neighbors_enabled
+ 
+     @cute.kernel
+     def kernel(
+@@ -423,6 +425,15 @@ def kernel(
+             cute.arch.sync_threads()
+ 
+             if warp == 0:
++                mapped_start_block = cutlass.Int32(0)
++                mapped_end_block = cutlass.Int32(0)
++                if cutlass.const_expr(self.mapped_neighbors_enabled):
++                    mapped_start_block = cutlass.Int32(
++                        mKeyBias[q_tile_idx, 0]
++                    )
++                    mapped_end_block = cutlass.Int32(
++                        mKeyBias[q_tile_idx, 1]
++                    )
+                 preceding = cutlass.Int32(0)
+                 lane_mask_lt = cutlass.Int32(0x7FFFFFFF) >> (
+                     cutlass.Int32(31) - lane
+@@ -455,6 +466,11 @@ def kernel(
+                             kv_block >= sink_start_block
+                             and kv_block < sink_end_block
+                         )
++                        if cutlass.const_expr(self.mapped_neighbors_enabled):
++                            exact = exact or (
++                                kv_block >= mapped_start_block
++                                and kv_block < mapped_end_block
++                            )
+                     ballot = cutlass.Int32(
+                         cute.arch.vote_ballot_sync(exact)
+                     )
