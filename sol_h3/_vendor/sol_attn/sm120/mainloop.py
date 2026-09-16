@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
@@ -46,6 +46,7 @@ class SolAttnForwardSm120:
         prefetch_first_exact_k: bool = True,
         prefetch_next_route_k: bool = True,
         key_bias_enabled: bool = False,
+        mapped_neighbors_enabled: bool = False,
     ):
         self.dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
@@ -58,6 +59,7 @@ class SolAttnForwardSm120:
         self.prefetch_first_exact_k = prefetch_first_exact_k
         self.prefetch_next_route_k = prefetch_next_route_k
         self.key_bias_enabled = key_bias_enabled
+        self.mapped_neighbors_enabled = mapped_neighbors_enabled
 
     @cute.kernel
     def kernel(
@@ -423,6 +425,15 @@ class SolAttnForwardSm120:
             cute.arch.sync_threads()
 
             if warp == 0:
+                mapped_start_block = cutlass.Int32(0)
+                mapped_end_block = cutlass.Int32(0)
+                if cutlass.const_expr(self.mapped_neighbors_enabled):
+                    mapped_start_block = cutlass.Int32(
+                        mKeyBias[q_tile_idx, 0]
+                    )
+                    mapped_end_block = cutlass.Int32(
+                        mKeyBias[q_tile_idx, 1]
+                    )
                 preceding = cutlass.Int32(0)
                 lane_mask_lt = cutlass.Int32(0x7FFFFFFF) >> (
                     cutlass.Int32(31) - lane
@@ -455,6 +466,11 @@ class SolAttnForwardSm120:
                             kv_block >= sink_start_block
                             and kv_block < sink_end_block
                         )
+                        if cutlass.const_expr(self.mapped_neighbors_enabled):
+                            exact = exact or (
+                                kv_block >= mapped_start_block
+                                and kv_block < mapped_end_block
+                            )
                     ballot = cutlass.Int32(
                         cute.arch.vote_ballot_sync(exact)
                     )
