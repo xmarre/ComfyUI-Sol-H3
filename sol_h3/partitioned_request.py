@@ -23,12 +23,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .mapped_neighbors import (
-    MappingUnavailable,
-    compile_descriptor,
-    device_descriptor,
-    validate_wire_map,
-)
+from .mapped_neighbors import MappingUnavailable, compile_descriptor, device_descriptor, validate_wire_map
 from .sparse import arithmetic_gate_passes, error_metrics
 
 PARTITIONED_REQUEST_ABI = "sol-h3-partitioned-single-union-v1"
@@ -190,56 +185,36 @@ def _sm120_union(
     if type(sink_rows) is not int or not 0 <= sink_rows <= kb.shape[1]:
         raise RuntimeError("partitioned Sol exact K prefix is outside the K/V domain")
 
-    if key_bias is not None:
-        if (
-            key_bias.ndim != 1
-            or key_bias.shape[0] != kb.shape[1]
-            or key_bias.dtype != torch.float32
-            or key_bias.device != q.device
-            or not key_bias.is_contiguous()
-        ):
-            raise RuntimeError("partitioned Sol key bias must be contiguous FP32 [Tkv]")
-        nonzero = torch.nonzero(key_bias, as_tuple=False)
-        if nonzero.numel():
-            last_biased = int(nonzero[-1, 0].item()) + 1
-            if last_biased > sink_rows:
-                raise RuntimeError("partitioned Sol key bias escaped the exact K prefix")
+    if key_bias is not None and (
+        key_bias.ndim != 1
+        or key_bias.shape[0] != kb.shape[1]
+        or key_bias.dtype != torch.float32
+        or key_bias.device != q.device
+        or not key_bias.is_contiguous()
+    ):
+        raise RuntimeError("partitioned Sol key bias must be contiguous FP32 [Tkv]")
 
-    q_bthd = qb
-    k_bthd = kb
-    v_bthd = vb
-    batch, q_rows, heads, _ = q_bthd.shape
-    kv_rows = k_bthd.shape[1]
+    batch, q_rows, heads, _ = qb.shape
+    kv_rows = kb.shape[1]
     with torch.cuda.device(q.device):
         kc, vc, threshold = prepare(
-            q_bthd,
-            k_bthd,
-            v_bthd,
+            qb,
+            kb,
+            vb,
             scale=float(scale),
             tau=float(tau),
             thresh_type="diag",
             valid_tokens=q_rows,
             valid_kv_tokens=kv_rows,
         )
-        output = torch.empty_like(q_bthd)
+        output = torch.empty_like(qb)
         lse = torch.empty((batch, q_rows, heads), device=q.device, dtype=torch.float32)
         stream = interface._stream(q.device)
         sink_start_block, sink_end_block = interface._sink_block_range(kv_rows, 0, sink_rows)
         key_bias_arg = key_bias if key_bias is not None else threshold
         mapped_arg = mapped_neighbor_intervals if mapped_neighbor_intervals is not None else threshold
-        tensors = [
-            q_bthd,
-            k_bthd,
-            v_bthd,
-            output,
-            kc,
-            vc,
-            threshold,
-            key_bias_arg,
-            mapped_arg,
-            lse,
-        ]
-        layout_key = tuple(tuple(int(value) for value in tensor.stride()) for tensor in (q_bthd, k_bthd, v_bthd))
+        tensors = [qb, kb, vb, output, kc, vc, threshold, key_bias_arg, mapped_arg, lse]
+        layout_key = tuple(tuple(int(value) for value in tensor.stride()) for tensor in (qb, kb, vb))
         key = (
             PARTITIONED_REQUEST_ABI,
             q.device.index,
@@ -271,13 +246,7 @@ def _sm120_union(
                     args = interface._to_cute_tensors(tensors)
         else:
             args = interface._to_cute_tensors(tensors)
-        compiled(
-            *args,
-            float(scale),
-            sink_start_block,
-            sink_end_block,
-            stream=stream,
-        )
+        compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
     return output[0]
 
 
@@ -285,12 +254,7 @@ def _descriptor_for_wire(state, wire, *, q_rows: int, kv_rows: int, sink_rows: i
     if wire is None:
         return None, None
     try:
-        validated = validate_wire_map(
-            wire,
-            q_rows=q_rows,
-            kv_rows=kv_rows,
-            sink_rows=sink_rows,
-        )
+        validated = validate_wire_map(wire, q_rows=q_rows, kv_rows=kv_rows, sink_rows=sink_rows)
         descriptor = compile_descriptor(validated)
         if descriptor is None:
             return validated, None
@@ -430,11 +394,7 @@ def partitioned_request_attention(
     state.partitioned_sparse_calls = getattr(state, "partitioned_sparse_calls", 0) + 1
     state.partitioned_requested_q_rows = getattr(state, "partitioned_requested_q_rows", 0) + int(q.shape[0])
     state.partitioned_kernel_q_rows = getattr(state, "partitioned_kernel_q_rows", 0) + int(q.shape[0])
-    return result[0]
+    return result
 
 
-__all__ = [
-    "PARTITIONED_RECEIPT_TAG",
-    "PARTITIONED_REQUEST_ABI",
-    "partitioned_request_attention",
-]
+__all__ = ["PARTITIONED_RECEIPT_TAG", "PARTITIONED_REQUEST_ABI", "partitioned_request_attention"]
