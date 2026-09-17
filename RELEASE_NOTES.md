@@ -1,226 +1,134 @@
-# ComfyUI-Sol-H3 v0.1.4
+# ComfyUI-Sol-H3 v0.1.5
 
-Coordinated companion release for MiniMax-H3 Flow-Aligned Regenerate v0.3.3. This release adds the real-SM120 K/V attention-measure path that fixes the smaller whole-frame shrink/top-edge reveal observed at some Mixed-Grid Continuum exact-prefix joins.
+Coordinated production release with [ComfyUI-VDN-H3-Plus v1.5.5](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.5) and [MiniMax H3 Flow-Aligned Regenerate v0.3.5](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.5).
 
-## Flow Mixed-Grid attention measure
+Implementation PRs: [Sol-H3 #14](https://github.com/xmarre/ComfyUI-Sol-H3/pull/14), [VDN-H3-Plus #18](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/18), and Flow [#33](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/33) + [#48](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/48).
 
-Flow's mixed sequence keeps the protected prefix on the target spatial grid while the generated suffix remains on the lower source grid. In the validated production geometry, each protected-prefix frame contributes `28 x 38 = 1064` K/V rows while each source-grid suffix frame contributes `20 x 27 = 540` rows. Ordinary softmax therefore overweights the protected-prefix frame by about `1.97037x` in discrete K/V measure even though RoPE coordinates are continuous.
+## Motivation: the first-high artifact
 
-Sol-H3 now consumes Flow's independent `h3_flow_mixed_grid_attention_measure_v1` contract after validating the existing VDN API-2 mixed sequence. It:
+The real production stack could produce a reproducible **first-high visual corruption/artifact** when VDN retained grouped local attention was routed through Sol-H3 sparse attention after the progressive low-to-high handoff.
 
-- preserves every Q row;
-- preserves every non-video K/V row;
-- preserves every generated source-grid suffix K/V row exactly and in order;
-- applies explicit full-domain preprocessing such as Untwisting RoPE before reduction;
-- stratifies only protected-prefix K/V to the source-grid spatial measure using native MiniMax-H3 area-normalized `_frame_grid` coordinates;
-- sends the resulting rectangular Q/KV tensors through the same packaged Sana SM120 CuTe kernel;
-- fails closed on malformed or inconsistent measure metadata.
+The controlled same-input investigation isolated the failure without changing the sampler entry state:
 
-Validated production accounting:
+- replay R reproduced the broken first-high output;
+- native W-window was clean while preserving VDN's restricted local K/V support and learned linear complement;
+- W-full-support was also clean;
+- global and anchor attention remained native.
 
-```text
-Q:   56029 -> 56029
-K/V: 56029 -> 49741
-removed protected-prefix K/V rows: 6288 per call
-```
+This ruled out both “VDN needs full K/V support” and “the VDN learned complement must be removed” as necessary fixes. The remaining causal boundary was the **Sol-local sparse route**.
 
-VDN API 2 and its learned external-mode gate remain unchanged.
+VDN local attention is not an ordinary square sequence. For each grouped call it gathers requested Q rows separately and constructs the restricted K/V domain as `[global_rows, permitted_window_rows]`. A requested query's physical row in that gathered K/V domain therefore differs, in general, from its local Q ordinal.
 
-## Spectrum history/receipt integration
-
-The audited route `sol_external_mixed_measure` is included in Sol-H3's backend-history receipt contract. Flow's replacement identity also includes whether the attention-measure path is active, so measure-on/off executions cannot silently share incompatible forecasting history. Unknown receipt routes and malformed state still fail closed.
-
-Matched run `00324` restored the expected schedule while keeping the measure path active:
+The old Sol exact-neighbor selector still used the ordinary aligned-coordinate rule:
 
 ```text
-18 logical calls
-13 actual transformer NFE
-5 Spectrum forecasts
-
-low:   7 actual / 3 forecast
-high:  4 actual / 2 forecast
-probe: 2 actual
+abs(q_block - kv_block) <= 1
 ```
 
-The real measure path executed 192 times with Q `56029`, K/V `49741`, no compatibility fallback and no numerical-backend transition.
+That is correct for aligned/square attention but not for these grouped rectangular calls. In the preserved failing group-10 geometry, the requested queries physically map into K positions `9245..10268` while their local Q block ordinals are only `0..15`. Sol was therefore protecting the wrong local K neighborhood exactly.
 
-## Decoded-media acceptance
+Diagnostic M proved the correction on the same input: preserve the existing sparse approximation and VDN restricted support, but add exact neighbors around every query's **mapped physical K/V position**. The diagnostic implementation itself used temporary selector instrumentation and descriptor-value specialization, so it was evidence rather than the production design.
 
-The previously visible whole-frame shrink/top-edge reveal is absent in the matched decoded-media validation. The old problematic join remains approximately unit-scale in both the `dense_evaluations=0` validation output and the separate `dense_evaluations=1` quality follow-up, with no delayed framing pulse introduced by the K/V normalization.
+## Resolution: mapped-neighbor provider v4
 
-v0.1.4 does **not** change the SOL trajectory-warmup policy established by v0.1.3. `dense_evaluations=1` remains the conservative default and `dense_evaluations=0` remains the explicit maximum-speed mode. The framing correction is independent of that choice.
+v0.1.5 turns that evidence into the real production kernel path.
 
-## Compatibility
+The paired VDN-H3-Plus v1.5.5 provider-v4 contract now transports an immutable, owner-bound affine mapping from each requested Q row to its exact position in the already-gathered restricted K/V domain. Sol validates the full mapping and ownership contract, compiles it into bounded `[start_block, end_block)` K64 intervals per Q64 tile, keeps descriptor data request-local, and sends the small descriptor to the packaged SM120 CuTe kernel as runtime metadata.
 
-- Linux/WSL SM120 remains the validated CuTe SOL execution target.
-- Native-Windows fail-closed behavior is unchanged.
-- Existing rectangular SOL, VDN provider, Spectrum, Untwist and Diff-Aid ownership semantics are preserved.
-- No extra H3 transformer NFE is introduced by the attention-measure operation itself.
+Inside the kernel the correction is additive:
+
+```text
+new_exact = old_exact OR mapped_neighbor
+```
+
+The existing route is otherwise preserved: threshold routing, sinks, the ordinary ordinal-neighbor selector, Q/K/V values and row order, restricted K/V support, scale/tau, KC/VC preprocessing, VDN's learned softmax gate/output projection/complement, global and anchor calls, and dense-warmup policy.
+
+The production implementation deliberately does **not** carry forward the diagnostic shortcuts: no square-Q expansion, no full-K/V reconstruction, no QxK mask, no selector monkeypatch, no per-map JIT specialization, and no per-local-call GPU-to-CPU synchronization. Unsupported, stale or ambiguous maps use VDN's supplied native restricted-domain callback; arithmetic, CUDA and OOM failures remain real failures rather than being hidden as capability fallback.
+
+This is the production fix for the captured artifact: **VDN transports the physical coordinate it owns, and Sol preserves that physical neighborhood exactly inside the actual sparse SM120 kernel.**
+
+## Coordinated Flow / Continuum path
+
+The companion Flow v0.3.5 release makes **Progressive Handoff (Target Input)** the standard target-input/Continuum path and retires Mixed-Grid from the production acceptance matrix. Exact protected continuation stays on the target grid; the validated four-audio-tick guided overlap is used during sampling while caller-owned exact video/audio values are restored at output.
+
+The validated production stack for this coordinated release is:
+
+```text
+MiniMax H3 Flow-Aligned Regenerate v0.3.5
+ComfyUI-Sol-H3                    v0.1.5
+ComfyUI-VDN-H3-Plus              v1.5.5
+```
+
+The retired Mixed-Grid weighted companion work is not a release prerequisite, and VDN PR #8's separate audio-fidelity/training experiment is not part of this coordinated release.
+
+## Production validation
+
+The production route passed all release gates on real RTX PRO 6000 / SM120 hardware.
+
+### Same-input mapped correctness
+
+- route mismatch count: `0`;
+- preserved E/M accounting: `88393` original + `585` mapped = `88978` effective block pairs;
+- frozen-route arithmetic gate: `rel_l2=0.0016882352`, `max_abs=0.0614815`;
+- changing descriptor values created no new CuTe specialization keys.
+
+### Matched historical-M performance
+
+Five-repeat matched median:
+
+```text
+production mapped: 1.109472036 ms
+historical M:      1.105535984 ms
+ratio:             1.0035603114x
+median delta:      +0.356031%
+acceptance budget: <= +5%
+result:            clear_pass
+```
+
+### Controlled first-high replay
+
+The production replay preserved the exact captured first-high inputs and produced:
+
+- `1 logical / 1 actual / 0 forecast`;
+- zero learned-upscaler calls;
+- exactly 700 completed Sol receipts: 528 mapped local, 22 dense warmup, 50 native global, 100 native anchor;
+- exact mapped topology/geometry with no mapped-local or kernel-unavailable fallback;
+- clean raw, pre-guidance and final decoded first-high media.
+
+### Representative two-chunk trajectory
+
+Run `00494` completed:
+
+```text
+17 logical calls
+13 actual H3 NFE
+4 Spectrum forecasts
+
+low:    4 actual / 1 forecast
+probe:  1 actual / 0 forecast
+high:   2 actual / 1 forecast
+later:  6 actual / 2 forecast
+```
+
+Mapped local calls were `1,584` low, `1,056` high and `3,120` later. Requested Q rows always equalled kernel Q rows, square expansion remained zero, and all Mixed-Grid/weighted-Mixed-Grid counters were zero.
+
+The 14-second decoded output showed no first-high corruption, frame shift, zoom-out, top-edge reveal, flash, grid artifact or physical AV seam; the chunk boundary was perceptually seamless.
+
+00494 evidence hashes:
+
+- runtime log: `699c17b6d85d186039b9179c4b99edb596e88fdda37d3f8814917c50b6905ca8`;
+- metrics JSON: `c25a90af61d83c1430c3f29b9e99de7b0adb22f60d714e2d1392a269e6f0802e`;
+- final MP4: `1ffb5ebff47417f2f9354d3ae7cdfa32b6b6e292cd661efb9ddc2fd818d66ab2`.
+
+## Review hardening
+
+The final review additionally fixed two retained compatibility edge cases:
+
+- empty weighted exact-K ranges now clamp `sink_start` to the current K-row count;
+- preprocessing cache identity now incorporates bounded semantics of code-reachable globals/helpers instead of using code-only identity when mutable `LOAD_GLOBAL` state is visible; unsupported mutable state receives deliberately volatile identity.
+
+These review fixes are covered by the exact-head hosted CI lanes and do not change the mapped-neighbor production arithmetic validated above.
 
 ---
 
-# ComfyUI-Sol-H3 v0.1.3
-
-Patch release restoring the conservative one-evaluation dense SOL warmup after a controlled same-seed video comparison exposed a startup trajectory discontinuity when SOL approximation was enabled from the first sigma-1.0 denoiser evaluation.
-
-## Default restored
-
-`Sol-H3 SOL Attention (Experimental)` now defaults to:
-
-```text
-dense_evaluations = 1
-dense_layers      = 2
-```
-
-`dense_evaluations=1` keeps the first complete denoiser evaluation on inherited dense attention before switching to SOL. `dense_layers=2` remains a separate per-evaluation leading-layer policy and does not add a transformer NFE.
-
-`dense_evaluations=0` remains supported as an explicit maximum-speed mode. This release changes the default because of a demonstrated quality risk; it does not remove the SOL-first path.
-
-## Startup quality evidence
-
-A subsequent controlled same-seed video comparison established a concrete failure mode for `dense_evaluations=0`:
-
-- SOL from the first denoiser evaluation produced an abrupt opening pose/orientation change with heavy early motion smearing before settling into the opposite heading.
-- One initial dense evaluation preserved a continuous opening turn in the corresponding comparison.
-
-This demonstrates that SOL-first execution **can** destabilize the initial trajectory when approximate attention acts from sigma 1.0. The available pair does not establish the frequency of the artifact across seeds, prompts, references, resolutions or model variants, so the release does not claim that every `dense_evaluations=0` run is affected.
-
-## Spectrum and NFE trade-off
-
-The v0.1.2 scheduling analysis remains correct. A one-evaluation dense warmup creates a real numerical-backend transition:
-
-```text
-first actual evaluation: dense
-next numerical route:    SOL
-```
-
-Spectrum correctly invalidates incompatible forecasting history across that `dense -> sol` boundary. The first would-be forecast can therefore become an additional actual transformer NFE to establish a SOL-side anchor.
-
-The previous controlled hot evidence remains the measured performance trade-off:
-
-| Run | SOL | `dense_evaluations` | Logical | Actual | Forecast | H3 sampler | End-to-end |
-|---|---|---:|---:|---:|---:|---:|---:|
-| `metrics_00321` | on | 1 | 40 | 26 | 14 | 353.36 s | 400.94 s |
-| `metrics_00322` | off | — | 40 | 25 | 15 | 374.84 s | 420.81 s |
-| `metrics_00323` | on | **0** | **40** | **25** | **15** | **332.56 s** | **380.57 s** |
-
-`dense_evaluations=0` avoids the initial backend-history transition and restored `25 actual / 15 forecast` topology parity with the no-SOL control in that test. Relative to the otherwise-matched `dense_evaluations=1` SOL run, it removed one actual NFE and measured 20.80 s (5.9%) lower H3 sampler wall time and 20.37 s (5.1%) lower end-to-end wall time. Arithmetic-gate/calibration time also varied, so the structural result is the removed NFE; the entire wall-time delta must not be assigned to that NFE alone.
-
-Do not weaken Spectrum's history/receipt safety to recover the NFE while retaining a dense-to-SOL transition. The extra actual call is the correct safety consequence of changing numerical attention backends mid-trajectory.
-
-## Migration
-
-Existing saved workflows keep their serialized `dense_evaluations` value. Workflows created or saved under v0.1.2 can therefore remain at `0` after upgrading until the node value is changed explicitly.
-
-Recommended policy:
-
-```text
-dense_evaluations = 1   # default: conservative startup trajectory
-
-dense_evaluations = 0   # opt-in: maximum-speed SOL-first path
-                         # may save one Spectrum actual NFE
-                         # may cause visible startup discontinuity
-```
-
-## Documentation and tests
-
-- Restored `Config(backend="sol")` and the ComfyUI node default to `dense_evaluations=1`.
-- Added regression coverage for the restored default, the SOL-first opt-in and Flow continuation semantics.
-- Reworked `docs/DENSE_EVALUATIONS.md` around the speed/quality trade-off and saved-workflow migration behavior.
-- Updated README and changelog to keep the v0.1.2 timing result as historical performance evidence rather than a quality-equivalence claim.
-
----
-
-# ComfyUI-Sol-H3 v0.1.2
-
-Patch release changing the default SOL trajectory policy so new workflows start SOL on the first real denoiser evaluation instead of burning a full dense evaluation before switching numerical backends.
-
-## Default change
-
-`Sol-H3 SOL Attention (Experimental)` now defaults to:
-
-```text
-dense_evaluations = 0
-dense_layers      = 2
-```
-
-The previous `dense_evaluations=1` default created an initial `dense -> sol` numerical-backend transition. Spectrum correctly invalidates forecasting history across that transition, so the first would-be forecast became an additional actual transformer NFE solely to establish a SOL-side anchor.
-
-v0.1.2 does not weaken Spectrum's history/receipt safety. It removes that unnecessary transition from the default policy. Existing saved workflows retain their serialized `dense_evaluations` value, and `dense_evaluations=1` remains available as an explicit conservative trajectory warmup.
-
-`dense_layers=2` is unchanged. It keeps the first two H3 blocks dense inside each otherwise-SOL denoiser evaluation and does not add a full transformer NFE.
-
-## Controlled hot evidence
-
-Same seed, references, resolution, prompt, sampler, sampling settings and workflow structure; VDN disabled in all three runs:
-
-| Run | SOL | `dense_evaluations` | Logical | Actual | Forecast | H3 sampler | End-to-end |
-|---|---|---:|---:|---:|---:|---:|---:|
-| `metrics_00321` | on | 1 | 40 | 26 | 14 | 353.36 s | 400.94 s |
-| `metrics_00322` | off | — | 40 | 25 | 15 | 374.84 s | 420.81 s |
-| `metrics_00323` | on | **0** | **40** | **25** | **15** | **332.56 s** | **380.57 s** |
-
-The new default therefore restores exact NFE/forecast topology parity with the no-SOL control:
-
-```text
-40 logical
-25 actual NFE
-15 Spectrum forecasts
-
-low:    15 actual / 9 forecast
-high:    8 actual / 6 forecast
-probe:   2 actual / 0 forecast
-```
-
-`metrics_00323` starts backend history directly in `phase=sol` and reports `numerical_backend_transitions=0`.
-
-Against the topology-matched no-SOL control, the tested SOL run is 42.28 s (11.3%) faster in H3 sampler wall time and 40.24 s (9.6%) faster end-to-end. This is a controlled measurement for this MiniMax-H3/RTX PRO 6000 deployment instance, not a universal Sol-Attn percentage.
-
-Against the previous `dense_evaluations=1` SOL run, sampler wall falls by 20.80 s (5.9%) and end-to-end wall by 20.37 s (5.1%). Arithmetic-gate/calibration time also varied between hot runs, so the defensible structural gain is the restored forecast replacing one full actual NFE; the entire wall-time delta should not be assigned to that NFE alone.
-
-## Quality boundary
-
-The same-seed `dense_evaluations=0` output is visibly different from the `dense_evaluations=1` output, which is expected when approximate SOL attention affects the trajectory from sigma 1.0. Manual inspection did not establish either video as better or worse.
-
-That supports making zero the operational default for the tested stack, but it is not statistical perceptual-equivalence evidence. Users who want the previous conservative policy can set `dense_evaluations=1` explicitly.
-
-## Documentation and tests
-
-- Added `docs/DENSE_EVALUATIONS.md` with the backend-history rationale, timing evidence, quality boundary, migration behavior, and the distinction between `dense_evaluations` and `dense_layers`.
-- Updated the README and changelog to distinguish historical v0.1.0/v0.1.1 warmup behavior from the v0.1.2 default.
-- Added regression coverage verifying that new SOL configs and the ComfyUI node default to `dense_evaluations=0`, while explicit one-evaluation warmup and Flow continuation handling remain supported.
-
-## Telemetry caveat
-
-The existing `dense_warmup` telemetry field counts attention calls kept dense by either `dense_evaluations` or `dense_layers`. It can therefore remain nonzero with `dense_evaluations=0`. Use the configured `dense_evaluations`, backend-history `phase`, `numerical_backend_transitions`, and actual/forecast topology to diagnose whole-evaluation warmup behavior.
-
----
-
-# ComfyUI-Sol-H3 v0.1.1
-
-Patch release correcting native-Windows installation/provenance behavior and defining the supported fallback boundary for custom kernels.
-
-## Fixed
-
-- Fixed a cross-platform provenance bug: vendored Sana file names are compared with canonical `/` manifest paths instead of platform-native `Path` strings, so valid Windows checkouts are not rejected because of path-separator formatting.
-- Pinned the vendored source snapshot to LF checkout via `.gitattributes`.
-- Provenance hashing accepts only Git-style CRLF-to-LF transport normalization in addition to exact bytes; any other content change still fails closed.
-- Added `windows-latest` provenance CI covering Windows path semantics, CRLF normalization and tamper rejection.
-- Scoped CuTe/Triton runtime dependencies to Linux, matching the platform supported by the packaged custom-kernel path.
-- Native Windows reports an explicit `Linux/WSL2` requirement when the SM120 CuTe backend is unavailable.
-- Exact Runtime fails closed on native Windows before importing or executing its Triton affine kernel and delegates to the untouched native H3 block.
-
-## Native Windows boundary
-
-The real `cute_sm120` SOL kernel requires Linux/WSL2 because NVIDIA's current CUTLASS CuTe DSL does not support native Windows. On native Windows, SOL delegates to inherited dense attention and Exact Runtime delegates to native H3, so no Sol-H3 custom kernel executes there.
-
-Official NVIDIA references:
-
-- https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/limitations.html
-- https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html
-
-See `docs/WINDOWS.md` for the current platform boundary and troubleshooting guidance.
-
-## Regression scope
-
-The Linux/WSL SM120 production kernel contract, rectangular Q/KV execution, VDN API-v3 route, Flow mixed-grid route, Spectrum history semantics and zero-copy BTHD behavior are unchanged from v0.1.0.
+Previous release notes through v0.1.4 are preserved verbatim in `docs/RELEASE_NOTES_v0.1.4_AND_EARLIER.md`.

@@ -1,13 +1,16 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry; see tools/rectangular_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
 """Public Sol-Attn interface."""
 
 from __future__ import annotations
 
 import functools
+import math
+import threading
 
 import torch
 
 BLOCK_SIZE = 64
+MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"
 _CUTE_BACKENDS = {
     (9, 0): "cute_sm90",
     (10, 0): "cute_sm100",
@@ -19,6 +22,7 @@ _CUTE_BACKENDS = {
     (12, 0): "cute_sm120",
 }
 _compiled = {}
+_compile_lock = threading.Lock()
 
 
 def _validate_inputs(
@@ -200,12 +204,17 @@ def _compile_sm120(
     sink_start_block,
     sink_end_block,
     stream,
+    key_bias_enabled,
+    mapped_neighbors_enabled,
 ):
     import cutlass.cute as cute
 
     from .sm120 import make_kernel
 
-    operator = make_kernel()
+    operator = make_kernel(
+        key_bias_enabled=key_bias_enabled,
+        mapped_neighbors_enabled=mapped_neighbors_enabled,
+    )
     args = _to_cute_tensors(tensors)
     compiled = cute.compile(
         operator,
@@ -233,6 +242,8 @@ def _sol_attn_cute(
     sink_tokens,
     sink_start,
     valid_tokens=None,
+    key_bias=None,
+    mapped_neighbor_intervals=None,
 ):
     from .preprocess import prepare
 
@@ -259,11 +270,17 @@ def _sol_attn_cute(
             dtype=torch.float32,
         )
         stream = _stream(q.device)
-        # CuTe specializes tensor layouts.  Shape alone is insufficient now that a caller may
-        # supply views into an interleaved packed QKV buffer; never reuse a compiled contiguous
-        # descriptor for a strided view (or vice versa).
+        # CuTe specializes tensor layouts. Shape alone is insufficient now that a caller may
+        # supply views into an interleaved packed QKV buffer. Mapped descriptor values remain
+        # runtime data; the compile key carries only the structural ABI/source contract.
         layout_key = tuple(tuple(int(s) for s in x.stride()) for x in (q, k, v))
-        key = (q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits, layout_key)
+        mapped_profile = (
+            MAPPED_NEIGHBOR_CONTRACT if mapped_neighbor_intervals is not None else None
+        )
+        key = (
+            q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,
+            layout_key, key_bias is not None, mapped_profile,
+        )
 
         if arch == (9, 0):
             if sink_tokens:
@@ -346,17 +363,37 @@ def _sol_attn_cute(
                 sink_start,
                 sink_tokens,
             )
-            tensors = [q, k, v, output, kc, vc, threshold, lse]
+            key_bias_arg = key_bias if key_bias is not None else threshold
+            mapped_arg = (
+                mapped_neighbor_intervals
+                if mapped_neighbor_intervals is not None
+                else threshold
+            )
+            # Disabled optional arguments reuse the already-live threshold tensor;
+            # ordinary and weighted calls allocate no mapped metadata.
+            tensors = [
+                q, k, v, output, kc, vc, threshold,
+                key_bias_arg, mapped_arg, lse,
+            ]
             compiled = _compiled.get(key)
             if compiled is None:
-                compiled, args = _compile_sm120(
-                    key,
-                    tensors,
-                    scale,
-                    sink_start_block,
-                    sink_end_block,
-                    stream,
-                )
+                # CuTe's compiled cache is process-global. Serialize only first
+                # compilation for one structural key and recheck under the lock.
+                with _compile_lock:
+                    compiled = _compiled.get(key)
+                    if compiled is None:
+                        compiled, args = _compile_sm120(
+                            key,
+                            tensors,
+                            scale,
+                            sink_start_block,
+                            sink_end_block,
+                            stream,
+                            key_bias is not None,
+                            mapped_neighbor_intervals is not None,
+                        )
+                    else:
+                        args = _to_cute_tensors(tensors)
             else:
                 args = _to_cute_tensors(tensors)
             compiled(
@@ -389,7 +426,7 @@ def _pad_to_bucket(q, k, v, bucket_size: int):
     )
     padded = packed.split(q.shape[3], dim=-1)
     # Ulysses produces Q/K/V by splitting one contiguous [..., Q | K | V]
-    # allocation.  Recover that packed view and copy it in one launch.  The
+    # allocation. Recover that packed view and copy it in one launch. The
     # fallback retains support for callers that supply independent tensors.
     head_dim = q.shape[3]
     same_storage = (
@@ -416,7 +453,7 @@ def _pad_to_bucket(q, k, v, bucket_size: int):
     else:
         for destination, source in zip(padded, (q, k, v)):
             destination[:, :tokens].copy_(source)
-    # Only the bucket tail is unwritten.  Clearing it after copying avoids the
+    # Only the bucket tail is unwritten. Clearing it after copying avoids the
     # old full-capacity memset while preserving exactly the same padded values.
     packed[:, tokens:].zero_()
     return padded
@@ -434,6 +471,8 @@ def sol_attn(
     sink_tokens: int = 0,
     sink_start: int | None = None,
     compile_bucket_size: int | None = None,
+    key_bias: torch.Tensor | None = None,
+    mapped_neighbor_intervals: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
 
@@ -453,6 +492,34 @@ def sol_attn(
     if kv_splits not in (1, 2, 4):
         raise ValueError("kv_splits must be 1, 2, or 4")
     backend = _backend_for_arch(arch)
+    if key_bias is not None:
+        if backend != "cute_sm120":
+            raise ValueError("key_bias is currently supported by cute_sm120 only")
+        if (not torch.is_tensor(key_bias) or key_bias.ndim != 1
+                or key_bias.shape[0] != k.shape[1] or key_bias.device != q.device
+                or key_bias.dtype != torch.float32 or not key_bias.is_contiguous()):
+            raise ValueError("key_bias must be contiguous float32 with one natural-log value per K/V row")
+        weighted_scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+        if not math.isfinite(weighted_scale) or weighted_scale <= 0.0:
+            raise ValueError("weighted Sol-Attn requires a finite positive attention scale")
+    if mapped_neighbor_intervals is not None:
+        expected = ((q.shape[1] + BLOCK_SIZE - 1) // BLOCK_SIZE, 2)
+        if backend != "cute_sm120":
+            raise ValueError("mapped_neighbor_intervals is currently supported by cute_sm120 only")
+        if key_bias is not None:
+            raise ValueError("mapped_neighbor_intervals cannot be combined with key_bias")
+        if (
+            q.shape[0] != 1
+            or not torch.is_tensor(mapped_neighbor_intervals)
+            or mapped_neighbor_intervals.ndim != 2
+            or tuple(mapped_neighbor_intervals.shape) != expected
+            or mapped_neighbor_intervals.dtype != torch.int32
+            or mapped_neighbor_intervals.device != q.device
+            or not mapped_neighbor_intervals.is_contiguous()
+        ):
+            raise ValueError(
+                "mapped_neighbor_intervals must be contiguous int32 [ceil(Tq/64), 2] on the QKV device for B=1"
+            )
     if q.shape[1] != k.shape[1] and backend != "cute_sm120":
         raise ValueError("Rectangular attention currently requires cute_sm120")
     valid_tokens = q.shape[1]
@@ -495,6 +562,8 @@ def sol_attn(
         sink_tokens=sink_tokens,
         sink_start=sink_start,
         valid_tokens=valid_tokens,
+        key_bias=key_bias,
+        mapped_neighbor_intervals=mapped_neighbor_intervals,
     )
 
 
