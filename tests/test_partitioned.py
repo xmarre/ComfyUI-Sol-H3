@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sol_h3.partitioned import merge_lse_partitions, sm120_attention_with_lse
+from sol_h3.partitioned_request import _weighted_dense
 
 
 def test_lse_partition_merge_matches_explicit_dense_softmax():
@@ -39,6 +40,41 @@ def test_lse_partition_merge_matches_explicit_dense_softmax():
 
     assert torch.allclose(merged, full_output, rtol=1e-12, atol=1e-12)
     assert torch.allclose(merged_lse, full_lse, rtol=1e-12, atol=1e-12)
+
+
+def test_single_union_weighted_dense_matches_partition_lse_oracle():
+    """Production union transport and the design LSE oracle are dense-equivalent."""
+    generator = torch.Generator(device="cpu").manual_seed(7341)
+    q = torch.randn((4, 3, 8), generator=generator, dtype=torch.float64)
+    prefix_k = torch.randn((6, 3, 8), generator=generator, dtype=torch.float64)
+    prefix_v = torch.randn(prefix_k.shape, generator=generator, dtype=torch.float64)
+    suffix_k = torch.randn((5, 3, 8), generator=generator, dtype=torch.float64)
+    suffix_v = torch.randn(suffix_k.shape, generator=generator, dtype=torch.float64)
+    prefix_measure = math.log(5.0 / 12.0)
+    scale = q.shape[-1] ** -0.5
+
+    q_bhtd = q.transpose(0, 1).unsqueeze(0)
+    partial_outputs = []
+    partial_lses = []
+    for key, value in ((prefix_k, prefix_v), (suffix_k, suffix_v)):
+        key_bhtd = key.transpose(0, 1).unsqueeze(0)
+        value_bhtd = value.transpose(0, 1).unsqueeze(0)
+        scores = torch.matmul(q_bhtd, key_bhtd.transpose(-1, -2)) * scale
+        partial_lses.append(torch.logsumexp(scores, dim=-1))
+        partial_outputs.append(torch.matmul(torch.softmax(scores, dim=-1), value_bhtd))
+    oracle, _ = merge_lse_partitions(partial_outputs, partial_lses, [prefix_measure, 0.0])
+
+    union_k = torch.cat((prefix_k, suffix_k), dim=0)
+    union_v = torch.cat((prefix_v, suffix_v), dim=0)
+    union_bias = torch.cat(
+        (
+            torch.full((prefix_k.shape[0],), prefix_measure, dtype=torch.float64),
+            torch.zeros(suffix_k.shape[0], dtype=torch.float64),
+        )
+    )
+    union = _weighted_dense(q, union_k, union_v, union_bias, scale=scale)
+
+    assert torch.allclose(union.transpose(0, 1).unsqueeze(0), oracle, rtol=1e-12, atol=1e-12)
 
 
 def test_lse_partition_merge_accumulates_bfloat16_in_float32():
