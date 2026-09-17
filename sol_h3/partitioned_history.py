@@ -1,17 +1,20 @@
 """Spectrum history identity and receipts for partitioned exact-prefix Flow.
 
 The released Sol history parser recognizes the retired Mixed-Grid replacement by
-its concrete closure contract. The new partitioned path has a distinct identity
-and explicit completion receipts. This opt-in bridge extends only those two
-classifiers; ordinary history behavior delegates to the released implementation.
+its concrete closure contract. The new partitioned path has a distinct identity,
+layout contract and explicit completion receipts. This opt-in bridge extends only
+those classifiers; ordinary history behavior delegates to the released
+implementation.
 """
 from __future__ import annotations
 
 import math
 
 PARTITIONED_FLOW_IDENTITY = "h3_flow_partitioned_exact_prefix_v1"
+VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
 _BRIDGE_MARKER = "_sol_h3_partitioned_history_bridge_v1"
 _RECEIPT_BRIDGE_MARKER = "_sol_h3_partitioned_receipt_bridge_v1"
+_VDN_HISTORY_BRIDGE_MARKER = "_sol_h3_partitioned_vdn_history_bridge_v1"
 
 
 def _digest(value):
@@ -20,6 +23,72 @@ def _digest(value):
         and len(value) == 64
         and value == value.lower()
         and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _partitioned_history_layout_valid(options, layout) -> bool:
+    """Validate Flow's current mixed-domain layout before any forecast identity."""
+    contract = (options or {}).get(PARTITIONED_FLOW_IDENTITY)
+    if contract is None:
+        return True
+    if not isinstance(contract, dict):
+        return False
+    names = (
+        "sequence_rows",
+        "video_start",
+        "temporal",
+        "prefix_t",
+        "source_rows_per_frame",
+        "target_rows_per_frame",
+    )
+    if any(type(contract.get(name)) is not int for name in names):
+        return False
+    sequence_rows = contract["sequence_rows"]
+    video_start = contract["video_start"]
+    temporal = contract["temporal"]
+    prefix_t = contract["prefix_t"]
+    source_rows = contract["source_rows_per_frame"]
+    target_rows = contract["target_rows_per_frame"]
+    if (
+        sequence_rows <= 0
+        or video_start <= 0
+        or temporal <= 1
+        or not 0 < prefix_t < temporal
+        or source_rows <= 0
+        or target_rows <= source_rows
+        or sequence_rows
+        != video_start + prefix_t * target_rows + (temporal - prefix_t) * source_rows
+        or not _digest(contract.get("semantic_digest"))
+    ):
+        return False
+
+    signature = getattr(layout, "signature", None)
+    segments = getattr(layout, "segments", None)
+    if (
+        int(getattr(layout, "seq_len", -1)) != sequence_rows
+        or not isinstance(signature, tuple)
+        or not signature
+        or signature[0] != PARTITIONED_FLOW_IDENTITY
+        or not isinstance(segments, (tuple, list))
+        or not segments
+        or tuple(segments[-1]) != (video_start, sequence_rows, "video")
+    ):
+        return False
+
+    external = (options or {}).get(VDN_EXTERNAL_SEQUENCE_KEY)
+    if not isinstance(external, dict):
+        return False
+    return bool(
+        external.get("api") == 3
+        and external.get("mode") == "partitioned_attention_no_linear"
+        and external.get("topology") == "target_prefix_source_suffix"
+        and external.get("sequence_rows") == sequence_rows
+        and external.get("video_start") == video_start
+        and external.get("temporal") == temporal
+        and external.get("prefix_t") == prefix_t
+        and external.get("source_rows_per_frame") == source_rows
+        and external.get("target_rows_per_frame") == target_rows
+        and external.get("flow_semantic_digest") == contract["semantic_digest"]
     )
 
 
@@ -264,6 +333,20 @@ def install_partitioned_history_bridge() -> None:
         partitioned_aware._sol_h3_released_mixed_grid_classifier = released
         interop._flow_mixed_grid_replacement_identity = partitioned_aware
 
+    current_vdn_history = interop._mapped_vdn_history_identity
+    if not getattr(current_vdn_history, _VDN_HISTORY_BRIDGE_MARKER, False):
+        released_vdn_history = current_vdn_history
+
+        def partitioned_vdn_history(forward, options, layout):
+            if (options or {}).get(PARTITIONED_FLOW_IDENTITY) is not None:
+                if not _partitioned_history_layout_valid(options, layout):
+                    return True, None
+            return released_vdn_history(forward, options, layout)
+
+        setattr(partitioned_vdn_history, _VDN_HISTORY_BRIDGE_MARKER, True)
+        partitioned_vdn_history._sol_h3_released_mapped_vdn_history = released_vdn_history
+        interop._mapped_vdn_history_identity = partitioned_vdn_history
+
     current_accept = interop.HistoryPolicy.accept_receipts
     if not getattr(current_accept, _RECEIPT_BRIDGE_MARKER, False):
         released_accept = current_accept
@@ -295,4 +378,7 @@ def install_partitioned_history_bridge() -> None:
         interop.HistoryPolicy.accept_receipts = partitioned_accept
 
 
-__all__ = ["PARTITIONED_FLOW_IDENTITY", "install_partitioned_history_bridge"]
+__all__ = [
+    "PARTITIONED_FLOW_IDENTITY",
+    "install_partitioned_history_bridge",
+]
