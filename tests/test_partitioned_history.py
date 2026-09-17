@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 
+from sol_h3 import interop
 from sol_h3.partitioned_history import (
     PARTITIONED_FLOW_IDENTITY,
     VDN_EXTERNAL_SEQUENCE_KEY,
     _accept_partitioned_receipt,
+    _partitioned_flow_replacement_identity,
     _partitioned_history_layout_valid,
 )
 from sol_h3.partitioned_request import (
@@ -97,6 +99,53 @@ def _partitioned_history_fixture():
     return options, layout
 
 
+def _flow_replacement_fixture():
+    layer = 0
+    previous = object()
+    plan = SimpleNamespace(
+        prefix_t=2,
+        temporal=5,
+        source_rows=4,
+        target_rows=16,
+        prefix_rows=32,
+        partitioned_rows=44,
+        target_hw=(8, 8),
+    )
+    video_start = 7
+    video_end = 27
+    carrier_prefix_rows = 8
+    layout = SimpleNamespace(
+        seq_len=27,
+        segments=[(0, 7, "nonvideo"), (7, 27, "video")],
+        signature=("native", 5, 4, 4),
+    )
+    partitioned_layout = SimpleNamespace(
+        seq_len=51,
+        segments=[(0, 7, "nonvideo"), (7, 51, "video")],
+        signature=(PARTITIONED_FLOW_IDENTITY, "partitioned"),
+    )
+    inner = SimpleNamespace(blocks=[object(), object()])
+    partition_contract = {"semantic_digest": DIGEST}
+
+    def call():
+        return (
+            layer,
+            previous,
+            plan,
+            layout,
+            partitioned_layout,
+            video_start,
+            video_end,
+            carrier_prefix_rows,
+            inner,
+            partition_contract,
+        )
+
+    call.__module__ = "h3_flow_regenerate.partitioned_transformer"
+    call.__qualname__ = "partitioned_diffusion_wrapper.<locals>.wrap.<locals>.call"
+    return call, previous
+
+
 def test_owned_partitioned_dense_receipt_is_accepted():
     fields = _fields()
     item = ("sol_h3", 3, PARTITIONED_DENSE_ROUTE, fields)
@@ -152,7 +201,7 @@ def test_owned_partitioned_mapped_receipt_requires_exact_map_proof():
         _REQUEST.reset(token)
 
 
-def test_partitioned_history_requires_current_mixed_layout_and_vdn_binding():
+def test_partitioned_history_requires_current_partitioned_layout_and_vdn_binding():
     options, layout = _partitioned_history_fixture()
     assert _partitioned_history_layout_valid(options, layout)
 
@@ -171,3 +220,17 @@ def test_partitioned_history_requires_current_mixed_layout_and_vdn_binding():
         },
     }
     assert not _partitioned_history_layout_valid(bad_external, layout)
+
+
+def test_partitioned_history_recognizes_dedicated_flow_transformer_closure():
+    patch, previous = _flow_replacement_fixture()
+    resolved = _partitioned_flow_replacement_identity(interop, patch, 0)
+    assert resolved is not None
+    identity, inherited = resolved
+    assert identity[0] == PARTITIONED_FLOW_IDENTITY
+    assert identity[1] == DIGEST
+    assert identity[2:10] == (27, 51, 7, 5, 2, 4, 16, (8, 8))
+    assert inherited is previous
+
+    patch.__module__ = "h3_flow_regenerate.partitioned_mixed"
+    assert _partitioned_flow_replacement_identity(interop, patch, 0) is None
