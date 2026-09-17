@@ -76,8 +76,8 @@ def _partitioned_history_fixture():
         "semantic_digest": DIGEST,
     }
     external = {
-        "api": 3,
-        "mode": "partitioned_attention_no_linear",
+        "api": 4,
+        "mode": "partitioned_attention_variable_grid_linear",
         "topology": "target_prefix_source_suffix",
         "sequence_rows": 49,
         "video_start": 7,
