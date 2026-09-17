@@ -23,11 +23,20 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .mapped_neighbors import MappingUnavailable, compile_descriptor, device_descriptor, validate_wire_map
+from .mapped_neighbors import (
+    POLICY as MAPPED_POLICY,
+    MappingUnavailable,
+    compile_descriptor,
+    device_descriptor,
+    validate_wire_map,
+)
 from .sparse import arithmetic_gate_passes, error_metrics
 
 PARTITIONED_REQUEST_ABI = "sol-h3-partitioned-single-union-v1"
 PARTITIONED_RECEIPT_TAG = "sol_h3_partitioned_exact_prefix_v1"
+PARTITIONED_DENSE_ROUTE = "partitioned_dense"
+PARTITIONED_SOL_ROUTE = "partitioned_sol"
+PARTITIONED_MAPPED_ROUTE = "partitioned_sol_mapped"
 MAX_BIAS_CACHE_ENTRIES = 64
 MAX_BIAS_CACHE_BYTES = 4 * 1024 * 1024
 BLOCK_SIZE = 64
@@ -36,6 +45,15 @@ BLOCK_SIZE = 64
 def _sha256_json(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(char in "0123456789abcdef" for char in value)
+    )
 
 
 def _request_state():
@@ -47,13 +65,17 @@ def _request_state():
     return state
 
 
-def _forward_evaluation() -> int:
+def _active_forward():
     from .runtime import _FORWARD
 
     active = _FORWARD.get()
     if active is None or len(active) != 5:
         raise RuntimeError("partitioned Sol must execute inside the native Sol diffusion lifecycle")
-    return int(active[2])
+    return active
+
+
+def _forward_evaluation() -> int:
+    return int(_active_forward()[2])
 
 
 def _validate_thd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -113,7 +135,7 @@ def _key_bias(
     log_measure = float(log_measure)
     if not math.isfinite(log_measure) or log_measure > 0.0:
         raise RuntimeError("partitioned Sol target-prefix log measure must be finite and non-positive")
-    if not isinstance(semantic_digest, str) or len(semantic_digest) != 64:
+    if not _digest(semantic_digest):
         raise RuntimeError("partitioned Sol semantic digest is invalid")
 
     cache = _bias_cache(state)
@@ -126,19 +148,32 @@ def _key_bias(
         log_measure,
         str(device),
     )
-    hit = cache.get(key)
-    if hit is not None:
-        cache.move_to_end(key)
-        return hit
-    bias = torch.zeros(kv_rows, dtype=torch.float32, device=device)
-    bias[start:end] = log_measure
-    cache[key] = bias
-    cache.move_to_end(key)
+    with torch.cuda.device(device):
+        current = torch.cuda.current_stream(device)
+        hit = cache.get(key)
+        if hit is not None:
+            cache.move_to_end(key)
+            bias, event, _size = hit
+            if event is None:
+                raise RuntimeError("partitioned Sol CUDA bias cache entry is missing its stream event")
+            current.wait_event(event)
+            bias.record_stream(current)
+            return bias
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("partitioned Sol cannot allocate key-measure metadata during CUDA graph capture")
+        bias = torch.zeros(kv_rows, dtype=torch.float32, device=device)
+        bias[start:end] = log_measure
+        event = torch.cuda.Event()
+        event.record(current)
+        bias.record_stream(current)
+
     size = bias.numel() * bias.element_size()
+    cache[key] = (bias, event, size)
+    cache.move_to_end(key)
     state.partitioned_measure_bias_bytes += size
     while len(cache) > MAX_BIAS_CACHE_ENTRIES or state.partitioned_measure_bias_bytes > MAX_BIAS_CACHE_BYTES:
-        _, evicted = cache.popitem(last=False)
-        state.partitioned_measure_bias_bytes -= evicted.numel() * evicted.element_size()
+        _, (_evicted, _event, evicted_size) = cache.popitem(last=False)
+        state.partitioned_measure_bias_bytes -= evicted_size
     return bias
 
 
@@ -193,6 +228,16 @@ def _sm120_union(
         or not key_bias.is_contiguous()
     ):
         raise RuntimeError("partitioned Sol key bias must be contiguous FP32 [Tkv]")
+    if mapped_neighbor_intervals is not None:
+        expected = ((q.shape[0] + BLOCK_SIZE - 1) // BLOCK_SIZE, 2)
+        if (
+            mapped_neighbor_intervals.ndim != 2
+            or tuple(mapped_neighbor_intervals.shape) != expected
+            or mapped_neighbor_intervals.dtype != torch.int32
+            or mapped_neighbor_intervals.device != q.device
+            or not mapped_neighbor_intervals.is_contiguous()
+        ):
+            raise RuntimeError("partitioned Sol mapped-neighbor metadata is invalid")
 
     batch, q_rows, heads, _ = qb.shape
     kv_rows = kb.shape[1]
@@ -250,17 +295,86 @@ def _sm120_union(
     return output[0]
 
 
-def _descriptor_for_wire(state, wire, *, q_rows: int, kv_rows: int, sink_rows: int, device):
+def _descriptor_for_wire(
+    state,
+    wire,
+    *,
+    q_rows: int,
+    kv_rows: int,
+    sink_rows: int,
+    device,
+    materialize: bool,
+):
     if wire is None:
-        return None, None
+        return None, None, None
     try:
         validated = validate_wire_map(wire, q_rows=q_rows, kv_rows=kv_rows, sink_rows=sink_rows)
         descriptor = compile_descriptor(validated)
-        if descriptor is None:
-            return validated, None
-        return validated, device_descriptor(state, descriptor, device)
+        mapped = None
+        if descriptor is not None and materialize:
+            mapped = device_descriptor(state, descriptor, device)
+        return validated, descriptor, mapped
     except MappingUnavailable as exc:
         raise RuntimeError(f"partitioned Sol mapped-neighbor contract is unavailable: {exc.reason}") from exc
+
+
+def _completion_fields(
+    *,
+    evaluation: int,
+    semantic_digest: str,
+    kind: str,
+    execution_mode: str,
+    q_rows: int,
+    kv_rows: int,
+    sink_rows: int,
+    prefix_k_range,
+    prefix_log_key_measure: float,
+    validated,
+    descriptor,
+    kernel_contract: str | None,
+):
+    return (
+        PARTITIONED_RECEIPT_TAG,
+        ("sol_h3_evaluation", int(evaluation)),
+        PARTITIONED_REQUEST_ABI,
+        semantic_digest,
+        kind,
+        execution_mode,
+        int(q_rows),
+        int(kv_rows),
+        int(sink_rows),
+        prefix_k_range,
+        float(prefix_log_key_measure),
+        None if validated is None else validated.map_digest,
+        None if descriptor is None else descriptor.descriptor_digest,
+        None if validated is None else MAPPED_POLICY,
+        kernel_contract,
+        True,
+    )
+
+
+def _record_completion(
+    state,
+    transformer_options,
+    *,
+    block_index: int,
+    route: str,
+    fields: tuple,
+) -> None:
+    active = _active_forward()
+    if active[1] is not state:
+        raise RuntimeError("partitioned Sol request ownership changed during an H3 block")
+    routes = active[4]
+    routes.append((block_index, route))
+    owned = getattr(state, "partitioned_validated_receipts", None)
+    if owned is None:
+        owned = set()
+        state.partitioned_validated_receipts = owned
+    owned.add((block_index, fields))
+    from .interop import receipt
+
+    receipt(transformer_options, block_index, route, fields=fields)
+    state.partitioned_receipts = getattr(state, "partitioned_receipts", 0) + 1
 
 
 def partitioned_request_attention(
@@ -281,6 +395,8 @@ def partitioned_request_attention(
 ) -> torch.Tensor:
     """Run one request-owned partitioned attention subcall over a single K/V union."""
     _validate_thd(q, k, v)
+    if not isinstance(transformer_options, dict):
+        raise RuntimeError("partitioned Sol requires transformer options")
     if kind not in {"global", "local", "anchor", "full"}:
         raise RuntimeError("partitioned Sol attention kind is unsupported")
     if type(block_index) is not int or block_index < 0:
@@ -290,10 +406,16 @@ def partitioned_request_attention(
         raise RuntimeError("partitioned Sol requires the native H3 attention scale")
     if type(sink_rows) is not int or not 0 <= sink_rows <= k.shape[0]:
         raise RuntimeError("partitioned Sol sink-row count is invalid")
+    if not _digest(semantic_digest):
+        raise RuntimeError("partitioned Sol semantic digest is invalid")
 
     state = _request_state()
     config = state.config
     evaluation = _forward_evaluation()
+    from .interop import dense_evaluation_warmup
+
+    warmup = dense_evaluation_warmup(config, evaluation, transformer_options)
+    dense_execution = bool(force_dense or warmup)
     key_bias = _key_bias(
         state,
         kv_rows=int(k.shape[0]),
@@ -306,22 +428,50 @@ def partitioned_request_attention(
     if prefix_k_range is not None:
         if prefix_k_range[0] < sink_rows:
             raise RuntimeError("partitioned Sol target-prefix K/V range overlaps the global sink")
+        if not dense_execution and prefix_k_range[0] != sink_rows:
+            raise RuntimeError(
+                "partitioned Sol sparse key measure must begin exactly at the global sink boundary"
+            )
         exact_end = max(exact_end, prefix_k_range[1])
-    validated, mapped = _descriptor_for_wire(
+
+    validated, descriptor, mapped = _descriptor_for_wire(
         state,
         query_position_map,
         q_rows=int(q.shape[0]),
         kv_rows=int(k.shape[0]),
         sink_rows=sink_rows,
         device=q.device,
+        materialize=not dense_execution,
     )
+    state.eligible_calls += 1
 
-    from .interop import dense_evaluation_warmup
-
-    warmup = dense_evaluation_warmup(config, evaluation, transformer_options)
-    if force_dense or warmup:
+    if dense_execution:
         result = _weighted_dense(q, k, v, key_bias, scale=scale)
         state.partitioned_dense_calls = getattr(state, "partitioned_dense_calls", 0) + 1
+        if warmup:
+            state.dense_calls += 1
+        mode = "dense_forced" if force_dense else "dense_warmup"
+        fields = _completion_fields(
+            evaluation=evaluation,
+            semantic_digest=semantic_digest,
+            kind=kind,
+            execution_mode=mode,
+            q_rows=int(q.shape[0]),
+            kv_rows=int(k.shape[0]),
+            sink_rows=sink_rows,
+            prefix_k_range=prefix_k_range,
+            prefix_log_key_measure=float(prefix_log_key_measure),
+            validated=validated,
+            descriptor=descriptor,
+            kernel_contract=None,
+        )
+        _record_completion(
+            state,
+            transformer_options,
+            block_index=block_index,
+            route=PARTITIONED_DENSE_ROUTE,
+            fields=fields,
+        )
         return result
 
     calibration_identity = _sha256_json(
@@ -335,6 +485,7 @@ def partitioned_request_attention(
             "exact_end": exact_end,
             "mapped": mapped is not None,
             "map_digest": None if validated is None else validated.map_digest,
+            "descriptor_digest": None if descriptor is None else descriptor.descriptor_digest,
         }
     )
     verified = getattr(state, "partitioned_sparse_verified", None)
@@ -394,7 +545,49 @@ def partitioned_request_attention(
     state.partitioned_sparse_calls = getattr(state, "partitioned_sparse_calls", 0) + 1
     state.partitioned_requested_q_rows = getattr(state, "partitioned_requested_q_rows", 0) + int(q.shape[0])
     state.partitioned_kernel_q_rows = getattr(state, "partitioned_kernel_q_rows", 0) + int(q.shape[0])
+    state.sparse_calls += 1
+    if kind == "local":
+        state.vdn_local_sol_calls += 1
+        state.vdn_requested_q_rows += int(q.shape[0])
+        state.vdn_kernel_q_rows += int(q.shape[0])
+        if q.shape[0] != k.shape[0]:
+            state.vdn_rectangular_sol_calls += 1
+        if mapped is not None:
+            state.vdn_mapped_sol_calls += 1
+
+    from .provenance import CONTRACT
+
+    route = PARTITIONED_MAPPED_ROUTE if mapped is not None else PARTITIONED_SOL_ROUTE
+    mode = "sm120_mapped" if mapped is not None else "sm120_union"
+    fields = _completion_fields(
+        evaluation=evaluation,
+        semantic_digest=semantic_digest,
+        kind=kind,
+        execution_mode=mode,
+        q_rows=int(q.shape[0]),
+        kv_rows=int(k.shape[0]),
+        sink_rows=sink_rows,
+        prefix_k_range=prefix_k_range,
+        prefix_log_key_measure=float(prefix_log_key_measure),
+        validated=validated,
+        descriptor=descriptor,
+        kernel_contract=CONTRACT,
+    )
+    _record_completion(
+        state,
+        transformer_options,
+        block_index=block_index,
+        route=route,
+        fields=fields,
+    )
     return result
 
 
-__all__ = ["PARTITIONED_RECEIPT_TAG", "PARTITIONED_REQUEST_ABI", "partitioned_request_attention"]
+__all__ = [
+    "PARTITIONED_DENSE_ROUTE",
+    "PARTITIONED_MAPPED_ROUTE",
+    "PARTITIONED_RECEIPT_TAG",
+    "PARTITIONED_REQUEST_ABI",
+    "PARTITIONED_SOL_ROUTE",
+    "partitioned_request_attention",
+]
