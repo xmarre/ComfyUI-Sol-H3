@@ -71,11 +71,11 @@ def _keyless_model(*, fake_qkv=False):
     return model
 
 
-def _layout():
+def _layout(seq_len=7, prefix=3):
     return SimpleNamespace(
-        seq_len=7,
-        segments=[(0, 3, "text"), (3, 7, "video")],
-        signature=(3, 7),
+        seq_len=seq_len,
+        segments=[(0, prefix, "text"), (prefix, seq_len, "video")],
+        signature=(prefix, seq_len),
     )
 
 
@@ -126,6 +126,27 @@ def test_keyless_history_identity_is_architecture_bound_and_requires_runtime_mar
         keyless_compat.KEYLESS_RECEIPT_TAG,
     )
     assert missing_marker is None
+
+
+def test_foreign_keyless_provider_makes_sol_history_opaque():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    model = _keyless_model()
+    semantic = keyless_compat.keyless_semantic_identity(model)
+    options = _history_options(cfg, semantic)
+
+    class ForeignProvider:
+        api = 1
+
+        def __call__(self, **_kwargs):
+            return None
+
+    options[keyless_compat.KEYLESS_PROVIDER_KEY] = ForeignProvider()
+    request = Request(cfg)
+    token = _REQUEST.set(request)
+    try:
+        assert HistoryPolicy(cfg)(layout=_layout(), options=options, model=model) is None
+    finally:
+        _REQUEST.reset(token)
 
 
 def test_keyless_materialized_receipts_are_tagged_and_accepted():
@@ -230,3 +251,197 @@ def test_runtime_install_marks_only_returned_clone_and_rejects_keyless_vdn(monke
     monkeypatch.setattr(keyless_compat, "_ORIGINAL_RUNTIME_INSTALL", lambda model, config: blocked_clone)
     with pytest.raises(RuntimeError, match="does not yet authorize VDN"):
         keyless_compat._runtime_install(source, cfg)
+
+
+def test_diffusion_wrapper_installs_one_request_stable_owned_provider(monkeypatch):
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    semantic = keyless_compat.keyless_semantic_identity(_keyless_model())
+    captured = []
+
+    def original(_self, _executor, _x, _timestep, _context, options, **_kwargs):
+        captured.append(options)
+        return options
+
+    monkeypatch.setattr(keyless_compat, "_ORIGINAL_DIFFUSION_CALL", original)
+    wrapper = SimpleNamespace(config=cfg)
+    request = Request(cfg)
+    token = _REQUEST.set(request)
+    try:
+        base = {keyless_compat.KEYLESS_RUNTIME_IDENTITY_KEY: semantic}
+        keyless_compat._diffusion_call(wrapper, object(), None, None, None, base)
+        keyless_compat._diffusion_call(wrapper, object(), None, None, None, base)
+    finally:
+        _REQUEST.reset(token)
+
+    first = captured[0][keyless_compat.KEYLESS_PROVIDER_KEY]
+    second = captured[1][keyless_compat.KEYLESS_PROVIDER_KEY]
+    assert first is second
+    assert first.api == 1
+    assert first.identity == (keyless_compat.KEYLESS_PROVIDER_IDENTITY, 1, semantic)
+    assert keyless_compat.KEYLESS_PROVIDER_KEY not in base
+
+
+def test_diffusion_wrapper_preserves_foreign_keyless_provider(monkeypatch):
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    semantic = keyless_compat.keyless_semantic_identity(_keyless_model())
+    foreign = object()
+    captured = []
+
+    def original(_self, _executor, _x, _timestep, _context, options, **_kwargs):
+        captured.append(options)
+        return options
+
+    monkeypatch.setattr(keyless_compat, "_ORIGINAL_DIFFUSION_CALL", original)
+    wrapper = SimpleNamespace(config=cfg)
+    request = Request(cfg)
+    token = _REQUEST.set(request)
+    try:
+        keyless_compat._diffusion_call(
+            wrapper,
+            object(),
+            None,
+            None,
+            None,
+            {
+                keyless_compat.KEYLESS_RUNTIME_IDENTITY_KEY: semantic,
+                keyless_compat.KEYLESS_PROVIDER_KEY: foreign,
+            },
+        )
+    finally:
+        _REQUEST.reset(token)
+    assert captured[0][keyless_compat.KEYLESS_PROVIDER_KEY] is foreign
+
+
+def test_owned_provider_scores_materialized_route_and_retrieves_raw_v(monkeypatch):
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    semantic = keyless_compat.keyless_semantic_identity(_keyless_model())
+    provider = keyless_compat._KeylessSolProviderV1(semantic)
+    captured = {}
+
+    class Routing:
+        block_index = 4
+        value_domain = None
+        routing_position_domain = None
+
+        @staticmethod
+        def materialize(v):
+            return v * 2.0
+
+    def fake_sparse(q, route, v, prefix, config, state, **kwargs):
+        captured.update(q=q.clone(), route=route.clone(), v=v.clone(), prefix=prefix)
+        return torch.zeros(1, q.shape[2], q.shape[1] * q.shape[3], dtype=q.dtype)
+
+    monkeypatch.setattr(sparse, "attention", fake_sparse)
+    monkeypatch.setattr(keyless_compat, "_sol_override_previous", lambda _options: None)
+
+    q = torch.randn(4, 2, 128)
+    raw_v = torch.randn_like(q)
+    options = {
+        keyless_compat.KEYLESS_RUNTIME_IDENTITY_KEY: semantic,
+        "minimax_h3_layout": _layout(seq_len=4, prefix=2),
+        RECEIPTS_KEY: [],
+    }
+    state = Request(cfg)
+    token = runtime._FORWARD.set((object(), state, 0, {4}, []))
+    try:
+        out = provider(
+            q=q,
+            v=raw_v,
+            heads=2,
+            scale=128**-0.5,
+            routing=Routing(),
+            mask=None,
+            log_measure=None,
+            exact_blocks=None,
+            query_domain=None,
+            value_domain=None,
+            dense_fallback=lambda: (_ for _ in ()).throw(AssertionError("unexpected fallback")),
+            transformer_options=options,
+        )
+        routes = runtime._FORWARD.get()[4]
+    finally:
+        runtime._FORWARD.reset(token)
+
+    assert out.shape == q.shape
+    torch.testing.assert_close(captured["route"].squeeze(0).transpose(0, 1), raw_v * 2.0)
+    torch.testing.assert_close(captured["v"].squeeze(0).transpose(0, 1), raw_v)
+    assert captured["prefix"] == 2
+    assert routes == [(4, "sol")]
+    assert state.eligible_calls == 1
+    assert options[RECEIPTS_KEY][0][2] == "sol"
+
+
+def test_owned_provider_defers_inherited_attention_composition(monkeypatch):
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    semantic = keyless_compat.keyless_semantic_identity(_keyless_model())
+    provider = keyless_compat._KeylessSolProviderV1(semantic)
+    sentinel = torch.randn(3, 2, 128)
+    previous = object()
+    monkeypatch.setattr(keyless_compat, "_sol_override_previous", lambda _options: previous)
+    monkeypatch.setattr(
+        sparse,
+        "attention",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sparse path must not run")),
+    )
+
+    class Routing:
+        block_index = 1
+        value_domain = None
+        routing_position_domain = None
+
+        @staticmethod
+        def materialize(_v):
+            raise AssertionError("route must be owned by the existing materialized bridge")
+
+    state = Request(cfg)
+    token = runtime._FORWARD.set((object(), state, 0, {1}, []))
+    try:
+        out = provider(
+            q=torch.randn(3, 2, 128),
+            v=torch.randn(3, 2, 128),
+            heads=2,
+            scale=128**-0.5,
+            routing=Routing(),
+            mask=None,
+            log_measure=None,
+            exact_blocks=None,
+            query_domain=None,
+            value_domain=None,
+            dense_fallback=lambda: sentinel,
+            transformer_options={keyless_compat.KEYLESS_RUNTIME_IDENTITY_KEY: semantic},
+        )
+    finally:
+        runtime._FORWARD.reset(token)
+    assert out is sentinel
+
+
+def test_owned_provider_refuses_unimplemented_exact_blocks():
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    semantic = keyless_compat.keyless_semantic_identity(_keyless_model())
+    provider = keyless_compat._KeylessSolProviderV1(semantic)
+
+    class Routing:
+        block_index = 2
+        value_domain = None
+        routing_position_domain = None
+
+    state = Request(cfg)
+    token = runtime._FORWARD.set((object(), state, 0, {2}, []))
+    try:
+        with pytest.raises(RuntimeError, match="exact_blocks"):
+            provider(
+                q=torch.randn(3, 2, 128),
+                v=torch.randn(3, 2, 128),
+                heads=2,
+                scale=128**-0.5,
+                routing=Routing(),
+                mask=None,
+                log_measure=None,
+                exact_blocks=(0, 1),
+                query_domain=None,
+                value_domain=None,
+                dense_fallback=lambda: None,
+                transformer_options={keyless_compat.KEYLESS_RUNTIME_IDENTITY_KEY: semantic},
+            )
+    finally:
+        runtime._FORWARD.reset(token)
