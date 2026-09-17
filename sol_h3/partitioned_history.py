@@ -12,6 +12,8 @@ import math
 
 PARTITIONED_FLOW_IDENTITY = "h3_flow_partitioned_exact_prefix_v1"
 VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
+VDN_PARTITIONED_SEQUENCE_API = 4
+VDN_PARTITIONED_SEQUENCE_MODE = "partitioned_attention_variable_grid_linear"
 _BRIDGE_MARKER = "_sol_h3_partitioned_history_bridge_v1"
 _RECEIPT_BRIDGE_MARKER = "_sol_h3_partitioned_receipt_bridge_v1"
 _VDN_HISTORY_BRIDGE_MARKER = "_sol_h3_partitioned_vdn_history_bridge_v1"
@@ -79,8 +81,8 @@ def _partitioned_history_layout_valid(options, layout) -> bool:
     if not isinstance(external, dict):
         return False
     return bool(
-        external.get("api") == 3
-        and external.get("mode") == "partitioned_attention_no_linear"
+        external.get("api") == VDN_PARTITIONED_SEQUENCE_API
+        and external.get("mode") == VDN_PARTITIONED_SEQUENCE_MODE
         and external.get("topology") == "target_prefix_source_suffix"
         and external.get("sequence_rows") == sequence_rows
         and external.get("video_start") == video_start
