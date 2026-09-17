@@ -27,7 +27,7 @@ def _digest(value):
 
 
 def _partitioned_history_layout_valid(options, layout) -> bool:
-    """Validate Flow's current mixed-domain layout before any forecast identity."""
+    """Validate Flow's current partitioned layout before any forecast identity."""
     contract = (options or {}).get(PARTITIONED_FLOW_IDENTITY)
     if contract is None:
         return True
@@ -93,16 +93,15 @@ def _partitioned_history_layout_valid(options, layout) -> bool:
 
 
 def _partitioned_flow_replacement_identity(interop, patch, block_index):
+    """Recognize the dedicated Flow partitioned transformer replacement exactly."""
     module = str(getattr(patch, "__module__", ""))
     qualname = str(getattr(patch, "__qualname__", ""))
     if not (
         (
-            module == "h3_flow_regenerate.partitioned_mixed"
-            or module.endswith(".h3_flow_regenerate.partitioned_mixed")
+            module == "h3_flow_regenerate.partitioned_transformer"
+            or module.endswith(".h3_flow_regenerate.partitioned_transformer")
         )
-        and qualname.endswith(
-            "partitioned_diffusion_wrapper.<locals>.wrap.<locals>.call"
-        )
+        and qualname.endswith("partitioned_diffusion_wrapper.<locals>.wrap.<locals>.call")
     ):
         return None
 
@@ -112,10 +111,10 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
         "previous",
         "plan",
         "layout",
-        "mixed_layout",
-        "va",
-        "vb",
-        "old_prefix",
+        "partitioned_layout",
+        "video_start",
+        "video_end",
+        "carrier_prefix_rows",
         "inner",
         "partition_contract",
     }
@@ -126,7 +125,7 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
 
     plan = values["plan"]
     layout = values["layout"]
-    mixed_layout = values["mixed_layout"]
+    partitioned_layout = values["partitioned_layout"]
     inner = values["inner"]
     partition_contract = values["partition_contract"]
     try:
@@ -135,15 +134,15 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
         source_rows = int(plan.source_rows)
         target_rows = int(plan.target_rows)
         prefix_rows = int(plan.prefix_rows)
-        mixed_rows = int(plan.mixed_rows)
+        partitioned_rows = int(plan.partitioned_rows)
         target_hw = tuple(int(value) for value in plan.target_hw)
-        va = int(values["va"])
-        vb = int(values["vb"])
-        old_prefix = int(values["old_prefix"])
+        video_start = int(values["video_start"])
+        video_end = int(values["video_end"])
+        carrier_prefix_rows = int(values["carrier_prefix_rows"])
         native_rows = int(layout.seq_len)
-        mixed_sequence_rows = int(mixed_layout.seq_len)
+        partitioned_sequence_rows = int(partitioned_layout.seq_len)
         native_segments = tuple(layout.segments)
-        mixed_segments = tuple(mixed_layout.segments)
+        partitioned_segments = tuple(partitioned_layout.segments)
         inner_blocks = len(inner.blocks)
         semantic_digest = str(partition_contract["semantic_digest"])
     except (AttributeError, KeyError, TypeError, ValueError):
@@ -156,19 +155,19 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
         or len(target_hw) != 2
         or any(value <= 0 or value % 2 for value in target_hw)
         or prefix_rows != prefix_t * target_rows
-        or old_prefix != prefix_t * source_rows
-        or mixed_rows != prefix_rows + (temporal - prefix_t) * source_rows
-        or va <= 0
-        or vb != va + temporal * source_rows
-        or native_rows != vb
-        or mixed_sequence_rows != va + mixed_rows
+        or carrier_prefix_rows != prefix_t * source_rows
+        or partitioned_rows != prefix_rows + (temporal - prefix_t) * source_rows
+        or video_start <= 0
+        or video_end != video_start + temporal * source_rows
+        or native_rows != video_end
+        or partitioned_sequence_rows != video_start + partitioned_rows
         or not native_segments
-        or native_segments[-1] != (va, vb, "video")
-        or not mixed_segments
-        or mixed_segments[-1] != (va, mixed_sequence_rows, "video")
-        or not isinstance(getattr(mixed_layout, "signature", None), tuple)
-        or not mixed_layout.signature
-        or mixed_layout.signature[0] != PARTITIONED_FLOW_IDENTITY
+        or native_segments[-1] != (video_start, video_end, "video")
+        or not partitioned_segments
+        or partitioned_segments[-1] != (video_start, partitioned_sequence_rows, "video")
+        or not isinstance(getattr(partitioned_layout, "signature", None), tuple)
+        or not partitioned_layout.signature
+        or partitioned_layout.signature[0] != PARTITIONED_FLOW_IDENTITY
         or not _digest(semantic_digest)
         or block_index < 0
         or block_index >= inner_blocks
@@ -179,15 +178,15 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
         PARTITIONED_FLOW_IDENTITY,
         semantic_digest,
         native_rows,
-        mixed_sequence_rows,
-        va,
+        partitioned_sequence_rows,
+        video_start,
         temporal,
         prefix_t,
         source_rows,
         target_rows,
         target_hw,
         repr(getattr(layout, "signature", None)),
-        repr(mixed_layout.signature),
+        repr(partitioned_layout.signature),
     )
     return identity, values["previous"]
 
