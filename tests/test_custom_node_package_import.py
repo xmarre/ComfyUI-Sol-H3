@@ -11,7 +11,13 @@ def test_comfy_custom_node_load_exposes_canonical_sol_h3(tmp_path):
 import importlib
 import importlib.util
 import sys
+import sysconfig
 from pathlib import Path
+
+# Keep site initialization disabled so the editable-install .pth file cannot
+# make sol_h3 importable before the custom-node root executes. Runtime wheels
+# such as torch remain directly importable from the physical site-packages dir.
+sys.path.append(sysconfig.get_paths()["purelib"])
 
 root = Path(sys.argv[1]).resolve()
 spec = importlib.util.spec_from_file_location(
