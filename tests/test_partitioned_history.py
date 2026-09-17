@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
-from sol_h3.partitioned_history import _accept_partitioned_receipt
+from sol_h3.partitioned_history import (
+    PARTITIONED_FLOW_IDENTITY,
+    VDN_EXTERNAL_SEQUENCE_KEY,
+    _accept_partitioned_receipt,
+    _partitioned_history_layout_valid,
+)
 from sol_h3.partitioned_request import (
     PARTITIONED_DENSE_ROUTE,
     PARTITIONED_MAPPED_ROUTE,
@@ -58,6 +63,40 @@ def _owned(item):
         _REQUEST.reset(token)
 
 
+def _partitioned_history_fixture():
+    contract = {
+        "sequence_rows": 49,
+        "video_start": 7,
+        "temporal": 5,
+        "prefix_t": 2,
+        "source_rows_per_frame": 6,
+        "target_rows_per_frame": 12,
+        "semantic_digest": DIGEST,
+    }
+    external = {
+        "api": 3,
+        "mode": "partitioned_attention_no_linear",
+        "topology": "target_prefix_source_suffix",
+        "sequence_rows": 49,
+        "video_start": 7,
+        "temporal": 5,
+        "prefix_t": 2,
+        "source_rows_per_frame": 6,
+        "target_rows_per_frame": 12,
+        "flow_semantic_digest": DIGEST,
+    }
+    options = {
+        PARTITIONED_FLOW_IDENTITY: contract,
+        VDN_EXTERNAL_SEQUENCE_KEY: external,
+    }
+    layout = SimpleNamespace(
+        seq_len=49,
+        segments=[(0, 7, "nonvideo"), (7, 49, "video")],
+        signature=(PARTITIONED_FLOW_IDENTITY, "test"),
+    )
+    return options, layout
+
+
 def test_owned_partitioned_dense_receipt_is_accepted():
     fields = _fields()
     item = ("sol_h3", 3, PARTITIONED_DENSE_ROUTE, fields)
@@ -111,3 +150,24 @@ def test_owned_partitioned_mapped_receipt_requires_exact_map_proof():
         assert not _accept_partitioned_receipt(bad)
     finally:
         _REQUEST.reset(token)
+
+
+def test_partitioned_history_requires_current_mixed_layout_and_vdn_binding():
+    options, layout = _partitioned_history_fixture()
+    assert _partitioned_history_layout_valid(options, layout)
+
+    stale_layout = SimpleNamespace(
+        seq_len=48,
+        segments=layout.segments,
+        signature=layout.signature,
+    )
+    assert not _partitioned_history_layout_valid(options, stale_layout)
+
+    bad_external = {
+        **options,
+        VDN_EXTERNAL_SEQUENCE_KEY: {
+            **options[VDN_EXTERNAL_SEQUENCE_KEY],
+            "flow_semantic_digest": "d" * 64,
+        },
+    }
+    assert not _partitioned_history_layout_valid(bad_external, layout)
