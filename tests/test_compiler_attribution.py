@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 import threading
 import time
 
@@ -49,3 +50,23 @@ def test_cache_generation_changes_only_for_destructive_mutation():
     assert cache.destructive_generation == 2
     cache.clear()
     assert cache.destructive_generation == 3
+
+
+
+def test_refresh_runtime_objects_rewraps_replaced_cache_and_lock():
+    interface = SimpleNamespace(
+        _compiled={("a",): lambda: None},
+        _compile_lock=threading.Lock(),
+    )
+    compiler_attribution._refresh_runtime_objects(interface)
+    assert isinstance(interface._compiled, compiler_attribution._AttributedCache)
+    assert isinstance(interface._compile_lock, compiler_attribution._TimedLock)
+    first_cache = interface._compiled
+
+    interface._compiled = {("b",): lambda: None}
+    interface._compile_lock = threading.Lock()
+    compiler_attribution._refresh_runtime_objects(interface)
+    assert isinstance(interface._compiled, compiler_attribution._AttributedCache)
+    assert isinstance(interface._compile_lock, compiler_attribution._TimedLock)
+    assert interface._compiled is not first_cache
+    assert ("b",) in interface._compiled
