@@ -26,14 +26,14 @@ Live API and Git reads during this investigation returned the following state. T
 | xmarre/MiniMax-H3-Flow-Aligned-Regenerate #49 | `85b953c2cdf8304dbb7da283a9131a3722ff5386` | `b659b311fa548c7e3275db0e6f0a05c037dac730` / main | `mirror/exact-prefix-progressive-v2-20260917` |
 | xmarre/ComfyUI-Sol-H3 #15 | `93b3e03f2b7b579aaf55fa0f87f55083b259e25c` | `0208ddbaaa8a94d70cbf29003680a24d6404fc66` / main | `mirror/exact-prefix-partitioned-attention-20260917` |
 | xmarre/ComfyUI-VDN-H3-Plus #19 | `1bc9f9cd0f685a28f84664b50951df8241501249` | `d244ae4cc635123826e243aac335b4719c865670` / main | `mirror/exact-prefix-partitioned-vdn-20260917` |
-| xmarre/ComfyUI-H3-Continuum-Plus #23 | `abe65a82194bed5308a284c800cef5bd1ef565c4` | `ccf50cddf83124707b866e4df3956e85d41dda4b` / production mirror | `mirror/production-physical-text-transport-20260913` |
+| xmarre/ComfyUI-H3-Continuum-Plus #23 | `abe65a82194bed5308a284c800cef5bd1ef565c4` | `ccf50cddf83124707b866e4df3956e85d41dda4b` / `fix/first-frame-continuation-presentation` | `mirror/production-physical-text-transport-20260913` |
 | Continuum Plus #24 | `e164609f6907ecd2a30da559cc54f19d2e5ab98c` | #23 head | `mirror/production-phase-aware-audio-20260913` |
 
 Flow/Sol/VDN heads are respectively 65/19/24 commits ahead of their main bases, with no base-only commits in the fetched comparisons. All three PRs are open drafts. Reviews and inline review comments were empty. Their discussion includes skipped automatic reviews; that is not review approval. Flow discussion also preserves superseded import/metrics failures, not new production requirements.
 
 Reported checks for these heads succeeded: Flow source-contracts and Python 3.10-3.13; Sol test/native-interop/windows-provenance; VDN pinned Comfy oracle/current-main smoke/legacy migration. Continuum #23/#24 test 3.10-3.13 and publisher-toolchain succeeded. These are structural checks, not timing or media evidence.
 
-Related open work was inspected: Flow #50 is stacked on #49; Sol #16/#17 and VDN #20/#21 are separate Keyless work; Sol #11-#13, Flow #34-#46 diagnostic stacks and VDN #15-#17 preserve earlier experiments. VDN #8 remains separate audio-fidelity work; #12 concerns AIMDO guard placement. Do not merge, rebase, repurpose or replace these branches to perform this task. Continuum main was `a5b8943844594545301b20d01af5d9e3fa38ae29`; neither main nor a PR title identifies an installed overlay.
+Related open work was inspected: Flow #50 is stacked on #49; Sol #16/#17 and VDN #20/#21 are separate Keyless work; Sol #11-#13, Flow #34-#46 diagnostic stacks and VDN #15-#17 preserve earlier experiments. Continuum #25 is stacked on #24; #23 is stacked on #20, while #22 remains a separate draft. VDN #8 remains separate audio-fidelity work; #12 concerns AIMDO guard placement. Do not merge, rebase, repurpose or replace these branches to perform this task. Continuum main was `a5b8943844594545301b20d01af5d9e3fa38ae29`; neither main nor a PR title identifies an installed overlay.
 
 No AGENTS.md was found in the three primary checked-out trees. Continuum's PR-head AGENTS.md requires public wrapper contracts, exact-state preservation, no global class replacements and no compatibility allowlists; its text/audio work must remain isolated.
 
@@ -108,9 +108,9 @@ First sampler stage sums leave .025478 s and .024437 s of unassigned enclosing o
 
 | Run/chunk/stage | Calls, seconds |
 |---|---|
-| 00504 first low | A10.359506, A9.647071, F.442744, A9.664969, A9.651959 |
+| 00504 first low | A10.359506, A9.647071, F0.442744, A9.664969, A9.651959 |
 | 00504 first probe | A10.158557 |
-| 00504 first high | A22.043973, F.995091, A21.720449 |
+| 00504 first high | A22.043973, F0.995091, A21.720449 |
 | 00504 continuation single | A30.305252, A26.614135, F1.215804, A26.360440, A26.613266, F1.948797, A26.458130, A26.483099 |
 | 00511 first low | A12.281669, A24.851608, F0.456137, A10.579650, A10.390465 |
 | 00511 first probe | A10.769987 |
@@ -131,7 +131,7 @@ Use the JSON events for full precision. The stage ledger and aggregate totals ar
 | Continuation low | 11 partitioned in 00511 | not applicable | **not recorded** | not recorded |
 | Continuation probe | 0 | not applicable | 0 | not recorded |
 | Continuation target/high | 5 | .122867 | 14.257642 | .002762 |
-| Timed ordinary sum | 15 | **.285472** | **42.794905** | **.045173** |
+| Timed ordinary sum | 15 | **.285472** | **42.794904** | **.045173** |
 
 00504 loader sum is .011326 s. `kernel_loader_s` measures import/provenance/wrapper loading, not CuTe compile time. Partitioned gates omit both timers entirely.
 
@@ -139,9 +139,9 @@ The five ordinary first-low (Tq,Tkv) pairs are (2024,12144), (2530,14674), (2530
 
 Partitioned checks have five distinct shape pairs: (1518,19697), (2530,16947), (2530,15847), (2530,13823), (506,11293). The middle pair appears seven times because the current validation identity also includes physical map/group semantics. All 11 report key-measure bias and mapped ABI. Logs omit their strides and canonical bias keys, so shape equality alone cannot certify cache equivalence.
 
-The ordinary gate interval increase is **42.509433 s**, or **47.94%** of the sampler regression. This is interval attribution, not proof that removing validation saves 42.5 s. Compile/initialization and earlier queued GPU work can be inside the interval. Dense-reference dominance is unproven.
+The ordinary gate interval increase is **42.509432 s**, or **47.94%** of the sampler regression. This is interval attribution, not proof that removing validation saves 42.5 s. Compile/initialization and earlier queued GPU work can be inside the interval. Dense-reference dominance is unproven.
 
-Optimistically subtracting every visible 00511 ordinary gate leaves **324.180443 s**, still **45.873834 s** above 00504 combined sampler. For continuation it leaves **209.921222 s**, still **35.996772 s** above the control. These are counterfactual accounting bounds, not predicted runtimes. Partitioned gate time is unknown; a roughly 14 s spike in its second low actual is suggestive, not a measurement of 11 gates. No defensible 50-60 s arithmetic-only saving follows from these artifacts.
+Optimistically subtracting every visible 00511 ordinary gate leaves **324.180444 s**, still **45.873835 s** above 00504 combined sampler. For continuation it leaves **209.921222 s**, still **35.996772 s** above the control. These are counterfactual accounting bounds, not predicted runtimes. Partitioned gate time is unknown; a roughly 14 s spike in its second low actual is suggestive, not a measurement of 11 gates. No defensible 50-60 s arithmetic-only saving follows from these artifacts.
 
 ### 4.5 Cold state, setup and residual
 
@@ -309,7 +309,7 @@ The explicit probe costs 26.279481 s enclosing wall, including 24.929898 s model
 | A | Sol `sparse.py:attention/error_metrics`; `partitioned_request.py:partitioned_request_attention/_sm120_union`; vendor `interface.py:_compile_sm120/_sol_attn_cute`; `runtime.py:SamplingWrapper` | Add bounded attribution, compiler-key/generation receipts, partition gate timing and Request summary. Initially preserve calls, keys and failures. Vendor edits require regenerated packaged manifest and maintained source patch artifacts. |
 | B | Sol new `validation.py`; `runtime.py:Request`; `sparse.py:load_kernel`; `partitioned_request.py:_sm120_union`; `provenance.py` | Introduce pinned request runtime lease and bounded success service. Verify source once per lease; pin loaded implementation identity. Preserve first-unseen full gate. Unit-test invalidation/failure before routing both callsites through it. |
 | C | Sol validation key builder + partitioned callsite | Separately prove and remove only duplicate map/group-dependent arithmetic keys whose bias/layout/profile is identical. Keep all map/owner/history checks. No universal cross-request cache. |
-| D | Flow `h3_flow_regenerate/runtime.py:flow_predict_wrapper/flow_sample_wrapper`, `partitioned_scheduler.py`, `metrics.py`; `partitioned_runtime_gate.py` / `tools/check_partitioned_runtime_evidence.py` | Correlate request/stage/evaluation IDs and summaries with actual/forecast events; retain exact-prefix/provider validators. Missing timing is unknown, not zero. Add offline exclusive accounting. No sampler or prompt-routing change. |
+| D | Flow `h3_flow_regenerate/runtime.py:flow_predict_wrapper/flow_outer_wrapper`, `partitioned_scheduler.py`, `metrics.py`; `partitioned_runtime_gate.py` / `tools/check_partitioned_runtime_evidence.py` | Correlate request/stage/evaluation IDs and summaries with actual/forecast events; retain exact-prefix/provider validators. Missing timing is unknown, not zero. Add offline exclusive accounting. No sampler or prompt-routing change. |
 | E | VDN `partitioned_runtime.py:_partitioned_vdn_forward`, `partitioned_linear.py:_variable_features/_core_readout/partitioned_linear_readout`; released `branch.py` and runtime buffer lease | Add sampled ranges for gather/preprocess/softmax/linear/weights. Optimize heterogeneous work only under the phase-2 trigger below. Preserve original implementation as numerical oracle during testing. |
 | None | Continuum #23/#24, VDN #8, diagnostic/Keyless stacks | Record installed provenance and keep fixed; do not modify for performance attribution. |
 
@@ -355,6 +355,17 @@ Use existing suites and targeted additions; no long unrelated full-stack campaig
 - Cross-repo tests use pinned exact implementation mirror commits and Comfy's generated custom-node loader namespace. Preserve public wrapper composition, Sage only, Sage+Sol, Sage+Spectrum and Sage+Sol+Spectrum. Current CI source pins must be deliberately updated, not silently redirected to mutable branches.
 
 Numerical tensor tests establish implementation equivalence within declared BF16 tolerances; they do not establish perceptual output quality.
+
+The existing offline validator was executed directly from its stdlib-only module against 00511. Its expectation arguments describe the **latest partitioned chunk**, so use 9/7/2 there, and independently assert whole-run counters 18/14/4. Passing 18/14/4 to those arguments incorrectly rejects the valid evidence. The CLI imports the package and requires PyTorch; direct module execution used for this document does not test that CLI environment.
+
+```bash
+python tools/check_partitioned_runtime_evidence.py \
+  --metrics /path/to/metrics_00511_.json \
+  --log /path/to/run00511.log \
+  --expected-logical 9 --expected-actual 7 --expected-forecast 2
+```
+
+No production tests or CUDA benchmark were run for this documentation-only task. Verification consists of source tracing, primary-artifact accounting, the existing offline runtime gate and documentation diff checks. Hosted checks reported in section 2 belong to the audited production heads.
 
 ## 15. Matched hardware campaign
 
@@ -439,6 +450,6 @@ print(sum(g['gate_wall_s'] for g in gates if 'gate_wall_s' in g))
 print('untimed gates:', sum('gate_wall_s' not in g for g in gates))
 ```
 
-Expected 00511 values: sampler 366.975348317 s, model intervals 345.492942404 s, remainder 21.482405913 s, ordinary gate total approximately 42.794905 s, 11 untimed gates. For 00504: sampler 278.306608945 s, model intervals 260.683242041 s, remainder 17.623366904 s, gates .285471621 s, zero untimed gates.
+Expected 00511 values: sampler 366.975348317 s, model intervals 345.492942404 s, remainder 21.482405913 s, ordinary gate total approximately 42.794904 s, 11 untimed gates. For 00504: sampler 278.306608945 s, model intervals 260.683242041 s, remainder 17.623366904 s, gates .285471621 s, zero untimed gates.
 
 The supplied Sol-Attn paper (2607.24027v1) describes online thresholding and approximate contributions from unselected blocks; it supports keeping sparse operator semantics distinct from a dense all-selected oracle. Sol Engine (2606.23743v2) describes instance-specific optimization. Neither defines this code's validation key/lifetime or proves a caching speedup. DMD2 (2405.14867v2), VSA (2505.13389v5) and Spectrum (2603.01623v1) provide background, not provenance or timing for these runs. Their training/forecast mechanisms are not replacement fixes for this regression.
