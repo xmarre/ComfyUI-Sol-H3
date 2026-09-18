@@ -89,6 +89,7 @@ def load_kernel(device):
     kernel.supports_attribution = True
     kernel.supports_cuda_diagnostics = True
     kernel.compiler_namespace = compiler_namespace
+    kernel.compiler_namespace_provider = lambda: install_hooks(interface)
     return kernel
 
 
