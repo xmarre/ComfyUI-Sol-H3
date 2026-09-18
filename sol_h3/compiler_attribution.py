@@ -53,6 +53,7 @@ def _proxy(value):
 
 class _AttributedCache(dict):
     def __init__(self, source=()):
+        self.destructive_generation = 0
         super().__init__((key, _proxy(value)) for key, value in dict(source).items())
 
     def get(self, key, default=None):
@@ -72,7 +73,34 @@ class _AttributedCache(dict):
         return value
 
     def __setitem__(self, key, value):
+        if key in self:
+            self.destructive_generation += 1
         super().__setitem__(key, _proxy(value))
+
+    def __delitem__(self, key):
+        if key in self:
+            self.destructive_generation += 1
+        super().__delitem__(key)
+
+    def clear(self):
+        if self:
+            self.destructive_generation += 1
+        super().clear()
+
+    def pop(self, key, *args):
+        if key in self:
+            self.destructive_generation += 1
+        return super().pop(key, *args)
+
+    def popitem(self):
+        if self:
+            self.destructive_generation += 1
+        return super().popitem()
+
+    def update(self, *args, **kwargs):
+        values = dict(*args, **kwargs)
+        for key, value in values.items():
+            self[key] = value
 
 
 class _TimedLock:
@@ -183,7 +211,14 @@ def install_hooks(interface):
 
 def compiler_namespace(interface):
     original = getattr(interface, "_sol_h3_original_compile_sm120", interface._compile_sm120)
-    return (HOOK_ABI, id(interface._compiled), id(original), id(interface._compile_lock))
+    cache_generation = int(getattr(interface._compiled, "destructive_generation", 0))
+    return (
+        HOOK_ABI,
+        id(interface._compiled),
+        cache_generation,
+        id(original),
+        id(interface._compile_lock),
+    )
 
 
 __all__ = ["HOOK_ABI", "attribution_scope", "compiler_namespace", "install_hooks"]
