@@ -12,9 +12,9 @@ production-development PRs:
 
 | Component | Preserved PR head | Implementation stack |
 | --- | --- | --- |
-| Flow | #49 `85b953c2cdf8304dbb7da283a9131a3722ff5386` | #51 / `mirror/arithmetic-validation-flow-20260918`; performance-contract checkpoint `fcdd7b300c2f08d3020d64d72caf0bc961776499` |
-| Sol-H3 | #15 `93b3e03f2b7b579aaf55fa0f87f55083b259e25c` | #18 / `mirror/arithmetic-validation-runtime-20260918`; replay/CUDA checkpoint `8b1343241c910f07c90b22c9f1bf1a2512169033` |
-| VDN-H3-Plus | #19 `1bc9f9cd0f685a28f84664b50951df8241501249` | #22 / `mirror/arithmetic-validation-vdn-20260918`; component-attribution checkpoint `7547f0959754a32deb0feadd11f400dbb3b315e0` |
+| Flow | #49 `85b953c2cdf8304dbb7da283a9131a3722ff5386` | #51 / `mirror/arithmetic-validation-flow-20260918`; final contract checkpoint `69d27d813c85dc13437ff8721d0bc6dbec47fe97` |
+| Sol-H3 | #15 `93b3e03f2b7b579aaf55fa0f87f55083b259e25c` | #18 / `mirror/arithmetic-validation-runtime-20260918`; final code checkpoint `b46aa1d5150782dc1f6d93c82b73459ef250a029` |
+| VDN-H3-Plus | #19 `1bc9f9cd0f685a28f84664b50951df8241501249` | #22 / `mirror/arithmetic-validation-vdn-20260918`; final component-attribution checkpoint `7547f0959754a32deb0feadd11f400dbb3b315e0` |
 
 Continuum Plus #23/#24 and VDN-H3-Plus #8 are outside this patch scope and are
 not modified by these implementation stacks.
@@ -101,20 +101,29 @@ established source contract. CPU-contract run `35302113686` captured those
 failures.
 
 The selected implementation therefore leaves the reviewed Sana Sol-Attn source
-bytes, public API, manifest, and existing executable dictionary unchanged.
-`sol_h3/compiler_attribution.py` installs transparent wrappers around the
-existing compile dictionary, compile lock, `_compile_sm120`, preprocessing
-entrypoint, and compiled callable. A `ContextVar` scopes receipts to the active
-Sol call. This records host-side cache hit/miss/race, compile-lock wait,
-compile-body time, preprocessing/JIT-inclusive wall time, and compiled dispatch
-enqueue wall time without introducing a second executable cache.
+bytes, public API, manifest, compile keys and executable-cache policy unchanged.
+`sol_h3/compiler_attribution.py` transparently wraps the existing compile
+dictionary, compile lock, `_compile_sm120`, preprocessing entrypoint and compiled
+callables while preserving existing entries; it does not introduce a competing
+executable cache. A `ContextVar` scopes receipts to the active Sol call. This
+records host-side cache hit/miss/race, compile-lock wait, compile-body time,
+preprocessing/JIT-inclusive wall time and compiled dispatch enqueue wall time.
+The wrapper also generation-tags destructive executable replacement/eviction so
+request-local arithmetic acceptance cannot survive a changed compiled runtime.
 
 The compiler-attribution implementation first passed the full Sol CPU-contract
 matrix at checkpoint `51f590b476b344e25138bd99376ee3c8912ac785`.
-The later replay/CUDA stack at
-`8b1343241c910f07c90b22c9f1bf1a2512169033` also passed the complete
-CPU-contract workflow in run `35345097286`, including native interop and
-Windows provenance. The reviewed vendored Sana Sol-Attn source remains unchanged.
+The final Sol code checkpoint
+`b46aa1d5150782dc1f6d93c82b73459ef250a029` passed the complete
+CPU-contract workflow in run `35347207776`, including the full test suite,
+native interop and Windows provenance. VDN checkpoint
+`7547f0959754a32deb0feadd11f400dbb3b315e0` passed CI run
+`35345618924`. Flow checkpoint
+`69d27d813c85dc13437ff8721d0bc6dbec47fe97`, pinned to those exact Sol/VDN
+contracts, passed CI run `35347426118`, including the cross-repository source
+contracts and Python 3.10-3.13 matrix. These are structural results, not SM120
+performance or decoded-media evidence. The reviewed vendored Sana Sol-Attn
+source remains unchanged.
 
 ## CUDA diagnostics
 
