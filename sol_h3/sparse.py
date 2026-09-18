@@ -236,7 +236,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         state.kernel_device = q.device
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
-    state.runtime_lease.bind_kernel(state.kernel, q.device)
+    compiler_namespace = state.runtime_lease.bind_kernel(state.kernel, q.device)
 
     qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
@@ -266,6 +266,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         mode=mode,
         layout="bhtd",
         scale=q.shape[-1] ** -0.5,
+        compiler_namespace=compiler_namespace,
         mapped_abi=MAPPED_ABI_VERSION if mapped_enabled else None,
         bias_range=bias_range,
         bias_log_measure=bias_log_measure,
@@ -277,19 +278,22 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
         gate_telemetry = {}
-        got = _kernel_call(
-            state.kernel, qb, kb, vb, telemetry=gate_telemetry,
-            tau=config.tau, thresh_type="diag", kv_splits=1,
-            sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
-            mapped_neighbor_intervals=mapped_neighbor_intervals,
-        )
-        want = _dense_reference(q, k, v, None, key_bias=key_bias)
-        metrics = error_metrics(got, want)
-        gate_wall_s = time.perf_counter() - gate_started
-        _accumulate_attribution(state, "arithmetic_gate", gate_telemetry, gate_wall_s)
-        if not arithmetic_gate_passes(metrics):
+        try:
+            got = _kernel_call(
+                state.kernel, qb, kb, vb, telemetry=gate_telemetry,
+                tau=config.tau, thresh_type="diag", kv_splits=1,
+                sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
+                mapped_neighbor_intervals=mapped_neighbor_intervals,
+            )
+            want = _dense_reference(q, k, v, None, key_bias=key_bias)
+            metrics = error_metrics(got, want)
+            gate_wall_s = time.perf_counter() - gate_started
+            _accumulate_attribution(state, "arithmetic_gate", gate_telemetry, gate_wall_s)
+            if not arithmetic_gate_passes(metrics):
+                raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
+        except BaseException:
             state.validation_state.publish_failure(ticket)
-            raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
+            raise
         state.validation_state.publish_success(ticket, metrics)
         state.validation_state.record_gate(
             ticket, mode=mode, gate_wall_s=gate_wall_s,
@@ -297,20 +301,20 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         )
         if len(state.gates) < 32:
             state.gates.append({
-            "shape": list(q.shape),
-            "kv_shape": list(k.shape),
-            "backend": getattr(state.kernel, "backend_name", "test_substitute"),
-            "mapped_neighbor_abi": mapped_enabled,
-            "mapped_abi_version": MAPPED_ABI_VERSION,
-            "kernel_loader_s": kernel_loader_s,
-            "gate_wall_s": gate_wall_s,
-            "materialized_qkv_bytes": 0,
-            "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
-            "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
-            "attribution": dict(gate_telemetry),
-            "arithmetic_key_digest": ticket.digest or None,
-            **metrics,
-        })
+                "shape": list(q.shape),
+                "kv_shape": list(k.shape),
+                "backend": getattr(state.kernel, "backend_name", "test_substitute"),
+                "mapped_neighbor_abi": mapped_enabled,
+                "mapped_abi_version": MAPPED_ABI_VERSION,
+                "kernel_loader_s": kernel_loader_s,
+                "gate_wall_s": gate_wall_s,
+                "materialized_qkv_bytes": 0,
+                "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
+                "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
+                "attribution": dict(gate_telemetry),
+                "arithmetic_key_digest": ticket.digest or None,
+                **metrics,
+            })
         del got, want
 
     if exact_k_blocks is None:
