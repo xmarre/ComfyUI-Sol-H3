@@ -74,11 +74,13 @@ def _device_identity(device):
         }
     index = torch.cuda.current_device() if device.index is None else int(device.index)
     properties = torch.cuda.get_device_properties(index)
+    device_uuid = getattr(properties, "uuid", None)
     return {
         "type": "cuda",
         "index": index,
         "current_device": int(torch.cuda.current_device()),
         "name": str(properties.name),
+        "uuid": None if device_uuid is None else str(device_uuid),
         "total_memory": int(properties.total_memory),
         "multi_processor_count": int(properties.multi_processor_count),
         "sm": list(torch.cuda.get_device_capability(index)),
