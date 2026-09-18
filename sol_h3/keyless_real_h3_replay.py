@@ -20,6 +20,49 @@ class ArithmeticLimit:
 
 
 @dataclass(frozen=True)
+class ScaleAwareArithmeticLimit:
+    rel_l2: float
+    max_abs_over_want_abs_max: float
+    mean_abs_over_want_mean_abs: float
+    worst_bf16_ulps: float
+
+
+@dataclass(frozen=True)
+class ReplayEnvelopeV2:
+    """Frozen from the threshold-free v2 calibration before holdout replay.
+
+    Aggregate limits are exactly 2x the observed 36-case calibration maxima.
+    The local arithmetic invariant is intentionally stricter: every calibration
+    case was at most one BF16 ULP at its worst element, so the holdout gate keeps
+    that exact one-ULP bound rather than multiplying it.
+    """
+
+    contract: str = "sol-h3-keyless-real-h3-replay-envelope-v2"
+    calibration_contract: str = "sol-h3-keyless-v2-calibration-v1"
+    calibration_sha256: str = (
+        "6cb5996e98613563947804d22c9a59cf11e8df58f1da4e566f3141709218531d"
+    )
+    calibration_case_count: int = 36
+    aggregate_margin_multiplier: float = 2.0
+    k1_route_centroid: ScaleAwareArithmeticLimit = ScaleAwareArithmeticLimit(
+        rel_l2=0.0002579810388851911,
+        max_abs_over_want_abs_max=0.007518796992481203,
+        mean_abs_over_want_mean_abs=6.181015165732724e-06,
+        worst_bf16_ulps=1.0,
+    )
+    k2_output: ScaleAwareArithmeticLimit = ScaleAwareArithmeticLimit(
+        rel_l2=0.002869961317628622,
+        max_abs_over_want_abs_max=0.012121212121212121,
+        mean_abs_over_want_mean_abs=0.0009517048283547036,
+        worst_bf16_ulps=1.0,
+    )
+    k1_value_max_abs: float = 0.0
+
+
+V2_ENVELOPE = ReplayEnvelopeV2()
+
+
+@dataclass(frozen=True)
 class ReplayEnvelopeV1:
     """Frozen before any real-H3 replay result is observed."""
 
@@ -247,6 +290,35 @@ def metric_within_limit(metrics: dict[str, float | bool], limit: ArithmeticLimit
     )
 
 
+def scale_aware_metric_within_limit(
+    metrics: dict[str, float | bool],
+    scale: dict[str, object],
+    limit: ScaleAwareArithmeticLimit,
+) -> bool:
+    if not bool(metrics.get("finite")) or not bool(scale.get("finite")):
+        return False
+    max_ratio = scale.get("max_abs_over_want_abs_max")
+    mean_ratio = scale.get("mean_abs_over_want_mean_abs")
+    worst = scale.get("worst")
+    if (
+        max_ratio is None
+        or mean_ratio is None
+        or not isinstance(worst, dict)
+        or worst.get("abs_error_in_want_bf16_ulps") is None
+    ):
+        return False
+    return (
+        float(metrics["rel_l2"]) <= limit.rel_l2
+        and float(max_ratio) <= limit.max_abs_over_want_abs_max
+        and float(mean_ratio) <= limit.mean_abs_over_want_mean_abs
+        and float(worst["abs_error_in_want_bf16_ulps"]) <= limit.worst_bf16_ulps
+    )
+
+
+def v2_envelope_dict() -> dict[str, object]:
+    return asdict(V2_ENVELOPE)
+
+
 def value_sum_within_limit(metrics: dict[str, float | bool], max_abs: float) -> bool:
     return bool(metrics.get("finite")) and float(metrics["max_abs"]) <= float(max_abs)
 
@@ -346,8 +418,11 @@ def split_projection(
 
 __all__ = [
     "ArithmeticLimit",
+    "ScaleAwareArithmeticLimit",
     "ENVELOPE",
+    "V2_ENVELOPE",
     "ReplayEnvelopeV1",
+    "ReplayEnvelopeV2",
     "block_summary_oracle",
     "checkpoint_tensor_names",
     "envelope_dict",
@@ -357,6 +432,8 @@ __all__ = [
     "apply_split_half_rope_fp32_from_normalized",
     "replay_requires_process_failure",
     "metric_within_limit",
+    "scale_aware_metric_within_limit",
+    "v2_envelope_dict",
     "split_projection",
     "tensor_metrics",
     "tensor_scale_diagnostics",
