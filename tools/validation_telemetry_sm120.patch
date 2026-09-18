@@ -1,21 +1,23 @@
 diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/interface.py
 --- a/sol_h3/_vendor/sol_attn/interface.py
 +++ b/sol_h3/_vendor/sol_attn/interface.py
-@@ -5,5 +5,6 @@ from __future__ import annotations
+@@ -6,6 +6,7 @@
  import functools
  import math
  import threading
 +import time
  
  import torch
-@@ -243,5 +244,6 @@ def _sol_attn_cute(
+ 
+@@ -244,6 +245,7 @@
      valid_tokens=None,
      key_bias=None,
      mapped_neighbor_intervals=None,
 +    telemetry=None,
  ):
      from .preprocess import prepare
-@@ -252,6 +254,7 @@ def _sol_attn_cute(
+ 
+@@ -253,6 +255,7 @@
      valid_blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
  
      with torch.cuda.device(q.device):
@@ -23,20 +25,25 @@ diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/inte
          kc, vc, threshold = prepare(
              q,
              k,
-@@ -263,4 +266,6 @@ def _sol_attn_cute(
+@@ -263,6 +266,8 @@
              valid_tokens=tokens,
              valid_kv_tokens=kv_tokens,
          )
 +        if telemetry is not None:
 +            telemetry["prepare_jit_host_wall_s"] = telemetry.get("prepare_jit_host_wall_s", 0.0) + (time.perf_counter() - prepare_started)
          output = torch.empty_like(q)
-@@ -281,3 +286,5 @@ def _sol_attn_cute(
+         lse = torch.empty(
+             (batch, capacity_tokens, heads),
+@@ -281,6 +286,8 @@
              q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,
              layout_key, key_bias is not None, mapped_profile,
          )
 +        if telemetry is not None:
 +            telemetry["compiler_key"] = repr(key)
-@@ -378,10 +385,16 @@ def _sol_attn_cute(
+ 
+         if arch == (9, 0):
+             if sink_tokens:
+@@ -376,12 +383,18 @@
                  key_bias_arg, mapped_arg, lse,
              ]
              compiled = _compiled.get(key)
@@ -53,7 +60,9 @@ diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/inte
                      if compiled is None:
 +                        compile_started = time.perf_counter()
                          compiled, args = _compile_sm120(
-@@ -389,8 +400,16 @@ def _sol_attn_cute(
+                             key,
+                             tensors,
+@@ -392,10 +405,18 @@
                              key_bias is not None,
                              mapped_neighbor_intervals is not None,
                          )
@@ -70,21 +79,30 @@ diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/inte
 +                    telemetry["compile_hit"] = True
 +            dispatch_started = time.perf_counter()
              compiled(
-@@ -400,3 +420,5 @@ def _sol_attn_cute(
+                 *args,
+                 scale,
+@@ -403,6 +424,8 @@
                  sink_end_block,
                  stream=stream,
              )
 +            if telemetry is not None:
 +                telemetry["dispatch_host_enqueue_s"] = telemetry.get("dispatch_host_enqueue_s", 0.0) + (time.perf_counter() - dispatch_started)
-@@ -484,4 +506,5 @@ def sol_attn(
+     return output[:, :tokens]
+ 
+ 
+@@ -473,6 +496,7 @@
      compile_bucket_size: int | None = None,
      key_bias: torch.Tensor | None = None,
      mapped_neighbor_intervals: torch.Tensor | None = None,
 +    telemetry: dict | None = None,
  ) -> torch.Tensor:
-@@ -568,4 +591,5 @@ def sol_attn(
+     """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
+ 
+@@ -564,6 +588,7 @@
          valid_tokens=valid_tokens,
          key_bias=key_bias,
          mapped_neighbor_intervals=mapped_neighbor_intervals,
 +        telemetry=telemetry,
      )
+ 
+ 
