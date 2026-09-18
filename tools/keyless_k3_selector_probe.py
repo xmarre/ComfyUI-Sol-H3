@@ -248,6 +248,7 @@ def _run_block(
         candidate_threshold = threshold_from_route_centroids(
             qb,
             candidate_rc,
+            kv_rows=v_rows,
             tau=tau,
             scale=SCALE,
         )
