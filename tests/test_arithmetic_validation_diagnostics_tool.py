@@ -6,6 +6,7 @@ from tools.check_arithmetic_validation_diagnostics import (
     DiagnosticEvidenceError,
     extract_sol_summaries,
     validate_cuda_attribution,
+    validate_cuda_attribution_across_summaries,
 )
 
 
@@ -213,4 +214,119 @@ def test_replay_rejects_missing_cuda_component():
         validate_cuda_attribution(
             summary,
             required_replay_targets=("partitioned_suffix",),
+        )
+
+
+
+def _set_replay_context(summary, *, flow_request_id, flow_stage):
+    report = summary["replay_diagnostics"]["reports"][0]
+    report["context"].update(
+        flow_request_id=flow_request_id,
+        flow_stage=flow_stage,
+    )
+    return summary
+
+
+def test_multi_request_replay_selects_continuation_high_by_flow_request():
+    first_low = _set_replay_context(
+        _add_replay(_summary(), "ordinary_low"),
+        flow_request_id="flow-first",
+        flow_stage="low",
+    )
+    first_high = _set_replay_context(
+        _add_replay(_summary(), "ordinary_continuation_high"),
+        flow_request_id="flow-first",
+        flow_stage="high",
+    )
+    continuation_low = _set_replay_context(
+        _add_replay(_summary(), "partitioned_suffix"),
+        flow_request_id="flow-continuation",
+        flow_stage="low",
+    )
+    continuation_high = _set_replay_context(
+        _add_replay(_summary(), "ordinary_continuation_high"),
+        flow_request_id="flow-continuation",
+        flow_stage="high",
+    )
+
+    report = validate_cuda_attribution_across_summaries(
+        [first_low, first_high, continuation_low, continuation_high],
+        required_replay_targets=(
+            "ordinary_low",
+            "ordinary_continuation_high",
+            "partitioned_suffix",
+        ),
+    )
+
+    assert report["selected_summary_indices"] == [0, 2, 3]
+    assert set(report["replay_reports"]) == {
+        "ordinary_low",
+        "ordinary_continuation_high",
+        "partitioned_suffix",
+    }
+    assert len(report["request_reports"]) == 3
+
+
+def test_multi_request_replay_requires_suffix_flow_correlation_for_continuation_high():
+    suffix = _add_replay(_summary(), "partitioned_suffix")
+    continuation_high = _set_replay_context(
+        _add_replay(_summary(), "ordinary_continuation_high"),
+        flow_request_id="flow-continuation",
+        flow_stage="high",
+    )
+
+    with pytest.raises(
+        DiagnosticEvidenceError,
+        match="omitted its Flow request correlation ID",
+    ):
+        validate_cuda_attribution_across_summaries(
+            [suffix, continuation_high],
+            required_replay_targets=(
+                "ordinary_continuation_high",
+                "partitioned_suffix",
+            ),
+        )
+
+
+def test_multi_request_replay_rejects_ambiguous_partitioned_suffix():
+    suffix_a = _set_replay_context(
+        _add_replay(_summary(), "partitioned_suffix"),
+        flow_request_id="flow-a",
+        flow_stage="low",
+    )
+    suffix_b = _set_replay_context(
+        _add_replay(_summary(), "partitioned_suffix"),
+        flow_request_id="flow-b",
+        flow_stage="low",
+    )
+
+    with pytest.raises(
+        DiagnosticEvidenceError,
+        match="partitioned_suffix replay target is ambiguous",
+    ):
+        validate_cuda_attribution_across_summaries(
+            [suffix_a, suffix_b],
+            required_replay_targets=("partitioned_suffix",),
+        )
+
+
+def test_multi_request_replay_propagates_cold_miss_requirement():
+    first_low = _set_replay_context(
+        _add_replay(
+            _summary(compile_misses=0),
+            "ordinary_low",
+            first_compile_misses=0,
+        ),
+        flow_request_id="flow-first",
+        flow_stage="low",
+    )
+
+    with pytest.raises(
+        DiagnosticEvidenceError,
+        match="first executable compilation",
+    ):
+        validate_cuda_attribution_across_summaries(
+            [first_low],
+            required_replay_targets=("ordinary_low",),
+            require_replay_cold_miss=True,
         )
