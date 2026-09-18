@@ -140,8 +140,149 @@ if triton is not None:
         tl.store(rc_ptr + rc_offsets, rc.to(tl.bfloat16))
         tl.store(vc_ptr + vc_offsets, vc.to(tl.bfloat16))
 
+
+    @triton.jit
+    def _materialize_native_route_kernel(
+        v_ptr,
+        weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        out_ptr,
+        rows,
+        stride_vt: tl.constexpr,
+        stride_vh: tl.constexpr,
+        stride_vd: tl.constexpr,
+        stride_ct: tl.constexpr,
+        stride_cd: tl.constexpr,
+        stride_st: tl.constexpr,
+        stride_sd: tl.constexpr,
+        stride_ot: tl.constexpr,
+        stride_oh: tl.constexpr,
+        stride_od: tl.constexpr,
+        eps: tl.constexpr,
+        block_size: tl.constexpr,
+        head_dim: tl.constexpr,
+        rope_half: tl.constexpr,
+        rope_rot: tl.constexpr,
+        round_rope_products: tl.constexpr,
+        rope_compute_fp32: tl.constexpr,
+    ):
+        """Diagnostic-only materialization of selectable RoPE rounding semantics."""
+        block = tl.program_id(0)
+        head = tl.program_id(1)
+        row_offsets = block * block_size + tl.arange(0, block_size)
+        d_offsets = tl.arange(0, head_dim)
+        valid_rows = row_offsets < rows
+
+        v_offsets = (
+            row_offsets[:, None] * stride_vt
+            + head * stride_vh
+            + d_offsets[None, :] * stride_vd
+        )
+        raw = tl.load(
+            v_ptr + v_offsets,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+
+        mean_square = tl.sum(raw * raw, axis=1) / head_dim
+        inv_rms = tl.rsqrt(mean_square + eps)
+        weight = tl.load(weight_ptr + d_offsets).to(tl.float32)
+        norm = (raw * inv_rms[:, None] * weight[None, :]).to(tl.bfloat16)
+
+        rotating = d_offsets < rope_rot
+        first_half = d_offsets < rope_half
+        partner_d = tl.where(
+            first_half,
+            d_offsets + rope_half,
+            d_offsets - rope_half,
+        )
+        partner_offsets = (
+            row_offsets[:, None] * stride_vt
+            + head * stride_vh
+            + partner_d[None, :] * stride_vd
+        )
+        partner_raw = tl.load(
+            v_ptr + partner_offsets,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        partner_weight = tl.load(
+            weight_ptr + partner_d,
+            mask=rotating,
+            other=0.0,
+        ).to(tl.float32)
+        partner_norm = (
+            partner_raw * inv_rms[:, None] * partner_weight[None, :]
+        ).to(tl.bfloat16)
+
+        pair_d = tl.where(
+            first_half,
+            d_offsets,
+            d_offsets - rope_half,
+        )
+        cos_loaded = tl.load(
+            cos_ptr
+            + row_offsets[:, None] * stride_ct
+            + pair_d[None, :] * stride_cd,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=1.0,
+        )
+        sin_loaded = tl.load(
+            sin_ptr
+            + row_offsets[:, None] * stride_st
+            + pair_d[None, :] * stride_sd,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=0.0,
+        )
+        if rope_compute_fp32:
+            # comfy-kitchen CUDA fused RMS+RoPE uses ComputeType=float when
+            # HasRms=true: normalized BF16 values and frequency values are
+            # converted to FP32 before the 2x2 rotation, then output is cast
+            # back to BF16.
+            norm_math = norm.to(tl.float32)
+            partner_math = partner_norm.to(tl.float32)
+            cos_values = cos_loaded.to(tl.float32)
+            sin_values = sin_loaded.to(tl.float32)
+        else:
+            norm_math = norm
+            partner_math = partner_norm
+            cos_values = cos_loaded.to(tl.bfloat16)
+            sin_values = sin_loaded.to(tl.bfloat16)
+
+        norm_cos = norm_math * cos_values
+        partner_sin = partner_math * sin_values
+        norm_sin = norm_math * sin_values
+        partner_cos = partner_math * cos_values
+        if round_rope_products:
+            # PyTorch's public Keyless expression materializes each BF16 multiply
+            # before the following add/subtract because they are distinct tensor ops.
+            norm_cos = norm_cos.to(tl.bfloat16)
+            partner_sin = partner_sin.to(tl.bfloat16)
+            norm_sin = norm_sin.to(tl.bfloat16)
+            partner_cos = partner_cos.to(tl.bfloat16)
+        first = norm_cos - partner_sin
+        second = partner_sin + norm_cos
+        route = tl.where(
+            first_half[None, :],
+            first,
+            tl.where(rotating[None, :], second, norm),
+        ).to(tl.bfloat16)
+
+        out_offsets = (
+            row_offsets[:, None] * stride_ot
+            + head * stride_oh
+            + d_offsets[None, :] * stride_od
+        )
+        tl.store(
+            out_ptr + out_offsets,
+            route,
+            mask=valid_rows[:, None],
+        )
+
 else:
     _reduce_route_vc_kernel = None
+    _materialize_native_route_kernel = None
 
 
 def _validate_common(
@@ -239,6 +380,189 @@ def route_summary_reference(
     return rc, vc
 
 
+def materialized_native_route_diagnostic(
+    v: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    rope_freqs: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize route(V) with the exact experimental K1/K2 Triton arithmetic.
+
+    This exists only to decompose real-H3 replay failures. Production native Keyless
+    execution must never call it because it intentionally allocates [T,H,128].
+    """
+    _validate_common(v, norm_weight, eps, rope_freqs)
+    if _materialize_native_route_kernel is None:
+        raise RuntimeError("native-route diagnostic requires Triton")
+    if v.dtype != torch.bfloat16 or norm_weight.dtype != torch.bfloat16:
+        raise TypeError("native-route diagnostic requires BF16 V and norm weight")
+    if v.device.type != "cuda":
+        raise RuntimeError("native-route diagnostic requires CUDA")
+    if torch.cuda.get_device_capability(v.device) != (12, 0):
+        raise RuntimeError("native-route diagnostic currently targets SM120 only")
+    if norm_weight.device != v.device or rope_freqs.device != v.device:
+        raise ValueError("native-route diagnostic tensors must share one CUDA device")
+    if float(eps) != NORM_EPS:
+        raise ValueError(f"native-route diagnostic currently requires eps={NORM_EPS}")
+
+    rows, heads, _ = v.shape
+    out = torch.empty_like(v)
+    cos = rope_freqs[0, :, 0, :, 0, 0]
+    sin = rope_freqs[0, :, 0, :, 1, 0]
+    blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    _materialize_native_route_kernel[(blocks, heads)](
+        v,
+        norm_weight,
+        cos,
+        sin,
+        out,
+        rows,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        cos.stride(0),
+        cos.stride(1),
+        sin.stride(0),
+        sin.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        eps=float(eps),
+        block_size=BLOCK_SIZE,
+        head_dim=HEAD_DIM,
+        rope_half=ROPE_HALF_DIM,
+        rope_rot=ROPE_ROT_DIM,
+        round_rope_products=False,
+        rope_compute_fp32=False,
+        num_warps=8,
+        num_stages=2,
+    )
+    return out
+
+
+def materialized_public_rounding_route_diagnostic(
+    v: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    rope_freqs: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the route with explicit BF16 RoPE-product rounding.
+
+    This diagnostic tests the hypothesis that public Keyless differs from the current
+    fused Triton route only because PyTorch materializes each BF16 multiply before
+    the subsequent add/subtract. It is never a production path.
+    """
+    _validate_common(v, norm_weight, eps, rope_freqs)
+    if _materialize_native_route_kernel is None:
+        raise RuntimeError("public-rounding route diagnostic requires Triton")
+    if v.dtype != torch.bfloat16 or norm_weight.dtype != torch.bfloat16:
+        raise TypeError("public-rounding route diagnostic requires BF16 V and norm weight")
+    if v.device.type != "cuda":
+        raise RuntimeError("public-rounding route diagnostic requires CUDA")
+    if torch.cuda.get_device_capability(v.device) != (12, 0):
+        raise RuntimeError("public-rounding route diagnostic currently targets SM120 only")
+    if norm_weight.device != v.device or rope_freqs.device != v.device:
+        raise ValueError("public-rounding route diagnostic tensors must share one CUDA device")
+    if float(eps) != NORM_EPS:
+        raise ValueError(f"public-rounding route diagnostic currently requires eps={NORM_EPS}")
+
+    rows, heads, _ = v.shape
+    out = torch.empty_like(v)
+    cos = rope_freqs[0, :, 0, :, 0, 0]
+    sin = rope_freqs[0, :, 0, :, 1, 0]
+    blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    _materialize_native_route_kernel[(blocks, heads)](
+        v,
+        norm_weight,
+        cos,
+        sin,
+        out,
+        rows,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        cos.stride(0),
+        cos.stride(1),
+        sin.stride(0),
+        sin.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        eps=float(eps),
+        block_size=BLOCK_SIZE,
+        head_dim=HEAD_DIM,
+        rope_half=ROPE_HALF_DIM,
+        rope_rot=ROPE_ROT_DIM,
+        round_rope_products=True,
+        rope_compute_fp32=False,
+        num_warps=8,
+        num_stages=2,
+    )
+    return out
+
+
+def materialized_fp32_rope_route_diagnostic(
+    v: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    rope_freqs: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize route(V) with native RMSNorm and comfy-kitchen-style FP32 RoPE math.
+
+    Diagnostic only. The route normalization remains the experimental Triton
+    reduction, but normalized BF16 values and frequency values are promoted to
+    FP32 for the 2x2 rotation exactly as comfy-kitchen CUDA does for fused
+    RMS+RoPE before casting the route back to BF16.
+    """
+    _validate_common(v, norm_weight, eps, rope_freqs)
+    if _materialize_native_route_kernel is None:
+        raise RuntimeError("FP32-RoPE route diagnostic requires Triton")
+    if v.dtype != torch.bfloat16 or norm_weight.dtype != torch.bfloat16:
+        raise TypeError("FP32-RoPE route diagnostic requires BF16 V and norm weight")
+    if v.device.type != "cuda":
+        raise RuntimeError("FP32-RoPE route diagnostic requires CUDA")
+    if torch.cuda.get_device_capability(v.device) != (12, 0):
+        raise RuntimeError("FP32-RoPE route diagnostic currently targets SM120 only")
+    if norm_weight.device != v.device or rope_freqs.device != v.device:
+        raise ValueError("FP32-RoPE route diagnostic tensors must share one CUDA device")
+    if float(eps) != NORM_EPS:
+        raise ValueError(f"FP32-RoPE route diagnostic currently requires eps={NORM_EPS}")
+
+    rows, heads, _ = v.shape
+    out = torch.empty_like(v)
+    cos = rope_freqs[0, :, 0, :, 0, 0]
+    sin = rope_freqs[0, :, 0, :, 1, 0]
+    blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    _materialize_native_route_kernel[(blocks, heads)](
+        v,
+        norm_weight,
+        cos,
+        sin,
+        out,
+        rows,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        cos.stride(0),
+        cos.stride(1),
+        sin.stride(0),
+        sin.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        eps=float(eps),
+        block_size=BLOCK_SIZE,
+        head_dim=HEAD_DIM,
+        rope_half=ROPE_HALF_DIM,
+        rope_rot=ROPE_ROT_DIM,
+        round_rope_products=False,
+        rope_compute_fp32=True,
+        num_warps=8,
+        num_stages=2,
+    )
+    return out
+
+
 def route_summary(
     v: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -310,6 +634,9 @@ __all__ = [
     "ROPE_HALF_DIM",
     "ROPE_ROT_DIM",
     "materialized_route_reference",
+    "materialized_native_route_diagnostic",
+    "materialized_public_rounding_route_diagnostic",
+    "materialized_fp32_rope_route_diagnostic",
     "route_summary",
     "route_summary_reference",
 ]

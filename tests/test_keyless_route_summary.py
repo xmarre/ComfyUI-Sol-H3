@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import math
 
 import pytest
@@ -108,3 +110,58 @@ def test_native_route_summary_rejects_noncanonical_epsilon_before_launch(monkeyp
         summary.route_summary_reference(v, weight, math.nan, rope)
     assert summary.NORM_EPS == 1e-5
     assert summary.CONTRACT == "sol-h3-keyless-route-summary-v1"
+
+
+def test_materialized_native_route_diagnostic_fails_closed_without_cuda():
+    v = torch.ones(3, 2, summary.HEAD_DIM, dtype=torch.bfloat16)
+    weight = torch.ones(summary.HEAD_DIM, dtype=torch.bfloat16)
+    rope = _rope(v.shape[0])
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        summary.materialized_native_route_diagnostic(
+            v,
+            weight,
+            summary.NORM_EPS,
+            rope,
+        )
+
+
+def test_materialized_public_rounding_route_diagnostic_fails_closed_without_cuda():
+    v = torch.ones(3, 2, summary.HEAD_DIM, dtype=torch.bfloat16)
+    weight = torch.ones(summary.HEAD_DIM, dtype=torch.bfloat16)
+    rope = _rope(v.shape[0])
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        summary.materialized_public_rounding_route_diagnostic(
+            v,
+            weight,
+            summary.NORM_EPS,
+            rope,
+        )
+
+
+def test_diagnostic_split_half_second_half_formula():
+    source = Path(summary.__file__).read_text(encoding="utf-8")
+    assert "first = norm_cos - partner_sin" in source
+    assert "second = partner_sin + norm_cos" in source
+    assert "second = norm_sin + partner_cos" not in source
+
+
+def test_materialized_fp32_rope_route_diagnostic_fails_closed_without_cuda():
+    v = torch.ones(3, 2, summary.HEAD_DIM, dtype=torch.bfloat16)
+    weight = torch.ones(summary.HEAD_DIM, dtype=torch.bfloat16)
+    rope = _rope(v.shape[0])
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        summary.materialized_fp32_rope_route_diagnostic(
+            v,
+            weight,
+            summary.NORM_EPS,
+            rope,
+        )
+
+
+def test_fp32_rope_diagnostic_keeps_comfy_fused_compute_semantics_in_source():
+    source = Path(summary.__file__).read_text(encoding="utf-8")
+    assert "rope_compute_fp32: tl.constexpr" in source
+    assert "norm_math = norm.to(tl.float32)" in source
+    assert "partner_math = partner_norm.to(tl.float32)" in source
+    assert "cos_values = cos_loaded.to(tl.float32)" in source
+    assert "sin_values = sin_loaded.to(tl.float32)" in source
