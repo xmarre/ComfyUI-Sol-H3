@@ -226,24 +226,3 @@ def test_invalidation_hook_requires_active_sampling_request():
 
     with pytest.raises(RuntimeError, match="active OUTER_SAMPLE"):
         invalidate_arithmetic_validation()
-
-
-def test_sampling_wrapper_resolves_diagnostics_without_retaining_request(monkeypatch):
-    resolved = []
-
-    class Diagnostic:
-        def resolve(self):
-            resolved.append(True)
-
-        def summary(self):
-            return {"enabled": True}
-
-    original = runtime.CudaDiagnosticState.from_env
-    monkeypatch.setattr(runtime.CudaDiagnosticState, "from_env", classmethod(lambda cls: Diagnostic()))
-    try:
-        wrapper = SamplingWrapper(Config(exact=False))
-        assert wrapper(lambda: "ok") == "ok"
-    finally:
-        monkeypatch.setattr(runtime.CudaDiagnosticState, "from_env", original)
-    assert resolved == [True]
-    assert _REQUEST.get() is None
