@@ -1,4 +1,7 @@
 from .contracts import Config
+from .keyless_real_h3_replay_node import SolH3KeylessRealH3Replay
+
+
 
 
 class SolH3Exact:
@@ -35,6 +38,13 @@ class SolH3Experimental:
         return (install(model, Config(exact_fusion, "sol", tau, dense_evaluations, dense_layers)),)
 
 
-NODE_CLASS_MAPPINGS = {"SolH3Exact": SolH3Exact, "SolH3Experimental": SolH3Experimental}
-NODE_DISPLAY_NAME_MAPPINGS = {"SolH3Exact": "Sol-H3 Exact Runtime",
-                              "SolH3Experimental": "Sol-H3 SOL Attention (Experimental)"}
+NODE_CLASS_MAPPINGS = {
+    "SolH3Exact": SolH3Exact,
+    "SolH3Experimental": SolH3Experimental,
+    "SolH3KeylessRealH3Replay": SolH3KeylessRealH3Replay,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "SolH3Exact": "Sol-H3 Exact Runtime",
+    "SolH3Experimental": "Sol-H3 SOL Attention (Experimental)",
+    "SolH3KeylessRealH3Replay": "Sol-H3 Keyless Real-H3 Replay",
+}
