@@ -148,6 +148,34 @@ def test_partitioned_binding_does_not_change_ordinary_namespace(monkeypatch):
     assert ordinary == ("ordinary",)
 
 
+def test_ordinary_compiler_cache_generation_reports_transition(monkeypatch):
+    lease = validation.RuntimeLease()
+    monkeypatch.setattr(
+        validation,
+        "_device_identity",
+        lambda device: {"type": "cpu", "index": None, "process": 1},
+    )
+    lease.source_verified = True
+    lease.source_generation = "source"
+    lease.implementation_generation = "impl"
+    lease.device_identity = {"type": "cpu", "index": None, "process": 1}
+
+    class Kernel:
+        backend_name = "cute_sm120"
+        block_size = 64
+
+        def __init__(self):
+            self.generation = 0
+            self.compiler_namespace_provider = (
+                lambda: ("compiler", self.generation)
+            )
+
+    kernel = Kernel()
+    assert lease.bind_kernel(kernel, torch.device("cpu")) is False
+    kernel.generation += 1
+    assert lease.bind_kernel(kernel, torch.device("cpu")) is True
+
+
 def test_loaded_ordinary_runtime_replacement_reports_transition(monkeypatch):
     lease = validation.RuntimeLease()
     monkeypatch.setattr(
