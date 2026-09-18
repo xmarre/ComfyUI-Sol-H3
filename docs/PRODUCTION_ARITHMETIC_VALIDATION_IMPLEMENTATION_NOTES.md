@@ -283,12 +283,27 @@ multiple Sol Request summaries. A compile miss in the primed arm is evidence of
 a new executable key and must be investigated rather than relabeled as
 validation overhead.
 
-Validate the same-input replay targets independently. A fresh-process diagnostic
-that is expected to demonstrate first executable compilation can use:
+The three same-input replay targets do not belong to one Sol Request in the
+progressive benchmark. Flow low/probe/high sampler invocations cross separate
+Sol OUTER_SAMPLE lifetimes; the exact 00511 log contains six Sol summaries for
+its two chunks. Therefore a whole-prompt replay check must resolve targets
+across the process log rather than selecting one `--request-index`.
+
+The checker uses the mapped `partitioned_suffix` replay's
+`flow_request_id` as the continuation correlation identity. It then requires
+`ordinary_continuation_high` from the high stage with that same Flow request
+ID, while `ordinary_low` must come from a low stage under a different Flow
+request ID. Ambiguous or missing correlation fails closed. This corrects the
+earlier single-summary command without changing replay execution or any
+production lifetime.
+
+A fresh-process diagnostic that is expected to demonstrate first executable
+compilation can use:
 
 ```bash
 python custom_nodes/ComfyUI-Sol-H3/tools/check_arithmetic_validation_diagnostics.py \
   --log /path/to/replay-comfy.log \
+  --all-requests \
   --require-replay-target ordinary_low \
   --require-replay-target ordinary_continuation_high \
   --require-replay-target partitioned_suffix \
