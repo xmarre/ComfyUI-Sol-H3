@@ -7,6 +7,7 @@ import logging
 from .contracts import KEY, Config, adaln_status, prefix_length
 from .validation import ArithmeticValidationState, RuntimeLease
 from .diagnostics import CudaDiagnosticState
+from .replay_diagnostics import ReplayDiagnosticState
 from .sparse import validation_scope
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from . import weighted_measure
@@ -77,6 +78,7 @@ class Request:
     validation_state: ArithmeticValidationState = field(default_factory=ArithmeticValidationState)
     runtime_lease: RuntimeLease = field(default_factory=RuntimeLease)
     cuda_diagnostics: CudaDiagnosticState = field(default_factory=CudaDiagnosticState.from_env)
+    replay_diagnostics: ReplayDiagnosticState = field(default_factory=ReplayDiagnosticState.from_env)
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,7 @@ class SamplingWrapper:
                         "validation": state.validation_state.summary(),
                         "runtime_lease": state.runtime_lease.summary(),
                         "cuda_diagnostics": state.cuda_diagnostics.summary(),
+                        "replay_diagnostics": state.replay_diagnostics.summary(),
                     }
                 ),
             )
@@ -279,6 +282,7 @@ def _external_sequence_prefix(contract, layout, rows):
 
 
 FLOW_REQUEST_ID_KEY = "h3_flow_request_id_v1"
+FLOW_STAGE_KEY = "h3_flow_stage"
 FLOW_STAGE_ID_KEY = "h3_flow_stage_id_v1"
 FLOW_EVALUATION_ID_KEY = "h3_flow_evaluation_id_v1"
 FLOW_PARTITIONED_STAGE_KEY = "h3_flow_partitioned_stage_v1"
@@ -287,6 +291,7 @@ FLOW_PARTITIONED_STAGE_KEY = "h3_flow_partitioned_stage_v1"
 def _validation_context(options, evaluation, block_index, *, owner_generation=None, route=None):
     context = {
         "flow_request_id": options.get(FLOW_REQUEST_ID_KEY),
+        "flow_stage": options.get(FLOW_STAGE_KEY),
         "flow_stage_id": options.get(FLOW_STAGE_ID_KEY),
         "flow_evaluation_id": options.get(FLOW_EVALUATION_ID_KEY),
         "sol_evaluation": int(evaluation),
