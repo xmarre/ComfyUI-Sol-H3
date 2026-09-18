@@ -41,6 +41,7 @@ from sol_h3.keyless_exact_attention import (  # noqa: E402
 )
 from sol_h3.keyless_real_h3_replay import (  # noqa: E402
     ENVELOPE,
+    V2_ENVELOPE,
     apply_split_half_rope_fp32_from_normalized,
     apply_split_half_rope_from_normalized,
     block_summary_oracle,
@@ -48,11 +49,13 @@ from sol_h3.keyless_real_h3_replay import (  # noqa: E402
     envelope_dict,
     identity_split_half_rope_like,
     metric_within_limit,
+    scale_aware_metric_within_limit,
     public_rms_norm,
     replay_requires_process_failure,
     split_projection,
     tensor_metrics,
     tensor_scale_diagnostics,
+    v2_envelope_dict,
     value_sum_within_limit,
 )
 from sol_h3.keyless_route_summary import (  # noqa: E402
@@ -72,7 +75,8 @@ HEADS = 56
 HIDDEN = 5376
 REPLAY_CONTRACT = "sol-h3-keyless-real-h3-replay-v1"
 V2_CALIBRATION_CONTRACT = "sol-h3-keyless-v2-calibration-v1"
-PROBE_CONTRACT = "sol-h3-keyless-v2-calibration-campaign-v5"
+V2_HOLDOUT_CONTRACT = "sol-h3-keyless-v2-holdout-v1"
+PROBE_CONTRACT = "sol-h3-keyless-v2-holdout-v6"
 V2_K1_CONTRACT = "sol-h3-keyless-route-summary-v2"
 V2_K2_CONTRACT = "sol-h3-keyless-exact-allselected-v2"
 
@@ -89,6 +93,20 @@ V2_CALIBRATION_CASES = (
     ("three-quarter-193x511", "three_quarter", 193, 511),
     ("tail-511x193", "tail", 511, 193),
     ("tail-1025x1537", "tail", 1025, 1537),
+)
+
+
+V2_HOLDOUT_CASES = (
+    ("eighth-95x95", 1, 8, 95, 95),
+    ("three-eighth-96x96", 3, 8, 96, 96),
+    ("five-eighth-97x97", 5, 8, 97, 97),
+    ("seven-eighth-191x191", 7, 8, 191, 191),
+    ("eighth-192x192", 1, 8, 192, 192),
+    ("three-eighth-193x193", 3, 8, 193, 193),
+    ("five-eighth-383x385", 5, 8, 383, 385),
+    ("seven-eighth-385x383", 7, 8, 385, 383),
+    ("five-eighth-769x1025", 5, 8, 769, 1025),
+    ("three-eighth-1025x769", 3, 8, 1025, 769),
 )
 
 
@@ -747,6 +765,218 @@ def _calibration_v2_extrema(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+
+
+def _resolve_fractional_start(
+    total_rows: int,
+    span: int,
+    numerator: int,
+    denominator: int,
+) -> int:
+    if total_rows <= 0 or span <= 0 or span > total_rows:
+        raise ValueError(
+            f"holdout span {span} does not fit captured length {total_rows}"
+        )
+    if denominator <= 0 or numerator < 0 or numerator > denominator:
+        raise ValueError("holdout fraction must satisfy 0 <= numerator <= denominator")
+    return ((total_rows - span) * numerator) // denominator
+
+
+def _holdout_v2_for_block(
+    record,
+    *,
+    checkpoint: Path,
+    checkpoint_kind: str,
+    checkpoint_sha256: str,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Evaluate the frozen v2 envelope on unseen deterministic windows."""
+    if record.case.rope_freqs is None or not torch.is_tensor(record.case.rope_freqs):
+        raise RuntimeError(f"capture block {record.block_index} has no exact H3 RoPE tensor")
+    if tuple(record.attention_input.shape) != tuple(record.case.x.shape):
+        raise RuntimeError("capture attention_input no longer matches block-input shape")
+    if record.attention_input.ndim != 2 or record.attention_input.shape[1] != HIDDEN:
+        raise RuntimeError(
+            f"capture attention_input must be [T,{HIDDEN}], got "
+            f"{tuple(record.attention_input.shape)}"
+        )
+
+    q_weight, v_weight, q_norm, route_norm, metadata, names = _load_block_weights(
+        checkpoint,
+        kind=checkpoint_kind,
+        block_index=record.block_index,
+        device=device,
+    )
+    total_rows = int(record.attention_input.shape[0])
+    q_norm = q_norm.to(device=device, dtype=torch.bfloat16)
+    route_norm = route_norm.to(device=device, dtype=torch.bfloat16)
+    cases: list[dict[str, Any]] = []
+
+    for name, numerator, denominator, q_rows, v_rows in V2_HOLDOUT_CASES:
+        span = max(q_rows, v_rows)
+        start = _resolve_fractional_start(
+            total_rows,
+            span,
+            numerator,
+            denominator,
+        )
+        q_start = start
+        v_start = start
+
+        q_raw = _project(
+            record.attention_input,
+            q_weight,
+            start=q_start,
+            rows=q_rows,
+            device=device,
+        ).view(q_rows, HEADS, HEAD_DIM)
+        v_raw = _project(
+            record.attention_input,
+            v_weight,
+            start=v_start,
+            rows=v_rows,
+            device=device,
+        ).view(v_rows, HEADS, HEAD_DIM)
+        q_rope = _rope_slice(
+            record.case.rope_freqs,
+            start=q_start,
+            rows=q_rows,
+            device=device,
+        )
+        v_rope = _rope_slice(
+            record.case.rope_freqs,
+            start=v_start,
+            rows=v_rows,
+            device=device,
+        )
+        q = _comfy_position(q_raw, q_norm, q_rope)
+        route = _comfy_position(v_raw, route_norm, v_rope)
+
+        oracle_rc, oracle_vc = block_summary_oracle(route, v_raw)
+        candidate_rc, candidate_vc = route_summary(
+            v_raw,
+            route_norm,
+            NORM_EPS,
+            v_rope,
+        )
+        k1_rc = tensor_metrics(candidate_rc, oracle_rc)
+        k1_rc_scale = tensor_scale_diagnostics(candidate_rc, oracle_rc)
+        k1_vc = tensor_metrics(candidate_vc, oracle_vc)
+
+        dense = _dense_attention(q, route, v_raw)
+        out = torch.empty_like(q)
+        exact_attention(
+            q,
+            v_raw,
+            route_norm,
+            NORM_EPS,
+            v_rope,
+            scale=CANONICAL_SCALE,
+            out=out,
+        )
+        torch.cuda.synchronize(device)
+        k2 = tensor_metrics(out, dense)
+        k2_scale = tensor_scale_diagnostics(out, dense)
+
+        k1_allocation = _candidate_allocation(
+            lambda: route_summary(v_raw, route_norm, NORM_EPS, v_rope),
+            device,
+        )
+        k2_allocation = _candidate_allocation(
+            lambda: exact_attention(
+                q,
+                v_raw,
+                route_norm,
+                NORM_EPS,
+                v_rope,
+                scale=CANONICAL_SCALE,
+                out=out,
+            ),
+            device,
+        )
+        full_route_bytes = int(v_raw.numel() * v_raw.element_size())
+        k1_allocation["full_materialized_route_bytes"] = full_route_bytes
+        k1_allocation["below_full_route"] = (
+            k1_allocation["temporary_peak_delta"] < full_route_bytes
+        )
+        k2_allocation["full_materialized_route_bytes"] = full_route_bytes
+        k2_allocation["below_full_route"] = (
+            k2_allocation["temporary_peak_delta"] < full_route_bytes
+        )
+
+        passes = {
+            "k1_route_centroid": scale_aware_metric_within_limit(
+                k1_rc,
+                k1_rc_scale,
+                V2_ENVELOPE.k1_route_centroid,
+            ),
+            "k1_value_sum": value_sum_within_limit(
+                k1_vc,
+                V2_ENVELOPE.k1_value_max_abs,
+            ),
+            "k2_output": scale_aware_metric_within_limit(
+                k2,
+                k2_scale,
+                V2_ENVELOPE.k2_output,
+            ),
+            "k1_allocation": bool(k1_allocation["below_full_route"]),
+            "k2_allocation": bool(k2_allocation["below_full_route"]),
+        }
+        passes["all"] = all(passes.values())
+
+        cases.append(
+            {
+                "name": name,
+                "fraction": {
+                    "numerator": numerator,
+                    "denominator": denominator,
+                },
+                "q_start": q_start,
+                "q_rows": q_rows,
+                "v_start": v_start,
+                "v_rows": v_rows,
+                "k1_route_centroid": k1_rc,
+                "k1_route_centroid_scale": k1_rc_scale,
+                "k1_raw_value_sum": k1_vc,
+                "k1_allocation": k1_allocation,
+                "k2_output": k2,
+                "k2_output_scale": k2_scale,
+                "k2_allocation": k2_allocation,
+                "passes": passes,
+            }
+        )
+
+    return {
+        "block_index": int(record.block_index),
+        "case_id": record.case.case_id,
+        "sigma": record.case.sigma,
+        "modality_label": record.case.modality_label,
+        "capture_rows": total_rows,
+        "checkpoint_kind": checkpoint_kind,
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_tensor_names": names,
+        "checkpoint_metadata_identity": {
+            key: metadata.get(key)
+            for key in (
+                "architecture",
+                "checkpoint_format_version",
+                "manifest_sha256",
+                "parent_model_sha256",
+                "teacher_model_sha256",
+                "training_run",
+                "export_commit",
+            )
+            if metadata.get(key) is not None
+        },
+        "cases": cases,
+        "all_cases_pass": all(bool(case["passes"]["all"]) for case in cases),
+    }
+
+
+def _holdout_v2_extrema(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    return _calibration_v2_extrema(blocks)
+
+
 def _record_for_block(
     record,
     *,
@@ -1320,6 +1550,14 @@ def main() -> None:
             "campaign across boundary lengths and sequence regions"
         ),
     )
+    parser.add_argument(
+        "--holdout-v2",
+        action="store_true",
+        help=(
+            "evaluate the frozen v2 envelope on predeclared unseen sequence "
+            "regions and window geometries"
+        ),
+    )
     args = parser.parse_args()
 
     probe_source = _probe_source_identity(_REPO_ROOT)
@@ -1335,13 +1573,15 @@ def main() -> None:
 
     if args.q_rows <= 0 or args.v_rows <= 0 or args.repeats <= 0:
         parser.error("q-rows, v-rows and repeats must be positive")
-    if args.calibration_v2 and (
+    if args.calibration_v2 and args.holdout_v2:
+        parser.error("--calibration-v2 and --holdout-v2 are mutually exclusive")
+    if (args.calibration_v2 or args.holdout_v2) and (
         K1_CONTRACT != V2_K1_CONTRACT or K2_CONTRACT != V2_K2_CONTRACT
     ):
         parser.error(
-            "v2 calibration requires the corrected owning K1/K2 contracts; "
+            "v2 replay requires the corrected owning K1/K2 contracts; "
             f"got K1={K1_CONTRACT!r}, K2={K2_CONTRACT!r}. Refresh the complete "
-            "Sol #17/#20/#21 Patcher stack before running calibration."
+            "Sol #17/#20/#21 Patcher stack before running calibration/holdout."
         )
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -1394,6 +1634,103 @@ def main() -> None:
     missing = sorted(selected.difference(by_block))
     if missing:
         raise RuntimeError(f"capture bundle does not contain requested blocks: {missing}")
+
+    if args.holdout_v2:
+        holdout_blocks = []
+        with torch.cuda.device(device), torch.inference_mode():
+            for block in sorted(selected):
+                holdout_blocks.append(
+                    _holdout_v2_for_block(
+                        by_block[block],
+                        checkpoint=checkpoint,
+                        checkpoint_kind=args.checkpoint_kind,
+                        checkpoint_sha256=checkpoint_sha256,
+                        device=device,
+                    )
+                )
+        holdout_pass = all(
+            bool(block["all_cases_pass"]) for block in holdout_blocks
+        )
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        result = {
+            "contract": V2_HOLDOUT_CONTRACT,
+            "mode": "k1-k2-v2-real-h3-holdout",
+            "promotion_evidence": False,
+            "thresholds_frozen": True,
+            "v2_envelope": v2_envelope_dict(),
+            "probe_source": probe_source,
+            "checkpoint_kind": args.checkpoint_kind,
+            "checkpoint_path": str(checkpoint),
+            "checkpoint_sha256": checkpoint_sha256,
+            "capture_bundle": str(capture_path),
+            "capture_bundle_sha256": capture_bundle_sha256,
+            "capture_receipt": str(receipt_path),
+            "capture_receipt_sha256": capture_receipt_sha256,
+            "capture_provenance": {
+                "code_commit": provenance.code_commit,
+                "comfy_commit": provenance.comfy_commit,
+                "dataset_manifest_sha256": provenance.dataset_manifest_sha256,
+                "execution_descriptor": provenance.execution_descriptor,
+                "teacher_model_revision": provenance.teacher_model_revision,
+                "teacher_model_sha256": provenance.teacher_model_sha256,
+            },
+            "source_contracts": {
+                "k1": K1_CONTRACT,
+                "k2": K2_CONTRACT,
+            },
+            "holdout_case_definitions": [
+                {
+                    "name": name,
+                    "fraction": {
+                        "numerator": numerator,
+                        "denominator": denominator,
+                    },
+                    "q_rows": q_rows,
+                    "v_rows": v_rows,
+                }
+                for name, numerator, denominator, q_rows, v_rows
+                in V2_HOLDOUT_CASES
+            ],
+            "blocks": holdout_blocks,
+            "observed_extrema": _holdout_v2_extrema(holdout_blocks),
+            "all_holdout_cases_pass": holdout_pass,
+            "memory_strategy": {
+                "capture_deserialize_device": str(device),
+                "checkpoint_tensor_device": str(device),
+                "large_file_hash_page_cache_policy": "posix_fadvise_dontneed_when_available",
+                "capture_bundle_rehash_after_validated_load": False,
+                "cuda_free_bytes_after_holdout": int(free_bytes),
+                "cuda_total_bytes": int(total_bytes),
+            },
+            "limitations": [
+                "arithmetic holdout only; this is not end-to-end promotion evidence",
+                "one captured sigma-1 native-H3 forward, using regions not sampled by calibration",
+                "blocks 0/25/49 cover early/mid/late route-norm weights but not all 50 blocks",
+                "K2 is all-selected experimental Triton arithmetic; sparse Sol selector and vendored CuTe production mainloop remain unwired",
+                "no decoded-media, sampler, full-sequence, or end-to-end performance evidence",
+            ],
+        }
+        if args.output_json:
+            output_path = Path(args.output_json)
+            _write_json_atomic(output_path, result)
+            print(
+                json.dumps(
+                    {
+                        "all_holdout_cases_pass": holdout_pass,
+                        "diagnostic_report": str(output_path.expanduser().resolve()),
+                        "probe_contract": PROBE_CONTRACT,
+                        "probe_git_commit": probe_source["git_commit"],
+                        "promotion_evidence": False,
+                        "thresholds_frozen": True,
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        if not holdout_pass and not args.diagnostic_only:
+            raise RuntimeError("real-H3 v2 holdout exceeded the frozen arithmetic envelope")
+        return
 
     if args.calibration_v2:
         calibration_blocks = []
