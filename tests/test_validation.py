@@ -160,3 +160,159 @@ def test_loaded_ordinary_runtime_replacement_reports_transition(monkeypatch):
 
     assert lease.bind_kernel(Kernel(1), torch.device("cpu")) is False
     assert lease.bind_kernel(Kernel(2), torch.device("cpu")) is True
+
+
+def test_failed_owner_wakes_waiter_and_requires_fresh_validation():
+    state = Request(Config(exact=False, backend="sol"))
+    key = _key(state)
+    first = state.validation_state.begin(key)
+    result = []
+
+    def waiter():
+        result.append(state.validation_state.begin(key))
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    state.validation_state.publish_failure(first)
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result and result[0].validate is True
+    assert result[0].publish is True
+    state.validation_state.publish_failure(result[0])
+
+
+def test_generation_change_during_validation_rejects_stale_publish_and_wakes_waiter():
+    state = Request(Config(exact=False, backend="sol"))
+    key = _key(state)
+    first = state.validation_state.begin(key)
+    result = []
+
+    def waiter():
+        result.append(state.validation_state.begin(key))
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    state.validation_state.invalidate("numerical_transition")
+    state.validation_state.publish_success(first, {"finite": True})
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result and result[0].validate is True
+    assert result[0].generation == 1
+    assert state.validation_state.stats["generation_publish_rejected"] == 1
+    state.validation_state.publish_failure(result[0])
+
+
+def test_oversized_identity_bypasses_success_storage():
+    service = validation.ArithmeticValidationState(max_entries=4, max_bytes=64)
+    state = Request(Config(exact=False, backend="sol"))
+    state.validation_state = service
+    key = _key(state)
+    ticket = service.begin(key)
+
+    assert ticket.validate is True
+    assert ticket.publish is False
+    service.publish_success(ticket, {"finite": True})
+    summary = service.summary()
+    assert summary["cache_entries"] == 0
+    assert summary["miss_reasons"]["unrepresentable_identity"] == 1
+
+
+def test_success_entries_retain_no_tensors():
+    state = Request(Config(exact=False, backend="sol"))
+    key = _key(state, bias={"segments": [{"start": 0, "stop": 8, "value": "0x0.0p+0"}]})
+    ticket = state.validation_state.begin(key)
+    state.validation_state.publish_success(ticket, {"finite": True, "mean_abs": 0.0})
+
+    def contains_tensor(value):
+        if torch.is_tensor(value):
+            return True
+        if isinstance(value, dict):
+            return any(contains_tensor(k) or contains_tensor(v) for k, v in value.items())
+        if isinstance(value, (tuple, list, set)):
+            return any(contains_tensor(item) for item in value)
+        return False
+
+    assert not contains_tensor(state.validation_state._entries)
+
+
+def test_bias_scale_and_physical_identity_mutations_do_not_hit_prior_success():
+    state = Request(Config(exact=False, backend="sol"))
+    service = state.validation_state
+    base_key = _key(state, bias={"value": "a"}, physical={"map": "a"})
+    ticket = service.begin(base_key)
+    service.publish_success(ticket, {"finite": True})
+
+    bias_key = _key(state, bias={"value": "b"}, physical={"map": "a"})
+    assert service.begin(bias_key).validate is True
+
+    # Use a fresh service for each mutation so the miss classification is not
+    # affected by an intentionally left in-flight validator above.
+    state.validation_state = validation.ArithmeticValidationState()
+    service = state.validation_state
+    ticket = service.begin(base_key)
+    service.publish_success(ticket, {"finite": True})
+    scale_key = dict(base_key)
+    scale_key["scale"] = float(0.123).hex()
+    assert service.begin(scale_key).validate is True
+
+    state.validation_state = validation.ArithmeticValidationState()
+    service = state.validation_state
+    ticket = service.begin(base_key)
+    service.publish_success(ticket, {"finite": True})
+    physical_key = dict(base_key)
+    physical_key["physical_identity"] = {"map": "b"}
+    assert service.begin(physical_key).validate is True
+
+
+def test_ordinary_and_partitioned_bindings_share_one_source_verification(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        validation,
+        "_device_identity",
+        lambda device: {"type": "cpu", "index": None, "process": 1},
+    )
+    import sol_h3.provenance as provenance
+    from sol_h3 import compiler_attribution
+
+    monkeypatch.setattr(
+        provenance,
+        "verify_source",
+        lambda: calls.append(True)
+        or {
+            "source": provenance.SOURCE,
+            "revision": provenance.REVISION,
+            "contract": provenance.CONTRACT,
+            "files": {},
+        },
+    )
+    monkeypatch.setattr(
+        compiler_attribution,
+        "install_hooks",
+        lambda interface: ("partitioned-compiler",),
+    )
+    monkeypatch.setattr(
+        compiler_attribution,
+        "compiler_namespace",
+        lambda interface: ("partitioned-compiler",),
+    )
+
+    class Kernel:
+        backend_name = "cute_sm120"
+        block_size = 64
+        compiler_namespace = ("ordinary-compiler",)
+
+    class Interface:
+        __file__ = "fake-interface.py"
+        MAPPED_NEIGHBOR_CONTRACT = "mapped-v4"
+
+        @staticmethod
+        def _compile_sm120():
+            raise AssertionError("compile is not part of lease binding")
+
+    lease = validation.RuntimeLease()
+    assert lease.bind_kernel(Kernel(), torch.device("cpu")) is False
+    assert lease.bind_partitioned(Interface(), torch.device("cpu")) is False
+    assert calls == [True]
+    assert lease.source_verify_count == 1
