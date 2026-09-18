@@ -32,11 +32,9 @@ def _sink_blocks(start, tokens, rows):
 
 def load_kernel(device):
     """Load the verified node-local public API; SM120 requires its CuTe backend."""
-    from .provenance import verify_source
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("This experimental SOL integration currently targets single-GPU SM120 only")
     try:
-        verify_source()
         from ._vendor.sol_attn import get_sol_attn_backend, sol_attn
         backend = get_sol_attn_backend(device)
         if backend != "cute_sm120":
@@ -222,6 +220,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     elif not mapped_enabled and (exact_k_blocks is not None or calibration_identity is not None):
         raise RuntimeError("weighted SOL routing metadata was supplied without key_bias")
 
+    state.runtime_lease.ensure_source_verified(q.device)
     kernel_loader_s = 0.0
     if state.kernel is None:
         failure = getattr(state, "kernel_failure", None)
@@ -237,6 +236,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         state.kernel_device = q.device
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
+    state.runtime_lease.bind_kernel(state.kernel, q.device)
 
     qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
@@ -246,8 +246,34 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     # Descriptor values are intentionally absent: every map with this layout reuses
     # one compiled mapped ABI. The runtime tensor remains a kernel argument.
     mapped_identity = (MAPPED_ABI_VERSION, True) if mapped_enabled else (MAPPED_ABI_VERSION, False)
-    key = (q.device, q.dtype, layout_key, calibration_identity, mapped_identity)
-    calibrating = key not in state.sparse_verified
+    from .validation import build_arithmetic_key
+    mode = (
+        "ordinary_weighted_v1" if key_bias is not None
+        else "ordinary_mapped_v1" if mapped_enabled
+        else "ordinary_unweighted_v1"
+    )
+    bias_range = None
+    bias_log_measure = None
+    if key_bias is not None and exact_k_blocks is not None:
+        bias_range = [int(exact_k_blocks[0]) * BLOCK_SIZE, int(exact_k_blocks[1]) * BLOCK_SIZE]
+        # The semantic identity remains authoritative; reading device bias values
+        # merely to build a key would introduce a synchronization.
+    arithmetic_key = build_arithmetic_key(
+        state=state,
+        q=q,
+        k=k,
+        v=v,
+        mode=mode,
+        layout="bhtd",
+        scale=q.shape[-1] ** -0.5,
+        mapped_abi=MAPPED_ABI_VERSION if mapped_enabled else None,
+        bias_range=bias_range,
+        bias_log_measure=bias_log_measure,
+        bias_identity=calibration_identity,
+        physical_identity=None,
+    )
+    ticket = state.validation_state.begin(arithmetic_key)
+    calibrating = ticket.validate
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
         gate_telemetry = {}
@@ -262,9 +288,15 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         gate_wall_s = time.perf_counter() - gate_started
         _accumulate_attribution(state, "arithmetic_gate", gate_telemetry, gate_wall_s)
         if not arithmetic_gate_passes(metrics):
+            state.validation_state.publish_failure(ticket)
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
-        state.sparse_verified.add(key)
-        state.gates.append({
+        state.validation_state.publish_success(ticket, metrics)
+        state.validation_state.record_gate(
+            ticket, mode=mode, gate_wall_s=gate_wall_s,
+            metrics=metrics, telemetry=gate_telemetry,
+        )
+        if len(state.gates) < 32:
+            state.gates.append({
             "shape": list(q.shape),
             "kv_shape": list(k.shape),
             "backend": getattr(state.kernel, "backend_name", "test_substitute"),
@@ -276,6 +308,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
             "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
             "attribution": dict(gate_telemetry),
+            "arithmetic_key_digest": ticket.digest or None,
             **metrics,
         })
         del got, want
@@ -294,10 +327,12 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias,
         mapped_neighbor_intervals=mapped_neighbor_intervals,
     )
+    production_host_wall_s = time.perf_counter() - production_started
     _accumulate_attribution(
         state, "production_sparse", production_telemetry,
-        time.perf_counter() - production_started,
+        production_host_wall_s,
     )
+    state.validation_state.record_production(production_host_wall_s)
     if prefix and recompute_prefix_queries:
         out[:, :prefix] = _dense_reference(
             q[:, :, :prefix], k, v, dense_attention, key_bias=key_bias

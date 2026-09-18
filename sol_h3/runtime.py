@@ -5,6 +5,7 @@ import json
 import logging
 
 from .contracts import KEY, Config, adaln_status, prefix_length
+from .validation import ArithmeticValidationState, RuntimeLease
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from . import weighted_measure
 from .interop import (
@@ -70,6 +71,8 @@ class Request:
     last_routes: tuple | None = None
     backend_transitions: int = 0
     runtime_attribution: dict = field(default_factory=dict)
+    validation_state: ArithmeticValidationState = field(default_factory=ArithmeticValidationState)
+    runtime_lease: RuntimeLease = field(default_factory=RuntimeLease)
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,8 @@ class SamplingWrapper:
                         "inherited_dense_backends": sorted(state.dense_attention_backends),
                         "arithmetic_gates": state.gates,
                         "runtime_attribution": state.runtime_attribution,
+                        "validation": state.validation_state.summary(),
+                        "runtime_lease": state.runtime_lease.summary(),
                     }
                 ),
             )

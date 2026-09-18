@@ -207,14 +207,9 @@ def _sm120_union(
     telemetry: dict | None = None,
 ) -> torch.Tensor:
     """Execute one SM120 sparse attention union with optional bias + mapped metadata."""
-    from .provenance import verify_source
     from ._vendor.sol_attn import interface
     from ._vendor.sol_attn.preprocess import prepare
 
-    verify_started = time.perf_counter()
-    verify_source()
-    if telemetry is not None:
-        telemetry["source_verify_s"] = telemetry.get("source_verify_s", 0.0) + (time.perf_counter() - verify_started)
     qb = q.unsqueeze(0)
     kb = k.unsqueeze(0)
     vb = v.unsqueeze(0)
@@ -514,20 +509,33 @@ def partitioned_request_attention(
             "descriptor_digest": None if descriptor is None else descriptor.descriptor_digest,
         }
     )
-    verified = getattr(state, "partitioned_sparse_verified", None)
-    if verified is None:
-        verified = set()
-        state.partitioned_sparse_verified = verified
-    layout_key = (
-        tuple(q.shape),
-        tuple(q.stride()),
-        tuple(k.shape),
-        tuple(k.stride()),
-        tuple(v.shape),
-        tuple(v.stride()),
-        calibration_identity,
+    from ._vendor.sol_attn import interface as sol_interface
+    state.runtime_lease.bind_partitioned(sol_interface, q.device)
+    from .validation import build_arithmetic_key
+    mode = (
+        "partitioned_mapped_weighted_v1" if mapped is not None and key_bias is not None
+        else "partitioned_mapped_v1" if mapped is not None
+        else "partitioned_weighted_v1" if key_bias is not None
+        else "partitioned_unweighted_v1"
     )
-    if layout_key not in verified:
+    arithmetic_key = build_arithmetic_key(
+        state=state,
+        q=q,
+        k=k,
+        v=v,
+        mode=mode,
+        layout="thd",
+        scale=scale,
+        mapped_abi=MAPPED_POLICY if mapped is not None else None,
+        bias_range=None if prefix_k_range is None else list(prefix_k_range),
+        bias_log_measure=None if prefix_k_range is None else float(prefix_log_key_measure),
+        bias_identity=semantic_digest if key_bias is not None else None,
+        # Conservative by design: current partitioned proof identity still
+        # retains map/group ownership until CUDA replay proves quotient safety.
+        physical_identity=calibration_identity,
+    )
+    ticket = state.validation_state.begin(arithmetic_key)
+    if ticket.validate:
         from .sparse import _accumulate_attribution
         gate_started = time.perf_counter()
         gate_telemetry = {}
@@ -550,9 +558,15 @@ def partitioned_request_attention(
         gate_wall_s = time.perf_counter() - gate_started
         _accumulate_attribution(state, "partitioned_arithmetic_gate", gate_telemetry, gate_wall_s)
         if not arithmetic_gate_passes(gate):
+            state.validation_state.publish_failure(ticket)
             raise RuntimeError(f"partitioned Sol all-selected arithmetic gate failed: {gate}")
-        verified.add(layout_key)
-        state.gates.append(
+        state.validation_state.publish_success(ticket, gate)
+        state.validation_state.record_gate(
+            ticket, mode=mode, gate_wall_s=gate_wall_s,
+            metrics=gate, telemetry=gate_telemetry,
+        )
+        if len(state.gates) < 32:
+            state.gates.append(
             {
                 "route": PARTITIONED_REQUEST_ABI,
                 "kind": kind,
@@ -562,6 +576,7 @@ def partitioned_request_attention(
                 "key_measure_bias": key_bias is not None,
                 "gate_wall_s": gate_wall_s,
                 "attribution": dict(gate_telemetry),
+                "arithmetic_key_digest": ticket.digest or None,
                 **gate,
             }
         )
@@ -580,10 +595,12 @@ def partitioned_request_attention(
         mapped_neighbor_intervals=mapped,
         telemetry=production_telemetry,
     )
+    production_host_wall_s = time.perf_counter() - production_started
     _accumulate_attribution(
         state, "partitioned_production_sparse", production_telemetry,
-        time.perf_counter() - production_started,
+        production_host_wall_s,
     )
+    state.validation_state.record_production(production_host_wall_s)
     state.partitioned_sparse_calls = getattr(state, "partitioned_sparse_calls", 0) + 1
     state.partitioned_requested_q_rows = getattr(state, "partitioned_requested_q_rows", 0) + int(q.shape[0])
     state.partitioned_kernel_q_rows = getattr(state, "partitioned_kernel_q_rows", 0) + int(q.shape[0])
