@@ -324,28 +324,6 @@ def _run_block(
             }
         )
 
-        del (
-            q_raw,
-            v_raw,
-            q_rope,
-            v_rope,
-            q,
-            route,
-            qb,
-            rb,
-            vb,
-            reference_rc,
-            reference_vc,
-            reference_threshold,
-            reference_output,
-            reference_trace,
-            v2_rc,
-            v2_vc,
-            v3_rc,
-            v3_vc,
-            v3_threshold,
-        )
-
     return {
         "block_index": int(record.block_index),
         "case_id": record.case.case_id,
