@@ -72,6 +72,7 @@ def threshold_from_route_centroids(
     q: torch.Tensor,
     route_centroid: torch.Tensor,
     *,
+    kv_rows: int,
     tau: float,
     scale: float,
 ) -> torch.Tensor:
@@ -86,6 +87,14 @@ def threshold_from_route_centroids(
         raise ValueError(
             "K3 threshold requires Q [B,Tq,H,128] and RC [B,ceil(Tv/64),H,128]"
         )
+    if type(kv_rows) is not int or kv_rows <= 0:
+        raise ValueError("K3 kv_rows must be a positive integer")
+    expected_blocks = _ceil_div(kv_rows, BLOCK_SIZE)
+    if int(route_centroid.shape[1]) != expected_blocks:
+        raise ValueError(
+            "K3 routed-centroid block count does not match the physical KV row count: "
+            f"{route_centroid.shape[1]} vs {expected_blocks}"
+        )
     if q.dtype is not torch.bfloat16 or route_centroid.dtype is not torch.bfloat16:
         raise TypeError("K3 threshold requires BF16 Q and routed centroids")
     if q.device != route_centroid.device or q.device.type != "cuda":
@@ -97,9 +106,11 @@ def threshold_from_route_centroids(
 
     from ._vendor.sol_attn.preprocess import _compute_diag_threshold
 
-    # RC carries only physical KV block summaries; its block count is the exact
-    # valid-KV block count for this bounded diagnostic.
-    valid_kv_tokens = int(route_centroid.shape[1]) * BLOCK_SIZE
+    # Bind the exact physical row count even though the current diagonal
+    # threshold helper consumes it only through ceil(Tv/64).  This keeps K3
+    # fail-closed if later threshold arithmetic starts using the partial-block
+    # length directly.
+    valid_kv_tokens = kv_rows
     return _compute_diag_threshold(
         q,
         route_centroid,
