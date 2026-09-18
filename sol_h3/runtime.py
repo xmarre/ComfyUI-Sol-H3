@@ -7,6 +7,7 @@ import logging
 from .contracts import KEY, Config, adaln_status, prefix_length
 from .validation import ArithmeticValidationState, RuntimeLease
 from .diagnostics import CudaDiagnosticState
+from .sparse import validation_scope
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from . import weighted_measure
 from .interop import (
@@ -472,7 +473,7 @@ class BlockPatch:
                             raise RuntimeError("weighted dense prefix returned an invalid output shape")
                         return out.transpose(1, 2)
 
-                    from .sparse import attention, KernelUnavailable, validation_scope
+                    from .sparse import attention, KernelUnavailable
                     try:
                         with validation_scope(
                             _validation_context(
