@@ -60,3 +60,16 @@ def test_k3_probe_does_not_claim_no_route_or_production_promotion():
         '"no production provider promotion, fused selected-route CuTe transform, decoded-media, sampler, or end-to-end performance evidence"'
         in source
     )
+
+
+
+def test_k3_probe_verifies_native_source_and_backend_provenance():
+    source = _probe_source()
+    assert "selector_provenance = _native_selector_provenance(device)" in source
+    assert "manifest = verify_source()" in source
+    assert "backend = get_sol_attn_backend(device)" in source
+    assert 'backend != "cute_sm120"' in source
+    assert '"selector_provenance": selector_provenance' in source
+    assert '"nvidia-cutlass-dsl"' in source
+    assert '"cuda-python"' in source
+    assert '"triton"' in source
