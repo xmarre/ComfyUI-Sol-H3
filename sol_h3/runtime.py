@@ -69,6 +69,7 @@ class Request:
     native_reason: str | None = None
     last_routes: tuple | None = None
     backend_transitions: int = 0
+    runtime_attribution: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,7 @@ class SamplingWrapper:
                         "exact_blocks": state.exact_blocks,
                         "inherited_dense_backends": sorted(state.dense_attention_backends),
                         "arithmetic_gates": state.gates,
+                        "runtime_attribution": state.runtime_attribution,
                     }
                 ),
             )

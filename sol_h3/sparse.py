@@ -55,7 +55,7 @@ def load_kernel(device):
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
                sink_start=0, sink_tokens=0, key_bias=None,
-               mapped_neighbor_intervals=None):
+               mapped_neighbor_intervals=None, _telemetry=None):
         _sink_blocks(sink_start, sink_tokens, k.shape[1])
         return sol_attn(
             q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
@@ -63,11 +63,13 @@ def load_kernel(device):
             sink_start=sink_start, sink_tokens=sink_tokens,
             key_bias=key_bias,
             mapped_neighbor_intervals=mapped_neighbor_intervals,
+            telemetry=_telemetry,
         )
 
     kernel.backend_name = backend
     kernel.source_tree_verified = True
     kernel.block_size = BLOCK_SIZE
+    kernel.supports_attribution = True
     return kernel
 
 
@@ -150,6 +152,36 @@ def _validate_mapped_descriptor(mapped, q, k):
     return True
 
 
+
+def _accumulate_attribution(state, phase, telemetry, host_wall_s=None):
+    """Aggregate host-side attribution without synchronizing the CUDA device."""
+    if telemetry is None:
+        telemetry = {}
+    target = state.runtime_attribution
+    target[phase + "_calls"] = int(target.get(phase + "_calls", 0)) + 1
+    if host_wall_s is not None:
+        target[phase + "_host_wall_s"] = float(target.get(phase + "_host_wall_s", 0.0)) + float(host_wall_s)
+    for name in (
+        "prepare_jit_host_wall_s",
+        "compile_lock_wait_s",
+        "compile_body_s",
+        "dispatch_host_enqueue_s",
+        "source_verify_s",
+    ):
+        value = telemetry.get(name)
+        if value is not None:
+            target[phase + "_" + name] = float(target.get(phase + "_" + name, 0.0)) + float(value)
+    for name in ("compile_hit", "compile_miss", "compile_race_hit"):
+        if telemetry.get(name):
+            target[phase + "_" + name] = int(target.get(phase + "_" + name, 0)) + 1
+
+
+def _kernel_call(kernel, q, k, v, *, telemetry, **kwargs):
+    if getattr(kernel, "supports_attribution", False):
+        kwargs["_telemetry"] = telemetry
+    return kernel(q, k, v, **kwargs)
+
+
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,
               calibration_identity=None, mapped_neighbor_intervals=None,
@@ -218,14 +250,17 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     calibrating = key not in state.sparse_verified
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
-        got = state.kernel(
-            qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
+        gate_telemetry = {}
+        got = _kernel_call(
+            state.kernel, qb, kb, vb, telemetry=gate_telemetry,
+            tau=config.tau, thresh_type="diag", kv_splits=1,
             sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
             mapped_neighbor_intervals=mapped_neighbor_intervals,
         )
         want = _dense_reference(q, k, v, None, key_bias=key_bias)
         metrics = error_metrics(got, want)
         gate_wall_s = time.perf_counter() - gate_started
+        _accumulate_attribution(state, "arithmetic_gate", gate_telemetry, gate_wall_s)
         if not arithmetic_gate_passes(metrics):
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
         state.sparse_verified.add(key)
@@ -240,6 +275,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             "materialized_qkv_bytes": 0,
             "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
             "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
+            "attribution": dict(gate_telemetry),
             **metrics,
         })
         del got, want
@@ -250,10 +286,17 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         sink_start = min(k.shape[2], exact_k_blocks[0] * BLOCK_SIZE)
         sink_end = min(k.shape[2], exact_k_blocks[1] * BLOCK_SIZE)
         sink_tokens = max(0, sink_end - sink_start)
-    out = state.kernel(
-        qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
+    production_telemetry = {}
+    production_started = time.perf_counter()
+    out = _kernel_call(
+        state.kernel, qb, kb, vb, telemetry=production_telemetry,
+        tau=config.tau, thresh_type="diag", kv_splits=1,
         sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias,
         mapped_neighbor_intervals=mapped_neighbor_intervals,
+    )
+    _accumulate_attribution(
+        state, "production_sparse", production_telemetry,
+        time.perf_counter() - production_started,
     )
     if prefix and recompute_prefix_queries:
         out[:, :prefix] = _dense_reference(

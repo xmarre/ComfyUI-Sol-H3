@@ -14,6 +14,7 @@ CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4'
 PATCHES = (
     ('rectangular-sm120-v3', ROOT / 'tools/rectangular_sm120.patch'),
     ('mapped-neighbor-sm120-v4', ROOT / 'tools/mapped_neighbor_sm120.patch'),
+    ('validation-telemetry-v1', ROOT / 'tools/validation_telemetry_sm120.patch'),
 )
 
 
@@ -108,7 +109,8 @@ def main():
         'contract': CONTRACT,
         'transformation': (
             'relative-imports-v1; rectangular-sm120-v3 (tools/rectangular_sm120.patch); '
-            'mapped-neighbor-sm120-v4 (tools/mapped_neighbor_sm120.patch)'
+            'mapped-neighbor-sm120-v4 (tools/mapped_neighbor_sm120.patch); '
+            'validation-telemetry-v1 (tools/validation_telemetry_sm120.patch)'
         ),
         # Legacy audit field remains the rectangular-v3 patch hash.
         'packaged_patch_sha256': patch_records[0]['sha256'],

@@ -236,3 +236,36 @@ def test_weighted_bridge_rejects_bias_without_bound_route_metadata(monkeypatch):
     state = Request(Config(exact=False, backend="sol"))
     with pytest.raises(RuntimeError, match="calibration identity"):
         sparse.attention(q, q, q, 1, state.config, state, key_bias=torch.zeros(65))
+
+
+def test_bridge_reports_compiler_attribution_without_changing_fake_kernel_contract(monkeypatch):
+    calls = []
+
+    def kernel(q, k, v, _telemetry=None, **kw):
+        calls.append(kw)
+        if _telemetry is not None:
+            _telemetry.update({
+                "prepare_jit_host_wall_s": 0.01,
+                "compile_lock_wait_s": 0.02,
+                "compile_body_s": 0.03,
+                "compile_miss": True,
+                "dispatch_host_enqueue_s": 0.04,
+                "compiler_key": "test-key",
+            })
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        ).transpose(1, 2)
+
+    kernel.supports_attribution = True
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: kernel)
+    q = torch.randn(1, 2, 9, 128).to(torch.bfloat16)
+    state = Request(Config(exact=False, backend="sol"))
+
+    sparse.attention(q, q, q, 0, state.config, state, recompute_prefix_queries=False)
+
+    gate = state.gates[0]
+    assert gate["attribution"]["compile_miss"] is True
+    assert gate["attribution"]["compiler_key"] == "test-key"
+    assert state.runtime_attribution["arithmetic_gate_compile_miss"] == 1
+    assert state.runtime_attribution["arithmetic_gate_compile_body_s"] == pytest.approx(0.03)
+    assert state.runtime_attribution["production_sparse_calls"] == 1

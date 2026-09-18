@@ -18,6 +18,7 @@ from collections import OrderedDict
 import hashlib
 import json
 import math
+import time
 from typing import Any
 
 import torch
@@ -203,13 +204,17 @@ def _sm120_union(
     sink_rows: int,
     key_bias: torch.Tensor | None,
     mapped_neighbor_intervals: torch.Tensor | None,
+    telemetry: dict | None = None,
 ) -> torch.Tensor:
     """Execute one SM120 sparse attention union with optional bias + mapped metadata."""
     from .provenance import verify_source
     from ._vendor.sol_attn import interface
     from ._vendor.sol_attn.preprocess import prepare
 
+    verify_started = time.perf_counter()
     verify_source()
+    if telemetry is not None:
+        telemetry["source_verify_s"] = telemetry.get("source_verify_s", 0.0) + (time.perf_counter() - verify_started)
     qb = q.unsqueeze(0)
     kb = k.unsqueeze(0)
     vb = v.unsqueeze(0)
@@ -242,6 +247,7 @@ def _sm120_union(
     batch, q_rows, heads, _ = qb.shape
     kv_rows = kb.shape[1]
     with torch.cuda.device(q.device):
+        prepare_started = time.perf_counter()
         kc, vc, threshold = prepare(
             qb,
             kb,
@@ -252,6 +258,8 @@ def _sm120_union(
             valid_tokens=q_rows,
             valid_kv_tokens=kv_rows,
         )
+        if telemetry is not None:
+            telemetry["prepare_jit_host_wall_s"] = telemetry.get("prepare_jit_host_wall_s", 0.0) + (time.perf_counter() - prepare_started)
         output = torch.empty_like(qb)
         lse = torch.empty((batch, q_rows, heads), device=q.device, dtype=torch.float32)
         stream = interface._stream(q.device)
@@ -272,11 +280,19 @@ def _sm120_union(
             key_bias is not None,
             mapped_neighbor_intervals is not None,
         )
+        if telemetry is not None:
+            telemetry["compiler_key"] = repr(key)
         compiled = interface._compiled.get(key)
+        if telemetry is not None:
+            telemetry["compile_cache_initial_hit"] = compiled is not None
         if compiled is None:
+            lock_started = time.perf_counter()
             with interface._compile_lock:
+                if telemetry is not None:
+                    telemetry["compile_lock_wait_s"] = telemetry.get("compile_lock_wait_s", 0.0) + (time.perf_counter() - lock_started)
                 compiled = interface._compiled.get(key)
                 if compiled is None:
+                    compile_started = time.perf_counter()
                     compiled, args = interface._compile_sm120(
                         key,
                         tensors,
@@ -287,11 +303,21 @@ def _sm120_union(
                         key_bias is not None,
                         mapped_neighbor_intervals is not None,
                     )
+                    if telemetry is not None:
+                        telemetry["compile_body_s"] = telemetry.get("compile_body_s", 0.0) + (time.perf_counter() - compile_started)
+                        telemetry["compile_miss"] = True
                 else:
                     args = interface._to_cute_tensors(tensors)
+                    if telemetry is not None:
+                        telemetry["compile_race_hit"] = True
         else:
             args = interface._to_cute_tensors(tensors)
+            if telemetry is not None:
+                telemetry["compile_hit"] = True
+        dispatch_started = time.perf_counter()
         compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
+        if telemetry is not None:
+            telemetry["dispatch_host_enqueue_s"] = telemetry.get("dispatch_host_enqueue_s", 0.0) + (time.perf_counter() - dispatch_started)
     return output[0]
 
 
@@ -502,6 +528,9 @@ def partitioned_request_attention(
         calibration_identity,
     )
     if layout_key not in verified:
+        from .sparse import _accumulate_attribution
+        gate_started = time.perf_counter()
+        gate_telemetry = {}
         got = _sm120_union(
             q,
             k,
@@ -511,12 +540,15 @@ def partitioned_request_attention(
             sink_rows=int(k.shape[0]),
             key_bias=key_bias,
             mapped_neighbor_intervals=mapped,
+            telemetry=gate_telemetry,
         )
         want = _weighted_dense(q, k, v, key_bias, scale=scale)
         gate = error_metrics(
             got.transpose(0, 1).unsqueeze(0),
             want.transpose(0, 1).unsqueeze(0),
         )
+        gate_wall_s = time.perf_counter() - gate_started
+        _accumulate_attribution(state, "partitioned_arithmetic_gate", gate_telemetry, gate_wall_s)
         if not arithmetic_gate_passes(gate):
             raise RuntimeError(f"partitioned Sol all-selected arithmetic gate failed: {gate}")
         verified.add(layout_key)
@@ -528,10 +560,15 @@ def partitioned_request_attention(
                 "kv_shape": [1, k.shape[1], k.shape[0], k.shape[2]],
                 "mapped_neighbor_abi": mapped is not None,
                 "key_measure_bias": key_bias is not None,
+                "gate_wall_s": gate_wall_s,
+                "attribution": dict(gate_telemetry),
                 **gate,
             }
         )
 
+    from .sparse import _accumulate_attribution
+    production_telemetry = {}
+    production_started = time.perf_counter()
     result = _sm120_union(
         q,
         k,
@@ -541,6 +578,11 @@ def partitioned_request_attention(
         sink_rows=exact_end,
         key_bias=key_bias,
         mapped_neighbor_intervals=mapped,
+        telemetry=production_telemetry,
+    )
+    _accumulate_attribution(
+        state, "partitioned_production_sparse", production_telemetry,
+        time.perf_counter() - production_started,
     )
     state.partitioned_sparse_calls = getattr(state, "partitioned_sparse_calls", 0) + 1
     state.partitioned_requested_q_rows = getattr(state, "partitioned_requested_q_rows", 0) + int(q.shape[0])
