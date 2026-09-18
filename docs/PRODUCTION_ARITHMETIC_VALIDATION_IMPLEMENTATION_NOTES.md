@@ -12,9 +12,9 @@ production-development PRs:
 
 | Component | Preserved PR head | Implementation stack |
 | --- | --- | --- |
-| Flow | #49 `85b953c2cdf8304dbb7da283a9131a3722ff5386` | #51 / `mirror/arithmetic-validation-flow-20260918` |
-| Sol-H3 | #15 `93b3e03f2b7b579aaf55fa0f87f55083b259e25c` | #18 / `mirror/arithmetic-validation-runtime-20260918` |
-| VDN-H3-Plus | #19 `1bc9f9cd0f685a28f84664b50951df8241501249` | #22 / `mirror/arithmetic-validation-vdn-20260918` |
+| Flow | #49 `85b953c2cdf8304dbb7da283a9131a3722ff5386` | #51 / `mirror/arithmetic-validation-flow-20260918`; performance-contract checkpoint `fcdd7b300c2f08d3020d64d72caf0bc961776499` |
+| Sol-H3 | #15 `93b3e03f2b7b579aaf55fa0f87f55083b259e25c` | #18 / `mirror/arithmetic-validation-runtime-20260918`; replay/CUDA checkpoint `8b1343241c910f07c90b22c9f1bf1a2512169033` |
+| VDN-H3-Plus | #19 `1bc9f9cd0f685a28f84664b50951df8241501249` | #22 / `mirror/arithmetic-validation-vdn-20260918`; component-attribution checkpoint `7547f0959754a32deb0feadd11f400dbb3b315e0` |
 
 Continuum Plus #23/#24 and VDN-H3-Plus #8 are outside this patch scope and are
 not modified by these implementation stacks.
@@ -101,10 +101,12 @@ Sol call. This records host-side cache hit/miss/race, compile-lock wait,
 compile-body time, preprocessing/JIT-inclusive wall time, and compiled dispatch
 enqueue wall time without introducing a second executable cache.
 
-The resulting implementation passed the full Sol CPU-contract matrix at
-checkpoint `51f590b476b344e25138bd99376ee3c8912ac785`. Later CUDA-diagnostic
-changes retain the same vendored-source boundary and must pass the same matrix
-before hardware use.
+The compiler-attribution implementation first passed the full Sol CPU-contract
+matrix at checkpoint `51f590b476b344e25138bd99376ee3c8912ac785`.
+The later replay/CUDA stack at
+`8b1343241c910f07c90b22c9f1bf1a2512169033` also passed the complete
+CPU-contract workflow in run `35345097286`, including native interop and
+Windows provenance. The reviewed vendored Sana Sol-Attn source remains unchanged.
 
 ## CUDA diagnostics
 
@@ -131,15 +133,54 @@ spans for:
 - error reductions.
 
 Production samples record the complete sparse production call plus preprocessing
-and compiled dispatch. Event resolution and its synchronization wall time are
-recorded once at Request teardown. CUDA-event spans that include host-side
-compiler delay can contain device idle time and are not claimed to be exclusive
-kernel occupancy.
+and compiled dispatch. Pending CUDA events are drained at the existing H3
+model-evaluation boundary, with a final no-op-compatible drain at Request
+teardown. Diagnostic synchronization wall time is reported separately. CUDA-event
+spans that include host-side compiler delay can contain device idle time and are
+not claimed to be exclusive kernel occupancy.
 
 `tools/check_arithmetic_validation_diagnostics.py` validates a saved ComfyUI
 log and fails closed if the diagnostic receipt is missing, unresolved, exceeds
 its bound, lacks required gate/production spans, or violates a requested
 compiler-hit/miss condition.
+
+### Bounded same-input replay
+
+The decisive same-input replay is separately opt-in:
+
+```bash
+SOL_H3_CUDA_DIAGNOSTICS=1 SOL_H3_REPLAY_DIAGNOSTICS=1 python main.py
+```
+
+For at most one ordinary low contract, one ordinary continuation-high contract,
+and one mapped partitioned suffix contract per Request, Sol-H3 clones Q/K/V
+after preprocessing/gathering while preserving the compiler-relevant tensor
+shape/stride geometry. Shared Q/K/V storage is cloned as one replacement storage
+where applicable. Bias and mapped-descriptor inputs are cloned as well.
+
+Each captured contract runs exactly three diagnostic-only arms:
+
+1. fresh arithmetic-proof state at the first observed executable state;
+2. a second fresh arithmetic-proof state with the executable cache retained;
+3. the same proof state as arm 2, proving retained proof reuse without a third
+   arithmetic gate.
+
+Replay calls the Sol arithmetic operator directly and discards every replay
+output. It does not re-enter the transformer, Flow provider, VDN runtime,
+Spectrum history, or BSA path, and it restores Python/CPU/CUDA RNG state.
+Replay snapshots are not retained by the Request after the replay call returns.
+The diagnostic can warm the executable cache and therefore must not be used as a
+production timing arm; its host wall remains explicit in the Request summary.
+
+A true first-executable claim is evidence-driven rather than assumed. When a
+fresh-process campaign is intended to begin from an executable miss, validate it
+with `--require-replay-cold-miss`. If the first replay arm reports no compile
+miss, the executable was already primed and that run is not relabeled as cold.
+
+Stage C key narrowing is deliberately still blocked. Same-input replay does not
+prove map-value independence; physical map/group identity remains in the
+partitioned arithmetic key until a separate descriptor-mutation proof establishes
+the required quotient safely.
 
 ## Cross-repository attribution
 
@@ -151,11 +192,17 @@ accumulators to the VDN path.
 
 VDN #22 records host-side ranges for partitioned API-4 preprocessing, gather,
 partitioned softmax, weight residency, softmax epilogue, variable-grid linear
-features/statistics/scans/state gather/output, and final projection. The
-recorder is optional and duck-typed; ordinary released VDN execution is
-unchanged. These intervals are host wall/enqueue measurements and can overlap.
-They are not CUDA-kernel timings and must not be summed as exclusive device
-occupancy.
+features/statistics/scans/output-gate/state-gather/output, the fixed-epsilon
+scalar extraction, and final projection. The fixed-epsilon `.item()` is
+measured explicitly because on CUDA it can expose a synchronization cost that
+was previously hidden outside the linear-output timer. The recorder is optional
+and duck-typed; ordinary released VDN execution is unchanged.
+
+When Sol CUDA diagnostics are enabled, VDN also contributes bounded CUDA-event
+spans for those partitioned components through the same Request-owned recorder.
+These spans identify nesting and device intervals; they are not additive
+exclusive occupancy. Host wall ranges can overlap asynchronous device work and
+likewise must not be summed as exclusive time.
 
 No VDN batching or heterogeneous-algorithm rewrite is included. The design
 requires the primed attribution result to select the largest avoidable component
@@ -183,11 +230,17 @@ That primed run must use a fresh Sol Request rather than ComfyUI graph-output
 reuse. Finally run a supported numerical-invalidation and geometry/bias mutation
 case and require revalidation of the changed contract.
 
-For CUDA-attribution arms, start ComfyUI from its root with diagnostics enabled,
-for example:
+For ordinary CUDA-attribution arms, start ComfyUI from its root with diagnostics
+enabled:
 
 ```bash
 SOL_H3_CUDA_DIAGNOSTICS=1 python main.py
+```
+
+For the bounded same-input diagnostic arm, enable replay as well:
+
+```bash
+SOL_H3_CUDA_DIAGNOSTICS=1 SOL_H3_REPLAY_DIAGNOSTICS=1 python main.py
 ```
 
 Save the complete process log and Flow metrics for every run. Validate a cold
@@ -212,6 +265,33 @@ Use the explicit `--request-index` option when a saved process log contains
 multiple Sol Request summaries. A compile miss in the primed arm is evidence of
 a new executable key and must be investigated rather than relabeled as
 validation overhead.
+
+Validate the same-input replay targets independently. A fresh-process diagnostic
+that is expected to demonstrate first executable compilation can use:
+
+```bash
+python custom_nodes/ComfyUI-Sol-H3/tools/check_arithmetic_validation_diagnostics.py \
+  --log /path/to/replay-comfy.log \
+  --require-replay-target ordinary_low \
+  --require-replay-target ordinary_continuation_high \
+  --require-replay-target partitioned_suffix \
+  --require-replay-cold-miss
+```
+
+For a partitioned performance-attribution run, require Flow correlation, complete
+low/probe/high accounting, VDN host-component receipts, and correlated VDN CUDA
+samples:
+
+```bash
+python custom_nodes/MiniMax-H3-Flow-Aligned-Regenerate/tools/check_partitioned_runtime_evidence.py \
+  --metrics /path/to/partitioned-metrics.json \
+  --log /path/to/partitioned-comfy.log \
+  --expected-logical 9 --expected-actual 7 --expected-forecast 2 \
+  --require-performance-accounting
+```
+
+The 9/7/2 values describe the latest partitioned chunk in the frozen benchmark;
+whole-run 18/14/4 accounting remains a separate acceptance check.
 
 Use at least three interleaved paired repetitions of the primed fixed-partitioned
 and matched full-target control when deciding performance. Record sampler/E2E and
