@@ -2,7 +2,6 @@ import random
 
 import torch
 
-from sol_h3.diagnostics import CudaDiagnosticState
 from sol_h3.replay_diagnostics import (
     ARMS,
     ReplayDiagnosticState,
@@ -38,9 +37,6 @@ def _key():
 
 def test_replay_uses_fresh_then_fresh_then_retained_validation():
     state = ReplayDiagnosticState(enabled=True)
-    diagnostics = CudaDiagnosticState(enabled=True, event_factory=None)
-    diagnostics.enabled = True
-
     class NoCudaDiagnostics:
         enabled = True
 
