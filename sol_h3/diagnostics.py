@@ -49,6 +49,8 @@ class CudaDiagnosticState:
         self._kind_counts = Counter()
         self._overflow = Counter()
         self._resolved = []
+        self._resolved_count = 0
+        self._drain_count = 0
         self._resolve_sync_wall_s = 0.0
         self._resolution_error = None
 
@@ -122,18 +124,25 @@ class CudaDiagnosticState:
             end.record()
             sample["spans"].append((str(name), start, end))
 
-    def resolve(self):
-        """Resolve all pending events once at request teardown.
+    def drain_pending(self):
+        """Resolve pending events at an existing model-evaluation/stage boundary.
 
         A diagnostic failure is retained in telemetry instead of changing model
         output or masking the sampling exception.
         """
-        if not self.enabled or self._resolved or not self._samples:
+        if not self.enabled:
             return
+        with self._lock:
+            start_index = self._resolved_count
+            pending = list(self._samples[start_index:])
+            self._resolved_count = len(self._samples)
+        if not pending:
+            return
+        self._drain_count += 1
         try:
             devices = []
             seen = set()
-            for sample in self._samples:
+            for sample in pending:
                 key = str(sample["device"])
                 if key not in seen:
                     seen.add(key)
@@ -141,15 +150,14 @@ class CudaDiagnosticState:
             started = time.perf_counter()
             for device in devices:
                 self._sync(device)
-            self._resolve_sync_wall_s = time.perf_counter() - started
+            self._resolve_sync_wall_s += time.perf_counter() - started
 
-            resolved = []
-            for sample in self._samples:
+            for sample in pending:
                 spans = {}
                 for name, start, end in sample["spans"]:
                     elapsed = float(start.elapsed_time(end))
                     spans[name] = float(spans.get(name, 0.0)) + elapsed
-                resolved.append({
+                self._resolved.append({
                     "kind": sample["kind"],
                     "ordinal": sample["ordinal"],
                     "device": sample["device_name"],
@@ -159,9 +167,12 @@ class CudaDiagnosticState:
                     ],
                     "cuda_event_ms": spans,
                 })
-            self._resolved = resolved
         except BaseException as exc:
             self._resolution_error = f"{type(exc).__name__}: {exc}"
+
+    def resolve(self):
+        """Compatibility alias used by the outer request teardown."""
+        self.drain_pending()
 
     def summary(self):
         details = self._resolved if self._resolved else []
@@ -172,6 +183,7 @@ class CudaDiagnosticState:
             "resolved_samples": len(details),
             "observed_calls": dict(self._kind_counts),
             "overflow": dict(self._overflow),
+            "drain_count": self._drain_count,
             "resolve_sync_wall_s": self._resolve_sync_wall_s,
             "resolution_error": self._resolution_error,
             "details": list(details),

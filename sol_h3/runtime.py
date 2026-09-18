@@ -26,6 +26,7 @@ from .interop import (
 log = logging.getLogger("comfy.sol_h3")
 _REQUEST = ContextVar("sol_h3_request", default=None)
 _FORWARD = ContextVar("sol_h3_forward", default=None)
+CUDA_DIAGNOSTICS_KEY = "sol_h3_cuda_diagnostics_v1"
 
 
 @dataclass
@@ -152,6 +153,8 @@ class DiffusionWrapper:
         state = _REQUEST.get()
         if state is None or state.config != self.config:
             raise RuntimeError("Sol-H3 must execute inside its native OUTER_SAMPLE lifecycle")
+        if state.cuda_diagnostics.enabled:
+            options[CUDA_DIAGNOSTICS_KEY] = state.cuda_diagnostics
         model = executor.class_obj
         seen = set()
         routes = []
@@ -166,6 +169,9 @@ class DiffusionWrapper:
             return result
         finally:
             _FORWARD.reset(token)
+            # Diagnostic mode is allowed to synchronize only at this existing
+            # H3 model-evaluation boundary. Production mode is a no-op.
+            state.cuda_diagnostics.drain_pending()
 
 
 def _shape_reason(q, k, v, heads, mask, kw, *, rectangular=False):
