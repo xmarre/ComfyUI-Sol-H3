@@ -472,25 +472,27 @@ class BlockPatch:
                             raise RuntimeError("weighted dense prefix returned an invalid output shape")
                         return out.transpose(1, 2)
 
-                    from .sparse import attention, KernelUnavailable
+                    from .sparse import attention, KernelUnavailable, validation_scope
                     try:
-                        result = attention(
-                            q, k, v, prefix, config, state,
-                            dense_attention=weighted_prefix_dense,
-                            key_bias=measure_plan.key_log_measure,
-                            exact_k_blocks=measure_plan.exact_k_block_range,
-                            calibration_identity=measure_plan.semantic_digest,
-                            validation_bias_identity=weighted_measure.arithmetic_bias_identity(
-                                generic_measure_contract, measure_plan
-                            ),
-                            validation_context=_validation_context(
+                        with validation_scope(
+                            _validation_context(
                                 current_options,
                                 evaluation,
                                 self.index,
                                 owner_generation=measure_plan.owner_generation,
                                 route="ordinary_weighted",
-                            ),
-                        )
+                            )
+                        ):
+                            result = attention(
+                                q, k, v, prefix, config, state,
+                                dense_attention=weighted_prefix_dense,
+                                key_bias=measure_plan.key_log_measure,
+                                exact_k_blocks=measure_plan.exact_k_block_range,
+                                calibration_identity=measure_plan.semantic_digest,
+                                validation_bias_identity=weighted_measure.arithmetic_bias_identity(
+                                    generic_measure_contract, measure_plan
+                                ),
+                            )
                     except KernelUnavailable as exc:
                         dense_plan = weighted_measure.prepare(
                             state, current_options, generic_measure_contract, **bind_kwargs,
@@ -543,13 +545,15 @@ class BlockPatch:
 
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(
-                        q, k, v, prefix, config, state,
-                        dense_attention=dense_attention,
-                        validation_context=_validation_context(
+                    with validation_scope(
+                        _validation_context(
                             current_options, evaluation, self.index, route="ordinary"
-                        ),
-                    )
+                        )
+                    ):
+                        result = attention(
+                            q, k, v, prefix, config, state,
+                            dense_attention=dense_attention,
+                        )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     dense_provider = previous
@@ -602,13 +606,15 @@ class BlockPatch:
                     return native()
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(
-                        qc, kc, vc, sink_rows, config, state,
-                        recompute_prefix_queries=False,
-                        validation_context=_validation_context(
+                    with validation_scope(
+                        _validation_context(
                             options, evaluation, self.index, route="vdn_legacy_local"
-                        ),
-                    )
+                        )
+                    ):
+                        result = attention(
+                            qc, kc, vc, sink_rows, config, state,
+                            recompute_prefix_queries=False,
+                        )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
@@ -721,15 +727,17 @@ class BlockPatch:
 
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(
-                        qc, kc, vc, sink_rows, config, state,
-                        recompute_prefix_queries=False,
-                        mapped_neighbor_intervals=mapped_tensor,
-                        mapped_calibration_identity=descriptor.descriptor_digest,
-                        validation_context=_validation_context(
+                    with validation_scope(
+                        _validation_context(
                             options, evaluation, self.index, route="vdn_mapped_v4"
-                        ),
-                    )
+                        )
+                    ):
+                        result = attention(
+                            qc, kc, vc, sink_rows, config, state,
+                            recompute_prefix_queries=False,
+                            mapped_neighbor_intervals=mapped_tensor,
+                            mapped_calibration_identity=descriptor.descriptor_digest,
+                        )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()

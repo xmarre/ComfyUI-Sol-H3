@@ -2,6 +2,8 @@
 import math
 import sys
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +15,16 @@ ARITH_MEAN_ABS_LIMIT = 0.002
 ARITH_REL_L2_LIMIT = 0.005
 ARITH_CATASTROPHIC_MAX_FLOOR = 0.5
 ARITH_CATASTROPHIC_REFERENCE_PEAK_MULTIPLIER = 4.0
+_VALIDATION_CONTEXT = ContextVar("sol_h3_sparse_validation_context", default=None)
+
+
+@contextmanager
+def validation_scope(context):
+    token = _VALIDATION_CONTEXT.set(None if context is None else dict(context))
+    try:
+        yield
+    finally:
+        _VALIDATION_CONTEXT.reset(token)
 
 
 class KernelUnavailable(RuntimeError):
@@ -202,6 +214,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
               calibration_identity=None, mapped_neighbor_intervals=None,
               mapped_calibration_identity=None, validation_bias_identity=None,
               validation_context=None):
+    if validation_context is None:
+        validation_context = _VALIDATION_CONTEXT.get()
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
             or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
             or q.shape[0] != 1 or q.shape[-1] != 128
