@@ -5,17 +5,20 @@ import torch
 
 from sol_h3.keyless_real_h3_replay import (
     ENVELOPE,
+    V2_ENVELOPE,
     apply_split_half_rope_fp32_from_normalized,
     apply_split_half_rope_from_normalized,
     block_summary_oracle,
     checkpoint_tensor_names,
     identity_split_half_rope_like,
     metric_within_limit,
+    scale_aware_metric_within_limit,
     public_rms_norm,
     replay_requires_process_failure,
     split_projection,
     tensor_metrics,
     tensor_scale_diagnostics,
+    v2_envelope_dict,
     value_sum_within_limit,
 )
 
@@ -30,6 +33,68 @@ def test_frozen_replay_envelope_values():
     assert ENVELOPE.k2_output.max_abs == 0.02
     assert ENVELOPE.k1_value_max_abs == 0.0
 
+
+
+
+def test_frozen_v2_replay_envelope_values_and_provenance():
+    assert V2_ENVELOPE.contract == "sol-h3-keyless-real-h3-replay-envelope-v2"
+    assert V2_ENVELOPE.calibration_contract == "sol-h3-keyless-v2-calibration-v1"
+    assert V2_ENVELOPE.calibration_sha256 == (
+        "6cb5996e98613563947804d22c9a59cf11e8df58f1da4e566f3141709218531d"
+    )
+    assert V2_ENVELOPE.calibration_case_count == 36
+    assert V2_ENVELOPE.aggregate_margin_multiplier == 2.0
+    assert V2_ENVELOPE.k1_route_centroid.rel_l2 == 0.0002579810388851911
+    assert (
+        V2_ENVELOPE.k1_route_centroid.max_abs_over_want_abs_max
+        == 0.007518796992481203
+    )
+    assert (
+        V2_ENVELOPE.k1_route_centroid.mean_abs_over_want_mean_abs
+        == 6.181015165732724e-06
+    )
+    assert V2_ENVELOPE.k1_route_centroid.worst_bf16_ulps == 1.0
+    assert V2_ENVELOPE.k2_output.rel_l2 == 0.002869961317628622
+    assert V2_ENVELOPE.k2_output.max_abs_over_want_abs_max == 0.012121212121212121
+    assert V2_ENVELOPE.k2_output.mean_abs_over_want_mean_abs == 0.0009517048283547036
+    assert V2_ENVELOPE.k2_output.worst_bf16_ulps == 1.0
+    assert V2_ENVELOPE.k1_value_max_abs == 0.0
+    assert v2_envelope_dict()["contract"] == V2_ENVELOPE.contract
+
+
+def test_scale_aware_v2_gate_is_inclusive_and_keeps_one_ulp_invariant():
+    limit = V2_ENVELOPE.k2_output
+    metrics = {
+        "finite": True,
+        "rel_l2": limit.rel_l2,
+        "mean_abs": 999.0,
+        "max_abs": 999.0,
+    }
+    scale = {
+        "finite": True,
+        "max_abs_over_want_abs_max": limit.max_abs_over_want_abs_max,
+        "mean_abs_over_want_mean_abs": limit.mean_abs_over_want_mean_abs,
+        "worst": {"abs_error_in_want_bf16_ulps": limit.worst_bf16_ulps},
+    }
+    assert scale_aware_metric_within_limit(metrics, scale, limit)
+    assert not scale_aware_metric_within_limit(
+        metrics,
+        {
+            **scale,
+            "worst": {"abs_error_in_want_bf16_ulps": 2.0},
+        },
+        limit,
+    )
+    assert not scale_aware_metric_within_limit(
+        {**metrics, "rel_l2": limit.rel_l2 + 1e-12},
+        scale,
+        limit,
+    )
+    assert not scale_aware_metric_within_limit(
+        metrics,
+        {**scale, "max_abs_over_want_abs_max": None},
+        limit,
+    )
 
 def test_metric_gate_is_inclusive_and_fails_nonfinite():
     limit = ENVELOPE.k2_output
