@@ -438,9 +438,25 @@ def prepare(
 
 
 def arithmetic_bias_identity(request, plan):
-    """Return an exact host identity for the FP32 bias without synchronizing CUDA."""
-    core = _core()
-    normalized = core.normalize(request)
+    """Return a host-only exact FP32-bias identity when the core contract is available.
+
+    A caller that cannot prove the canonical request receives a volatile identity.
+    That keeps execution compatible while forcing conservative revalidation rather
+    than reusing a proof under an underspecified bias.
+    """
+    core = _core(required=False)
+    if core is None:
+        return {
+            "unrepresentable_bias_identity": True,
+            "volatile_generation": uuid.uuid4().hex,
+        }
+    try:
+        normalized = core.normalize(request)
+    except (TypeError, ValueError, KeyError):
+        return {
+            "unrepresentable_bias_identity": True,
+            "volatile_generation": uuid.uuid4().hex,
+        }
 
     def fp32_hex(value):
         rounded = struct.unpack(">f", struct.pack(">f", float(value)))[0]

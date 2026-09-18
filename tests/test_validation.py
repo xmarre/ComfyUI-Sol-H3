@@ -129,6 +129,11 @@ def test_partitioned_binding_does_not_change_ordinary_namespace(monkeypatch):
         backend_name = "cute_sm120"
         block_size = 64
 
+    monkeypatch.setattr(
+        validation,
+        "_device_identity",
+        lambda device: {"type": "cpu", "index": None, "process": 1},
+    )
     lease.bind_kernel(Kernel(), torch.device("cpu"))
     ordinary = lease.compiler_namespace_for("ordinary_unweighted_v1")
     assert ordinary == ("ordinary",)

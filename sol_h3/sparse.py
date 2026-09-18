@@ -307,6 +307,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             metrics=metrics, telemetry=gate_telemetry,
         )
         state.validation_state.publish_success(ticket, metrics)
+        # Compatibility telemetry only. Routing decisions use validation_state.
+        state.sparse_verified.add(ticket.digest)
         if len(state.gates) < 32:
             state.gates.append({
                 "shape": list(q.shape),

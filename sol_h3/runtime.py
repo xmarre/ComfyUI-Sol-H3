@@ -820,3 +820,6 @@ def invalidate_arithmetic_validation(reason="numerical_transition"):
     if not isinstance(reason, str) or not reason:
         raise ValueError("arithmetic validation invalidation reason must be a nonempty string")
     state.validation_state.invalidate(reason)
+    state.sparse_verified.clear()
+    if hasattr(state, "partitioned_sparse_verified"):
+        state.partitioned_sparse_verified.clear()
