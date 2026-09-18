@@ -3,3 +3,4 @@ sol_h3/_vendor/** text eol=lf
 sol_h3/sol_manifest.json text eol=lf
 tools/rectangular_sm120.patch text eol=lf
 tools/mapped_neighbor_sm120.patch text eol=lf
+tools/validation_telemetry_sm120.patch text eol=lf
