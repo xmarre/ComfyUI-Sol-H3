@@ -104,11 +104,11 @@ def test_route_trace_metrics_reports_one_valid_bit_difference():
     want = torch.zeros_like(got)
     got[0, 0, 0, 0, 1] = 1  # physical block 32
 
-    metrics = route_trace_metrics(got, want, kv_rows=64)
+    metrics = route_trace_metrics(got, want, kv_rows=2049)
     assert metrics["equal"] is False
     assert metrics["differing_bits"] == 1
-    assert metrics["total_routing_bits"] == 64
-    assert metrics["differing_bit_fraction"] == pytest.approx(1 / 64)
+    assert metrics["total_routing_bits"] == 33
+    assert metrics["differing_bit_fraction"] == pytest.approx(1 / 33)
     assert metrics["candidate_exact_bits"] == 1
     assert metrics["reference_exact_bits"] == 0
 
