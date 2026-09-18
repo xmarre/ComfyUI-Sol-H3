@@ -457,6 +457,9 @@ class BlockPatch:
                             key_bias=measure_plan.key_log_measure,
                             exact_k_blocks=measure_plan.exact_k_block_range,
                             calibration_identity=measure_plan.semantic_digest,
+                            validation_bias_identity=weighted_measure.arithmetic_bias_identity(
+                                generic_measure_contract, measure_plan
+                            ),
                         )
                     except KernelUnavailable as exc:
                         dense_plan = weighted_measure.prepare(
@@ -805,3 +808,15 @@ def install(model, config):
             )
     log.info("Sol-H3 active: %s; AdaLN precompute=%s", config.metadata(), adaln_status(inner))
     return cloned
+
+
+def invalidate_arithmetic_validation(reason="numerical_transition"):
+    """Invalidate successful arithmetic proofs for the active OUTER_SAMPLE request."""
+    state = _REQUEST.get()
+    if state is None:
+        raise RuntimeError(
+            "Sol-H3 arithmetic validation invalidation requires an active OUTER_SAMPLE request"
+        )
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("arithmetic validation invalidation reason must be a nonempty string")
+    state.validation_state.invalidate(reason)

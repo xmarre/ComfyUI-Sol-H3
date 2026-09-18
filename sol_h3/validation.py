@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import platform
+import struct
 import threading
 import time
 
@@ -71,14 +72,19 @@ class RuntimeLease:
     source_verify_s: float = 0.0
     manifest_digest: str | None = None
     source_generation: str | None = None
-    device_identity: dict | None = None
-    runtime_identity: tuple | None = None
-    compiler_namespace: tuple | None = None
     implementation_generation: str | None = None
+    device_identity: dict | None = None
+    ordinary_runtime_identity: tuple | None = None
+    partitioned_runtime_identity: tuple | None = None
+    ordinary_compiler_namespace: tuple | None = None
+    partitioned_compiler_namespace: tuple | None = None
+    compiler_environment: dict = field(default_factory=dict)
     _lock: object = field(default_factory=threading.Lock, repr=False)
 
     def ensure_source_verified(self, device):
         """Verify packaged bytes once, then bind the request to one device context."""
+        import torch
+
         identity = _device_identity(device)
         with self._lock:
             if self.device_identity is None:
@@ -93,15 +99,25 @@ class RuntimeLease:
             manifest = verify_source()
             elapsed = time.perf_counter() - started
             manifest_digest = _digest(manifest)
-            generation = _digest({
+            source_generation = _digest({
                 "source": SOURCE,
                 "revision": REVISION,
                 "contract": CONTRACT,
                 "manifest": manifest_digest,
             })
             self.manifest_digest = manifest_digest
-            self.source_generation = generation
-            self.implementation_generation = generation
+            self.source_generation = source_generation
+            self.implementation_generation = _digest({
+                "source_generation": source_generation,
+                "validation_abi": KEY_ABI,
+                "lifetime_abi": "request_runtime_lease_v1",
+            })
+            self.compiler_environment = {
+                "python": platform.python_version(),
+                "platform": platform.system(),
+                "torch": str(torch.__version__),
+                "torch_cuda": str(torch.version.cuda),
+            }
             self.source_verify_s += elapsed
             self.source_verify_count += 1
             self.source_verified = True
@@ -115,41 +131,56 @@ class RuntimeLease:
             getattr(kernel, "backend_name", None),
             getattr(kernel, "block_size", None),
         )
-        namespace = ("ordinary", id(kernel))
+        namespace = getattr(kernel, "compiler_namespace", ("test_substitute", id(kernel)))
         with self._lock:
-            if self.runtime_identity is None:
-                self.runtime_identity = identity
-                self.compiler_namespace = namespace
-            elif self.runtime_identity != identity:
-                raise RuntimeError("Sol-H3 loaded kernel identity changed within one request")
+            if self.ordinary_runtime_identity is None:
+                self.ordinary_runtime_identity = identity
+                self.ordinary_compiler_namespace = tuple(namespace)
+            elif self.ordinary_runtime_identity != identity:
+                raise RuntimeError("Sol-H3 loaded ordinary kernel identity changed within one request")
 
     def bind_partitioned(self, interface, device):
         self.ensure_source_verified(device)
+        from .compiler_attribution import compiler_namespace, install_hooks
+
+        install_hooks(interface)
+        original_compile = getattr(
+            interface, "_sol_h3_original_compile_sm120", interface._compile_sm120
+        )
         identity = (
             "partitioned",
             getattr(interface, "__file__", None),
             id(interface),
-            id(interface._compile_sm120),
+            id(original_compile),
             getattr(interface, "MAPPED_NEIGHBOR_CONTRACT", None),
         )
-        namespace = ("partitioned", id(interface._compiled), id(interface._compile_sm120))
+        namespace = compiler_namespace(interface)
         with self._lock:
-            if self.runtime_identity is None:
-                self.runtime_identity = identity
-                self.compiler_namespace = namespace
-            elif self.runtime_identity != identity:
-                # Ordinary and partitioned execution may coexist in one request.
-                # Bind a union identity rather than replacing either owner.
-                current = self.runtime_identity
-                if not (isinstance(current, tuple) and current[:1] == ("union",)):
-                    current = ("union", current)
-                if identity not in current[1:]:
-                    current = current + (identity,)
-                self.runtime_identity = current
-                if not (isinstance(self.compiler_namespace, tuple) and self.compiler_namespace[:1] == ("union",)):
-                    self.compiler_namespace = ("union", self.compiler_namespace)
-                if namespace not in self.compiler_namespace[1:]:
-                    self.compiler_namespace = self.compiler_namespace + (namespace,)
+            if self.partitioned_runtime_identity is None:
+                self.partitioned_runtime_identity = identity
+                self.partitioned_compiler_namespace = tuple(namespace)
+            elif self.partitioned_runtime_identity != identity:
+                raise RuntimeError("Sol-H3 loaded partitioned kernel identity changed within one request")
+
+    def runtime_identity_for(self, mode):
+        value = (
+            self.partitioned_runtime_identity
+            if mode.startswith("partitioned_")
+            else self.ordinary_runtime_identity
+        )
+        if value is None:
+            raise RuntimeError("Sol-H3 arithmetic key requested before runtime identity binding")
+        return value
+
+    def compiler_namespace_for(self, mode):
+        value = (
+            self.partitioned_compiler_namespace
+            if mode.startswith("partitioned_")
+            else self.ordinary_compiler_namespace
+        )
+        if value is None:
+            raise RuntimeError("Sol-H3 arithmetic key requested before compiler namespace binding")
+        return value
 
     def summary(self):
         return {
@@ -161,12 +192,11 @@ class RuntimeLease:
             "source_generation": self.source_generation,
             "implementation_generation": self.implementation_generation,
             "device_identity": self.device_identity,
-            "runtime_identity": repr(self.runtime_identity),
-            "compiler_namespace": repr(self.compiler_namespace),
-            "environment": {
-                "python": platform.python_version(),
-                "platform": platform.system(),
-            },
+            "ordinary_runtime_identity": repr(self.ordinary_runtime_identity),
+            "partitioned_runtime_identity": repr(self.partitioned_runtime_identity),
+            "ordinary_compiler_namespace": repr(self.ordinary_compiler_namespace),
+            "partitioned_compiler_namespace": repr(self.partitioned_compiler_namespace),
+            "compiler_environment": dict(self.compiler_environment),
         }
 
 
@@ -224,7 +254,11 @@ class ArithmeticValidationState:
         if not same_mode:
             return "new_geometry"
         for old in same_mode:
-            if old.get("source_generation") != key.get("source_generation") or old.get("compiler_namespace") != key.get("compiler_namespace"):
+            if (
+                old.get("source_generation") != key.get("source_generation")
+                or old.get("runtime_identity") != key.get("runtime_identity")
+                or old.get("compiler_namespace") != key.get("compiler_namespace")
+            ):
                 return "new_runtime"
         for old in same_mode:
             if old.get("validation_generation") != key.get("validation_generation"):
@@ -240,15 +274,17 @@ class ArithmeticValidationState:
         try:
             payload = _canonical_bytes(key)
         except (TypeError, ValueError):
-            self.stats["misses"] += 1
-            self.stats["attempts"] += 1
-            self.miss_reasons["unrepresentable_identity"] += 1
+            with self._lock:
+                self.stats["misses"] += 1
+                self.stats["attempts"] += 1
+                self.miss_reasons["unrepresentable_identity"] += 1
             return ValidationTicket("", key, 0, self.generation, True, False)
         digest = hashlib.sha256(payload).hexdigest()
         if len(payload) > self.max_bytes:
-            self.stats["misses"] += 1
-            self.stats["attempts"] += 1
-            self.miss_reasons["unrepresentable_identity"] += 1
+            with self._lock:
+                self.stats["misses"] += 1
+                self.stats["attempts"] += 1
+                self.miss_reasons["unrepresentable_identity"] += 1
             return ValidationTicket(digest, key, len(payload), self.generation, True, False)
 
         owner = threading.get_ident()
@@ -428,7 +464,11 @@ def build_arithmetic_key(
     bias = {
         "enabled": bias_range is not None or bias_identity is not None,
         "range": bias_range,
-        "log_measure": None if bias_log_measure is None else float(bias_log_measure).hex(),
+        "log_measure_fp32": (
+            None
+            if bias_log_measure is None
+            else struct.unpack(">f", struct.pack(">f", float(bias_log_measure)))[0].hex()
+        ),
         "identity": bias_identity,
     }
     return {
@@ -436,7 +476,8 @@ def build_arithmetic_key(
         "mode": mode,
         "source_generation": lease.source_generation,
         "implementation_generation": lease.implementation_generation,
-        "compiler_namespace": repr(lease.compiler_namespace),
+        "runtime_identity": repr(lease.runtime_identity_for(mode)),
+        "compiler_namespace": repr(lease.compiler_namespace_for(mode)),
         "device": lease.device_identity,
         "validation_generation": state.validation_state.generation,
         "config_fingerprint": state.config.metadata()["fingerprint"],

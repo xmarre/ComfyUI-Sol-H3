@@ -1,6 +1,5 @@
 import threading
 
-import pytest
 import torch
 
 from sol_h3.contracts import Config
@@ -13,7 +12,8 @@ def _key(state, *, rows=8, bias=None, physical=None):
     state.runtime_lease.source_verified = True
     state.runtime_lease.source_generation = "source"
     state.runtime_lease.implementation_generation = "impl"
-    state.runtime_lease.compiler_namespace = ("test",)
+    state.runtime_lease.ordinary_runtime_identity = ("test-runtime",)
+    state.runtime_lease.ordinary_compiler_namespace = ("test-compiler",)
     state.runtime_lease.device_identity = {"type": "cpu", "index": None, "process": 1}
     return validation.build_arithmetic_key(
         state=state,
@@ -114,3 +114,21 @@ def test_runtime_lease_verifies_source_once(monkeypatch):
     lease.ensure_source_verified(torch.device("cpu"))
     assert calls == [True]
     assert lease.source_verify_count == 1
+
+
+def test_partitioned_binding_does_not_change_ordinary_namespace(monkeypatch):
+    state = Request(Config(exact=False, backend="sol"))
+    lease = state.runtime_lease
+    lease.source_verified = True
+    lease.source_generation = "source"
+    lease.implementation_generation = "impl"
+    lease.device_identity = {"type": "cpu", "index": None, "process": 1}
+
+    class Kernel:
+        compiler_namespace = ("ordinary",)
+        backend_name = "cute_sm120"
+        block_size = 64
+
+    lease.bind_kernel(Kernel(), torch.device("cpu"))
+    ordinary = lease.compiler_namespace_for("ordinary_unweighted_v1")
+    assert ordinary == ("ordinary",)

@@ -269,3 +269,15 @@ def test_bridge_reports_compiler_attribution_without_changing_fake_kernel_contra
     assert state.runtime_attribution["arithmetic_gate_compile_miss"] == 1
     assert state.runtime_attribution["arithmetic_gate_compile_body_s"] == pytest.approx(0.03)
     assert state.runtime_attribution["production_sparse_calls"] == 1
+
+
+def test_gate_exception_releases_inflight_validation_owner(monkeypatch):
+    def broken(q, k, v, **kw):
+        raise RuntimeError("synthetic gate failure")
+
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: broken)
+    q = torch.ones(1, 1, 3, 128, dtype=torch.bfloat16)
+    state = Request(Config(exact=False, backend="sol"))
+    with pytest.raises(RuntimeError, match="synthetic gate failure"):
+        sparse.attention(q, q, q, 0, state.config, state)
+    assert state.validation_state.summary()["failures"] == 1

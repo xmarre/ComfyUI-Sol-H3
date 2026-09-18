@@ -219,3 +219,10 @@ def test_request_validation_is_request_owned_and_runtime_lease_is_fresh():
     assert a.validation_state is not b.validation_state
     assert a.runtime_lease is not b.runtime_lease
     assert a.runtime_lease.request_id != b.runtime_lease.request_id
+
+
+def test_invalidation_hook_requires_active_sampling_request():
+    from sol_h3.runtime import invalidate_arithmetic_validation
+
+    with pytest.raises(RuntimeError, match="active OUTER_SAMPLE"):
+        invalidate_arithmetic_validation()

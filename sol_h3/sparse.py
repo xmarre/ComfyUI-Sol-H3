@@ -186,7 +186,7 @@ def _kernel_call(kernel, q, k, v, *, telemetry, **kwargs):
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,
               calibration_identity=None, mapped_neighbor_intervals=None,
-              mapped_calibration_identity=None):
+              mapped_calibration_identity=None, validation_bias_identity=None):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
             or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
             or q.shape[0] != 1 or q.shape[-1] != 128
@@ -220,7 +220,11 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         max_blocks = (k.shape[2] + BLOCK_SIZE - 1) // BLOCK_SIZE
         if exact_k_blocks[0] < 0 or exact_k_blocks[1] < exact_k_blocks[0] or exact_k_blocks[1] > max_blocks:
             raise RuntimeError("weighted SOL exact K block interval is out of range")
-    elif not mapped_enabled and (exact_k_blocks is not None or calibration_identity is not None):
+    elif not mapped_enabled and (
+        exact_k_blocks is not None
+        or calibration_identity is not None
+        or validation_bias_identity is not None
+    ):
         raise RuntimeError("weighted SOL routing metadata was supplied without key_bias")
 
     state.runtime_lease.ensure_source_verified(q.device)
@@ -270,7 +274,11 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         mapped_abi=MAPPED_ABI_VERSION if mapped_enabled else None,
         bias_range=bias_range,
         bias_log_measure=bias_log_measure,
-        bias_identity=calibration_identity,
+        bias_identity=(
+            validation_bias_identity
+            if validation_bias_identity is not None
+            else calibration_identity
+        ),
         physical_identity=None,
     )
     ticket = state.validation_state.begin(arithmetic_key)
@@ -278,40 +286,43 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
         gate_telemetry = {}
-        got = _kernel_call(
-            state.kernel, qb, kb, vb, telemetry=gate_telemetry,
-            tau=config.tau, thresh_type="diag", kv_splits=1,
-            sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
-            mapped_neighbor_intervals=mapped_neighbor_intervals,
-        )
-        want = _dense_reference(q, k, v, None, key_bias=key_bias)
-        metrics = error_metrics(got, want)
-        gate_wall_s = time.perf_counter() - gate_started
-        _accumulate_attribution(state, "arithmetic_gate", gate_telemetry, gate_wall_s)
-        if not arithmetic_gate_passes(metrics):
+        try:
+            got = _kernel_call(
+                state.kernel, qb, kb, vb, telemetry=gate_telemetry,
+                tau=config.tau, thresh_type="diag", kv_splits=1,
+                sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
+                mapped_neighbor_intervals=mapped_neighbor_intervals,
+            )
+            want = _dense_reference(q, k, v, None, key_bias=key_bias)
+            metrics = error_metrics(got, want)
+            gate_wall_s = time.perf_counter() - gate_started
+            _accumulate_attribution(state, "arithmetic_gate", gate_telemetry, gate_wall_s)
+            if not arithmetic_gate_passes(metrics):
+                raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
+        except BaseException:
             state.validation_state.publish_failure(ticket)
-            raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
-        state.validation_state.publish_success(ticket, metrics)
+            raise
         state.validation_state.record_gate(
             ticket, mode=mode, gate_wall_s=gate_wall_s,
             metrics=metrics, telemetry=gate_telemetry,
         )
+        state.validation_state.publish_success(ticket, metrics)
         if len(state.gates) < 32:
             state.gates.append({
-            "shape": list(q.shape),
-            "kv_shape": list(k.shape),
-            "backend": getattr(state.kernel, "backend_name", "test_substitute"),
-            "mapped_neighbor_abi": mapped_enabled,
-            "mapped_abi_version": MAPPED_ABI_VERSION,
-            "kernel_loader_s": kernel_loader_s,
-            "gate_wall_s": gate_wall_s,
-            "materialized_qkv_bytes": 0,
-            "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
-            "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
-            "attribution": dict(gate_telemetry),
-            "arithmetic_key_digest": ticket.digest or None,
-            **metrics,
-        })
+                "shape": list(q.shape),
+                "kv_shape": list(k.shape),
+                "backend": getattr(state.kernel, "backend_name", "test_substitute"),
+                "mapped_neighbor_abi": mapped_enabled,
+                "mapped_abi_version": MAPPED_ABI_VERSION,
+                "kernel_loader_s": kernel_loader_s,
+                "gate_wall_s": gate_wall_s,
+                "materialized_qkv_bytes": 0,
+                "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
+                "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
+                "attribution": dict(gate_telemetry),
+                "arithmetic_key_digest": ticket.digest or None,
+                **metrics,
+            })
         del got, want
 
     if exact_k_blocks is None:
