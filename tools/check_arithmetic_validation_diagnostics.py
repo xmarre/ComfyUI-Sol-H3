@@ -45,6 +45,8 @@ def validate_cuda_attribution(
     *,
     require_compile_miss: bool = False,
     require_no_compile_miss: bool = False,
+    required_replay_targets: tuple[str, ...] = (),
+    require_replay_cold_miss: bool = False,
 ) -> dict:
     diagnostics = summary.get("cuda_diagnostics")
     validation = summary.get("validation")
@@ -124,6 +126,151 @@ def validate_cuda_attribution(
                 value, f"cuda_event_ms.{name}"
             )
 
+    replay_reports = {}
+    if required_replay_targets:
+        replay = summary.get("replay_diagnostics")
+        if not isinstance(replay, dict) or not replay.get("enabled"):
+            raise DiagnosticEvidenceError("SOL_H3_REPLAY_DIAGNOSTICS was not enabled")
+        if replay.get("configuration_error"):
+            raise DiagnosticEvidenceError(
+                f"replay diagnostics configuration failed: {replay['configuration_error']}"
+            )
+        reports = replay.get("reports")
+        if not isinstance(reports, list):
+            raise DiagnosticEvidenceError("replay diagnostics contain no report list")
+        by_target = {
+            item.get("target"): item
+            for item in reports
+            if isinstance(item, dict) and isinstance(item.get("target"), str)
+        }
+        expected_arms = (
+            "first_executable_fresh_validation",
+            "primed_executable_fresh_validation",
+            "primed_executable_retained_validation",
+        )
+        replay_gate_required = {
+            "prepare",
+            "compiled_dispatch",
+            "all_selected_call",
+            "dense_reference",
+            "error_reduction",
+        }
+        replay_production_required = {
+            "prepare",
+            "compiled_dispatch",
+            "production_call",
+        }
+        replay_cuda = [
+            item
+            for item in details
+            if isinstance(item, dict)
+            and item.get("kind") in {"replay_arithmetic_gate", "replay_production_sparse"}
+        ]
+        for target in required_replay_targets:
+            report = by_target.get(target)
+            if not isinstance(report, dict):
+                raise DiagnosticEvidenceError(f"required replay target {target!r} was not captured")
+            if report.get("error"):
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} failed: {report['error']}"
+                )
+            if report.get("rng_restored") is not True:
+                raise DiagnosticEvidenceError(f"replay target {target!r} did not restore RNG state")
+            for name in (
+                "provider_history_reentered",
+                "vdn_runtime_reentered",
+                "bsa_pool_reentered",
+            ):
+                if report.get(name) is not False:
+                    raise DiagnosticEvidenceError(
+                        f"replay target {target!r} did not preserve {name}"
+                    )
+            if report.get("output_policy") != "discarded":
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} did not discard diagnostic output"
+                )
+            arms = report.get("arms")
+            if not isinstance(arms, list) or tuple(
+                arm.get("arm") for arm in arms if isinstance(arm, dict)
+            ) != expected_arms:
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} has incomplete arm ordering"
+                )
+            first, primed, retained = arms
+            if first.get("gate_performed") is not True or first.get("proof_hit") is not False:
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} first fresh validation did not gate"
+                )
+            if primed.get("gate_performed") is not True or primed.get("proof_hit") is not False:
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} primed fresh validation did not gate"
+                )
+            if retained.get("gate_performed") is not False or retained.get("proof_hit") is not True:
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} retained validation did not reuse proof"
+                )
+            if int(primed.get("compile_misses", 0)) != 0:
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} primed fresh arm compiled unexpectedly"
+                )
+            if int(retained.get("compile_misses", 0)) != 0:
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} retained-proof arm compiled unexpectedly"
+                )
+            if require_replay_cold_miss and int(first.get("compile_misses", 0)) < 1:
+                raise DiagnosticEvidenceError(
+                    f"replay target {target!r} did not observe first executable compilation"
+                )
+
+            for arm_name in expected_arms:
+                matching_production = [
+                    item
+                    for item in replay_cuda
+                    if item.get("kind") == "replay_production_sparse"
+                    and (item.get("context") or {}).get("replay_target") == target
+                    and (item.get("context") or {}).get("replay_arm") == arm_name
+                ]
+                if len(matching_production) != 1:
+                    raise DiagnosticEvidenceError(
+                        f"replay target {target!r} arm {arm_name!r} lacks one production CUDA sample"
+                    )
+                spans = matching_production[0].get("cuda_event_ms")
+                if not isinstance(spans, dict) or not replay_production_required.issubset(spans):
+                    missing = sorted(replay_production_required - set(spans or {}))
+                    raise DiagnosticEvidenceError(
+                        f"replay production sample is missing required spans: {missing}"
+                    )
+
+            for arm_name in expected_arms[:2]:
+                matching_gate = [
+                    item
+                    for item in replay_cuda
+                    if item.get("kind") == "replay_arithmetic_gate"
+                    and (item.get("context") or {}).get("replay_target") == target
+                    and (item.get("context") or {}).get("replay_arm") == arm_name
+                ]
+                if len(matching_gate) != 1:
+                    raise DiagnosticEvidenceError(
+                        f"replay target {target!r} arm {arm_name!r} lacks one gate CUDA sample"
+                    )
+                gate_item = matching_gate[0]
+                spans = gate_item.get("cuda_event_ms")
+                if not isinstance(spans, dict) or not replay_gate_required.issubset(spans):
+                    missing = sorted(replay_gate_required - set(spans or {}))
+                    raise DiagnosticEvidenceError(
+                        f"replay gate sample is missing required spans: {missing}"
+                    )
+                if gate_item.get("initial_stream_drain_host_wall_s") is None:
+                    raise DiagnosticEvidenceError(
+                        "replay gate CUDA sample omitted its clean-start drain receipt"
+                    )
+            replay_reports[target] = {
+                "first_compile_misses": int(first.get("compile_misses", 0)),
+                "primed_compile_misses": int(primed.get("compile_misses", 0)),
+                "retained_proof_hit": bool(retained.get("proof_hit")),
+                "host_wall_s": _number(report.get("host_wall_s", 0.0), "replay.host_wall_s"),
+            }
+
     return {
         "success": bool(summary.get("success")),
         "request_id": lease.get("request_id"),
@@ -147,6 +294,7 @@ def validate_cuda_attribution(
             "resolve_sync_wall_s",
         ),
         "cuda_event_ms_totals": cuda_totals,
+        "replay_reports": replay_reports,
     }
 
 
@@ -156,6 +304,18 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--require-compile-miss", action="store_true")
     group.add_argument("--require-no-compile-miss", action="store_true")
+    parser.add_argument(
+        "--require-replay-target",
+        action="append",
+        default=[],
+        choices=("ordinary_low", "ordinary_continuation_high", "partitioned_suffix"),
+        help="Require and validate one same-input replay target; may be repeated.",
+    )
+    parser.add_argument(
+        "--require-replay-cold-miss",
+        action="store_true",
+        help="Require first replay arm to observe executable compilation.",
+    )
     parser.add_argument(
         "--request-index",
         type=int,
@@ -177,6 +337,8 @@ def main() -> None:
             summary,
             require_compile_miss=args.require_compile_miss,
             require_no_compile_miss=args.require_no_compile_miss,
+            required_replay_targets=tuple(args.require_replay_target),
+            require_replay_cold_miss=args.require_replay_cold_miss,
         )
     except DiagnosticEvidenceError as exc:
         raise SystemExit(f"Sol-H3 CUDA attribution: FAIL: {exc}") from exc
