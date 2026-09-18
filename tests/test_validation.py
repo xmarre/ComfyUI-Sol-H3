@@ -353,3 +353,16 @@ def test_ordinary_and_partitioned_bindings_share_one_source_verification(monkeyp
     assert lease.bind_partitioned(Interface(), torch.device("cpu")) is False
     assert calls == [True]
     assert lease.source_verify_count == 1
+
+
+
+def test_device_identity_carries_stable_process_generation():
+    from sol_h3.validation import _device_identity
+
+    first = _device_identity("cpu")
+    second = _device_identity("cpu")
+
+    assert first["process"] == second["process"]
+    assert first["process_generation"] == second["process_generation"]
+    assert isinstance(first["process_generation"], str)
+    assert len(first["process_generation"]) == 32
