@@ -61,9 +61,12 @@ Sol-H3 now owns one `Request`-local `RuntimeLease` and one bounded
 
 The runtime lease verifies the packaged source tree once per OUTER_SAMPLE
 request and records the manifest/source generation, implementation generation,
-device identity, Python/PyTorch/CUDA environment, and distinct ordinary and
-partitioned runtime/compiler identities. Partitioned `_sm120_union` no longer
-rehashes the source tree on every sparse subcall.
+device identity, Python/PyTorch/CUDA environment, installed Triton,
+nvidia-cutlass-dsl, cuda-python and apache-tvm-ffi versions, and distinct
+ordinary and partitioned runtime/compiler identities. On CUDA it also records
+the device name, SM, memory size, multiprocessor count and driver version when
+available. Partitioned `_sm120_union` no longer rehashes the source tree on
+every sparse subcall.
 
 Successful arithmetic proof entries remain request-local. The service is
 bounded by count and bytes, supports per-key in-flight ownership, wakes waiters
@@ -72,10 +75,15 @@ changes, and retains no Q/K/V, dense reference, model weight, or output tensor.
 A new OUTER_SAMPLE creates a fresh proof lifetime even if the process-global
 compiled executable remains resident.
 
-The process-global CuTe executable cache is unchanged and remains separate from
-the request-local proof service. A fresh request therefore still revalidates its
-first unseen arithmetic contract while being able to report an executable-cache
-hit.
+The process-global CuTe executable cache remains separate from the request-local
+proof service. New executable-key insertion does not invalidate unrelated proof
+entries, but destructive cache mutation is generation-tracked by the transparent
+attribution wrapper. Clearing, deleting or replacing an existing executable
+advances the live compiler namespace; ordinary and partitioned routes detect the
+new namespace on their next call and invalidate Request-local arithmetic proof
+entries before building a new key. Replacing the cache object is rewrapped and
+also changes the namespace identity. A fresh request still revalidates its first
+unseen arithmetic contract while being able to report an executable-cache hit.
 
 Partitioned arithmetic keys deliberately remain conservative and still include
 their physical map/group ownership digest. The design permits removing that
