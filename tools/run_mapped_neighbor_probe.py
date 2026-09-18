@@ -37,7 +37,7 @@ EXPECTED_RUNTIME = {
 }
 EXPECTED_SOL_BLOBS = {
     "sol_h3/mapped_neighbors.py": "834323e2bbafa5f39467b82327e344cf3368a21e",
-    "sol_h3/sparse.py": "85f7edacc93279b4b9efb9c1477168a877229b29",
+    "sol_h3/sparse.py": "f99741a914df3923caf98dfe9c37329c57d94ec6",
     "sol_h3/provenance.py": "e3d0e3341d18e21080c33bf0f6fae4b8ebe0e237",
     "sol_h3/sol_manifest.json": "1dfd622bd102aa9f66db00f5dc49aa627560173e",
     "tools/mapped_neighbor_probe.py": "445055a66699e66d33da52242749248b2abcae4d",
