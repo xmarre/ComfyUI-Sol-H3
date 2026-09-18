@@ -13,6 +13,7 @@ import itertools
 import json
 import os
 import platform
+import secrets
 import struct
 import sys
 import threading
@@ -26,6 +27,7 @@ EVICTED_DIGEST_HISTORY = 512
 KEY_ABI = "sol_h3_arithmetic_key_v1"
 
 _REQUEST_SERIAL = itertools.count(1)
+_PROCESS_GENERATION = secrets.token_hex(16)
 
 
 def _request_id():
@@ -68,6 +70,7 @@ def _device_identity(device):
             "type": device.type,
             "index": device.index,
             "process": os.getpid(),
+            "process_generation": _PROCESS_GENERATION,
         }
     index = torch.cuda.current_device() if device.index is None else int(device.index)
     properties = torch.cuda.get_device_properties(index)
@@ -81,9 +84,10 @@ def _device_identity(device):
         "sm": list(torch.cuda.get_device_capability(index)),
         "cuda_driver_version": _cuda_driver_version(),
         "process": os.getpid(),
+        "process_generation": _PROCESS_GENERATION,
         # PyTorch owns the primary CUDA context in the supported runtime.  The
-        # process/device pair is therefore the stable context generation until
-        # process restart; no private driver handle is retained.
+        # process/device pair plus the per-process nonce is therefore the stable
+        # context generation until process restart; no private driver handle is retained.
         "context_scope": "pytorch-primary-process-device",
     }
 
