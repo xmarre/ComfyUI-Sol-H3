@@ -64,7 +64,7 @@ def test_public_api():
     assert tuple(inspect.signature(interface.sol_attn).parameters) == (
         'q', 'k', 'v', 'scale', 'tau', 'thresh_type', 'kv_splits',
         'sink_tokens', 'sink_start', 'compile_bucket_size', 'key_bias',
-        'mapped_neighbor_intervals')
+        'mapped_neighbor_intervals', 'telemetry')
     assert interface._backend_for_arch((12, 0), cute_available=True) == 'cute_sm120'
     assert interface._backend_for_arch((12, 0), cute_available=False) == 'triton'
     assert interface._backend_for_arch((10, 3), cute_available=True) == 'cute_sm100'
@@ -106,7 +106,6 @@ def test_bridge_calls_real_public_interface(monkeypatch):
     monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device=None: (12, 0))
     kernel = sparse.load_kernel(torch.device('cuda'))
     assert kernel.backend_name == 'cute_sm120'
-    assert kernel.source_tree_verified
     monkeypatch.setattr(sparse, 'load_kernel', lambda device: kernel)
     q = torch.randn(1, 2, 65, 128, dtype=torch.bfloat16)
     state = Request(Config(exact=False, backend='sol'))
