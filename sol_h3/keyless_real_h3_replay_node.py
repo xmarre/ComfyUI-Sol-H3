@@ -62,7 +62,12 @@ def _report_path(output_root: Path, payload: dict[str, Any], receipt_sha256: str
 class SolH3KeylessRealH3Replay:
     @classmethod
     def INPUT_TYPES(cls):
-        import folder_paths
+        try:
+            import folder_paths
+        except ImportError:
+            checkpoint_names = []
+        else:
+            checkpoint_names = folder_paths.get_filename_list("diffusion_models")
 
         return {
             "required": {
@@ -71,7 +76,7 @@ class SolH3KeylessRealH3Replay:
                     {"default": "", "multiline": False},
                 ),
                 "checkpoint_name": (
-                    folder_paths.get_filename_list("diffusion_models"),
+                    checkpoint_names,
                 ),
                 "checkpoint_kind": (
                     ["teacher", "keyless"],
