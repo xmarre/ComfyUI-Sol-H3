@@ -31,7 +31,7 @@ def _sink_blocks(start, tokens, rows):
 
 
 def load_kernel(device):
-    """Load the verified node-local public API; SM120 requires its CuTe backend."""
+    """Load the node-local public API after the request lease verifies source bytes."""
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("This experimental SOL integration currently targets single-GPU SM120 only")
     try:
@@ -65,7 +65,6 @@ def load_kernel(device):
         )
 
     kernel.backend_name = backend
-    kernel.source_tree_verified = True
     kernel.block_size = BLOCK_SIZE
     kernel.supports_attribution = True
     return kernel
@@ -242,10 +241,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
 
-    layout_key = _bthd_layout_key(qb, kb, vb)
     # Descriptor values are intentionally absent: every map with this layout reuses
     # one compiled mapped ABI. The runtime tensor remains a kernel argument.
-    mapped_identity = (MAPPED_ABI_VERSION, True) if mapped_enabled else (MAPPED_ABI_VERSION, False)
     from .validation import build_arithmetic_key
     mode = (
         "ordinary_weighted_v1" if key_bias is not None
