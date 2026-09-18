@@ -146,6 +146,23 @@ def test_failed_arithmetic_never_counts_sparse(monkeypatch):
     with pytest.raises(RuntimeError, match="arithmetic gate failed"):
         sparse.attention(q, q, q, 1, state.config, state)
     assert state.sparse_calls == 0
+    assert not state.validation_state._inflight
+    assert state.validation_state.summary()["failures"] == 1
+
+
+def test_gate_execution_exception_releases_validation_owner(monkeypatch):
+    def kernel(q, k, v, **kw):
+        raise RuntimeError("synthetic gate failure")
+
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: kernel)
+    state = Request(Config(exact=False, backend="sol"))
+    q = torch.ones(1, 1, 3, 128, dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="synthetic gate failure"):
+        sparse.attention(q, q, q, 1, state.config, state)
+
+    assert not state.validation_state._inflight
+    assert state.validation_state.summary()["failures"] == 1
 
 
 def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatch):
