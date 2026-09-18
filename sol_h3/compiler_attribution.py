@@ -161,10 +161,12 @@ def _refresh_runtime_objects(interface):
 
 def install_hooks(interface):
     """Wrap process-global compiler objects once without changing reviewed source bytes."""
-    if getattr(interface, "_sol_h3_attribution_abi", None) == HOOK_ABI:
-        with _INSTALL_LOCK:
-            _refresh_runtime_objects(interface)
-            return compiler_namespace(interface)
+    if (
+        getattr(interface, "_sol_h3_attribution_abi", None) == HOOK_ABI
+        and isinstance(interface._compiled, _AttributedCache)
+        and isinstance(interface._compile_lock, _TimedLock)
+    ):
+        return compiler_namespace(interface)
     with _INSTALL_LOCK:
         if getattr(interface, "_sol_h3_attribution_abi", None) == HOOK_ABI:
             _refresh_runtime_objects(interface)
