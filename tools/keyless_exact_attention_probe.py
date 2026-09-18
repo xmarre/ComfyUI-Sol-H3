@@ -8,18 +8,22 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import statistics
+import sys
 import time
 
-import torch
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sol_h3.keyless_exact_attention import (
+import torch  # noqa: E402
+
+from sol_h3.keyless_exact_attention import (  # noqa: E402
     CANONICAL_SCALE,
     CONTRACT,
     exact_attention,
     materialized_exact_reference,
 )
-from sol_h3.keyless_route_summary import HEAD_DIM, NORM_EPS, ROPE_HALF_DIM
+from sol_h3.keyless_route_summary import HEAD_DIM, NORM_EPS, ROPE_HALF_DIM  # noqa: E402
 
 
 def _rope(rows: int, device: torch.device) -> torch.Tensor:
@@ -210,6 +214,10 @@ def main() -> None:
         ],
     }
     print(json.dumps(record, indent=2, sort_keys=True))
+    if temporary_peak_delta >= route_tensor_bytes:
+        raise RuntimeError(
+            "candidate peak allocation is not bounded below one full materialized route tensor"
+        )
 
 
 if __name__ == "__main__":
