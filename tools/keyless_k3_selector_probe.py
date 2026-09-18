@@ -53,6 +53,53 @@ HEADS = 56
 HIDDEN = 5376
 SCALE = HEAD_DIM ** -0.5
 
+
+
+def _native_selector_provenance(device: torch.device) -> dict[str, object]:
+    """Verify and record the exact packaged source/backend/compiler stack."""
+    from importlib.metadata import PackageNotFoundError, version as distribution_version
+
+    from sol_h3._vendor.sol_attn import get_sol_attn_backend
+    from sol_h3.provenance import CONTRACT as SOURCE_CONTRACT
+    from sol_h3.provenance import REVISION as SOURCE_REVISION
+    from sol_h3.provenance import SOURCE as SOURCE_NAME
+    from sol_h3.provenance import verify_source
+
+    manifest = verify_source()
+    backend = get_sol_attn_backend(device)
+    if backend != "cute_sm120":
+        raise RuntimeError(
+            f"K3 selector calibration requires verified cute_sm120, got {backend!r}"
+        )
+
+    distributions = {}
+    for name in (
+        "nvidia-cutlass-dsl",
+        "cuda-python",
+        "triton",
+        "torch",
+    ):
+        try:
+            distributions[name] = distribution_version(name)
+        except PackageNotFoundError:
+            distributions[name] = None
+
+    return {
+        "source": SOURCE_NAME,
+        "revision": SOURCE_REVISION,
+        "contract": SOURCE_CONTRACT,
+        "manifest_source": manifest.get("source"),
+        "manifest_revision": manifest.get("revision"),
+        "manifest_contract": manifest.get("contract"),
+        "backend": backend,
+        "device_name": torch.cuda.get_device_name(device),
+        "compute_capability": list(torch.cuda.get_device_capability(device)),
+        "torch_version": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "distributions": distributions,
+    }
+
+
 K3_CALIBRATION_CASES = (
     ("head-257x1537-nosink", "head", 257, 1537, 0, 0),
     ("quarter-385x2049-prefix128", "quarter", 385, 2049, 0, 128),
@@ -436,6 +483,7 @@ def main() -> None:
             "K3 calibration requires SM120, got "
             f"{torch.cuda.get_device_capability(device)}"
         )
+    selector_provenance = _native_selector_provenance(device)
 
     capture_path = Path(args.capture_bundle).resolve()
     checkpoint = Path(args.checkpoint).resolve()
@@ -507,6 +555,7 @@ def main() -> None:
         },
         "tau": float(args.tau),
         "attention_scale": SCALE,
+        "selector_provenance": selector_provenance,
         "checkpoint_kind": args.checkpoint_kind,
         "checkpoint_path": str(checkpoint),
         "checkpoint_sha256": checkpoint_sha256,
