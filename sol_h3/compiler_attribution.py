@@ -152,19 +152,28 @@ def attribution_scope(telemetry, *, diagnostic_state=None, diagnostic_sample=Non
         _CURRENT.reset(token)
 
 
+def _refresh_runtime_objects(interface):
+    if not isinstance(interface._compiled, _AttributedCache):
+        interface._compiled = _AttributedCache(interface._compiled)
+    if not isinstance(interface._compile_lock, _TimedLock):
+        interface._compile_lock = _TimedLock(interface._compile_lock)
+
+
 def install_hooks(interface):
     """Wrap process-global compiler objects once without changing reviewed source bytes."""
     if getattr(interface, "_sol_h3_attribution_abi", None) == HOOK_ABI:
-        return compiler_namespace(interface)
+        with _INSTALL_LOCK:
+            _refresh_runtime_objects(interface)
+            return compiler_namespace(interface)
     with _INSTALL_LOCK:
         if getattr(interface, "_sol_h3_attribution_abi", None) == HOOK_ABI:
+            _refresh_runtime_objects(interface)
             return compiler_namespace(interface)
 
         original_compile = interface._compile_sm120
         preprocess = importlib.import_module(interface.__package__ + ".preprocess")
         original_prepare = preprocess.prepare
-        interface._compiled = _AttributedCache(interface._compiled)
-        interface._compile_lock = _TimedLock(interface._compile_lock)
+        _refresh_runtime_objects(interface)
 
         @functools.wraps(original_compile)
         def compile_sm120(*args, **kwargs):
@@ -210,13 +219,26 @@ def install_hooks(interface):
 
 
 def compiler_namespace(interface):
-    original = getattr(interface, "_sol_h3_original_compile_sm120", interface._compile_sm120)
+    preprocess = importlib.import_module(interface.__package__ + ".preprocess")
+    original_compile = getattr(
+        interface,
+        "_sol_h3_original_compile_sm120",
+        interface._compile_sm120,
+    )
+    original_prepare = getattr(
+        interface,
+        "_sol_h3_original_prepare",
+        preprocess.prepare,
+    )
     cache_generation = int(getattr(interface._compiled, "destructive_generation", 0))
     return (
         HOOK_ABI,
         id(interface._compiled),
         cache_generation,
-        id(original),
+        id(interface._compile_sm120),
+        id(original_compile),
+        id(preprocess.prepare),
+        id(original_prepare),
         id(interface._compile_lock),
     )
 
