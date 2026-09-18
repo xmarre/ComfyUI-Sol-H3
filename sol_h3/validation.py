@@ -72,8 +72,8 @@ class RuntimeLease:
     manifest_digest: str | None = None
     source_generation: str | None = None
     device_identity: dict | None = None
-    runtime_identity: tuple | None = None
-    compiler_namespace: tuple | None = None
+    runtime_identities: dict[str, tuple] = field(default_factory=dict)
+    compiler_namespaces: dict[str, tuple] = field(default_factory=dict)
     implementation_generation: str | None = None
     _lock: object = field(default_factory=threading.Lock, repr=False)
 
@@ -106,6 +106,18 @@ class RuntimeLease:
             self.source_verify_count += 1
             self.source_verified = True
 
+    def _bind_runtime(self, kind, identity, namespace):
+        """Bind one runtime route without making another route's key identity drift."""
+        with self._lock:
+            current = self.runtime_identities.get(kind)
+            current_namespace = self.compiler_namespaces.get(kind)
+            if current is None:
+                self.runtime_identities[kind] = identity
+                self.compiler_namespaces[kind] = namespace
+            elif current != identity or current_namespace != namespace:
+                raise RuntimeError(f"Sol-H3 {kind} runtime identity changed within one request")
+        return namespace
+
     def bind_kernel(self, kernel, device):
         self.ensure_source_verified(device)
         identity = (
@@ -116,12 +128,7 @@ class RuntimeLease:
             getattr(kernel, "block_size", None),
         )
         namespace = ("ordinary", id(kernel))
-        with self._lock:
-            if self.runtime_identity is None:
-                self.runtime_identity = identity
-                self.compiler_namespace = namespace
-            elif self.runtime_identity != identity:
-                raise RuntimeError("Sol-H3 loaded kernel identity changed within one request")
+        return self._bind_runtime("ordinary", identity, namespace)
 
     def bind_partitioned(self, interface, device):
         self.ensure_source_verified(device)
@@ -133,23 +140,7 @@ class RuntimeLease:
             getattr(interface, "MAPPED_NEIGHBOR_CONTRACT", None),
         )
         namespace = ("partitioned", id(interface._compiled), id(interface._compile_sm120))
-        with self._lock:
-            if self.runtime_identity is None:
-                self.runtime_identity = identity
-                self.compiler_namespace = namespace
-            elif self.runtime_identity != identity:
-                # Ordinary and partitioned execution may coexist in one request.
-                # Bind a union identity rather than replacing either owner.
-                current = self.runtime_identity
-                if not (isinstance(current, tuple) and current[:1] == ("union",)):
-                    current = ("union", current)
-                if identity not in current[1:]:
-                    current = current + (identity,)
-                self.runtime_identity = current
-                if not (isinstance(self.compiler_namespace, tuple) and self.compiler_namespace[:1] == ("union",)):
-                    self.compiler_namespace = ("union", self.compiler_namespace)
-                if namespace not in self.compiler_namespace[1:]:
-                    self.compiler_namespace = self.compiler_namespace + (namespace,)
+        return self._bind_runtime("partitioned", identity, namespace)
 
     def summary(self):
         return {
@@ -161,8 +152,8 @@ class RuntimeLease:
             "source_generation": self.source_generation,
             "implementation_generation": self.implementation_generation,
             "device_identity": self.device_identity,
-            "runtime_identity": repr(self.runtime_identity),
-            "compiler_namespace": repr(self.compiler_namespace),
+            "runtime_identity": repr(dict(self.runtime_identities)),
+            "compiler_namespace": repr(dict(self.compiler_namespaces)),
             "environment": {
                 "python": platform.python_version(),
                 "platform": platform.system(),
@@ -404,6 +395,7 @@ def build_arithmetic_key(
     mode,
     layout,
     scale,
+    compiler_namespace,
     mapped_abi=None,
     bias_range=None,
     bias_log_measure=None,
@@ -414,6 +406,8 @@ def build_arithmetic_key(
     lease = state.runtime_lease
     if not lease.source_verified:
         raise RuntimeError("Sol-H3 arithmetic key requires a verified runtime lease")
+    if compiler_namespace is None:
+        raise RuntimeError("Sol-H3 arithmetic key requires a bound compiler namespace")
 
     if layout == "bhtd":
         batch, heads, q_rows, head_dim = map(int, q.shape)
@@ -436,7 +430,7 @@ def build_arithmetic_key(
         "mode": mode,
         "source_generation": lease.source_generation,
         "implementation_generation": lease.implementation_generation,
-        "compiler_namespace": repr(lease.compiler_namespace),
+        "compiler_namespace": repr(compiler_namespace),
         "device": lease.device_identity,
         "validation_generation": state.validation_state.generation,
         "config_fingerprint": state.config.metadata()["fingerprint"],
