@@ -63,9 +63,11 @@ The runtime lease verifies the packaged source tree once per OUTER_SAMPLE
 request and records the manifest/source generation, implementation generation,
 device identity, Python/PyTorch/CUDA environment, installed Triton,
 nvidia-cutlass-dsl, cuda-python and apache-tvm-ffi versions, and distinct
-ordinary and partitioned runtime/compiler identities. On CUDA it also records
-the device name, SM, memory size, multiprocessor count and driver version when
-available. Partitioned `_sm120_union` no longer rehashes the source tree on
+ordinary and partitioned runtime/compiler identities. Device identity includes
+both the OS process ID and a random per-process generation nonce, so same-process
+campaign evidence does not rely on a recyclable PID alone. On CUDA it also
+records the device name, SM, memory size, multiprocessor count and driver version
+when available. Partitioned `_sm120_union` no longer rehashes the source tree on
 every sparse subcall.
 
 Successful arithmetic proof entries remain request-local. The service is
@@ -260,8 +262,12 @@ For the bounded same-input diagnostic arm, enable replay as well:
 SOL_H3_CUDA_DIAGNOSTICS=1 SOL_H3_REPLAY_DIAGNOSTICS=1 python main.py
 ```
 
-Save the complete process log and Flow metrics for every run. Validate a cold
-request that is expected to compile with:
+Save Flow metrics and a complete **single-prompt log segment** for every
+campaign run; each run segment must contain exactly one final
+`Prompt executed in ... seconds` receipt while retaining every Sol Request
+summary produced by that prompt. For same-process cold/primed/invalidation
+sequences, also preserve the uncut master process log as provenance. Validate a
+cold request segment that is expected to compile with:
 
 ```bash
 python custom_nodes/ComfyUI-Sol-H3/tools/check_arithmetic_validation_diagnostics.py \
