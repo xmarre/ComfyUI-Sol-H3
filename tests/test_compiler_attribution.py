@@ -35,7 +35,9 @@ def test_cache_generation_changes_only_for_destructive_mutation():
     cache = compiler_attribution._AttributedCache()
     assert cache.destructive_generation == 0
 
-    first = lambda: None
+    def first():
+        return None
+
     cache[("a",)] = first
     cache[("b",)] = lambda: None
     assert cache.destructive_generation == 0
