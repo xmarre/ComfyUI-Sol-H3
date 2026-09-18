@@ -6,7 +6,6 @@ from __future__ import annotations
 import functools
 import math
 import threading
-import time
 
 import torch
 
@@ -245,7 +244,6 @@ def _sol_attn_cute(
     valid_tokens=None,
     key_bias=None,
     mapped_neighbor_intervals=None,
-    telemetry=None,
 ):
     from .preprocess import prepare
 
@@ -255,7 +253,6 @@ def _sol_attn_cute(
     valid_blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     with torch.cuda.device(q.device):
-        prepare_started = time.perf_counter()
         kc, vc, threshold = prepare(
             q,
             k,
@@ -266,8 +263,6 @@ def _sol_attn_cute(
             valid_tokens=tokens,
             valid_kv_tokens=kv_tokens,
         )
-        if telemetry is not None:
-            telemetry["prepare_jit_host_wall_s"] = telemetry.get("prepare_jit_host_wall_s", 0.0) + (time.perf_counter() - prepare_started)
         output = torch.empty_like(q)
         lse = torch.empty(
             (batch, capacity_tokens, heads),
@@ -286,8 +281,6 @@ def _sol_attn_cute(
             q.device.index, arch, batch, capacity_tokens, k.shape[1], heads, kv_splits,
             layout_key, key_bias is not None, mapped_profile,
         )
-        if telemetry is not None:
-            telemetry["compiler_key"] = repr(key)
 
         if arch == (9, 0):
             if sink_tokens:
@@ -383,18 +376,12 @@ def _sol_attn_cute(
                 key_bias_arg, mapped_arg, lse,
             ]
             compiled = _compiled.get(key)
-            if telemetry is not None:
-                telemetry["compile_cache_initial_hit"] = compiled is not None
             if compiled is None:
                 # CuTe's compiled cache is process-global. Serialize only first
                 # compilation for one structural key and recheck under the lock.
-                lock_started = time.perf_counter()
                 with _compile_lock:
-                    if telemetry is not None:
-                        telemetry["compile_lock_wait_s"] = telemetry.get("compile_lock_wait_s", 0.0) + (time.perf_counter() - lock_started)
                     compiled = _compiled.get(key)
                     if compiled is None:
-                        compile_started = time.perf_counter()
                         compiled, args = _compile_sm120(
                             key,
                             tensors,
@@ -405,18 +392,10 @@ def _sol_attn_cute(
                             key_bias is not None,
                             mapped_neighbor_intervals is not None,
                         )
-                        if telemetry is not None:
-                            telemetry["compile_body_s"] = telemetry.get("compile_body_s", 0.0) + (time.perf_counter() - compile_started)
-                            telemetry["compile_miss"] = True
                     else:
                         args = _to_cute_tensors(tensors)
-                        if telemetry is not None:
-                            telemetry["compile_race_hit"] = True
             else:
                 args = _to_cute_tensors(tensors)
-                if telemetry is not None:
-                    telemetry["compile_hit"] = True
-            dispatch_started = time.perf_counter()
             compiled(
                 *args,
                 scale,
@@ -424,8 +403,6 @@ def _sol_attn_cute(
                 sink_end_block,
                 stream=stream,
             )
-            if telemetry is not None:
-                telemetry["dispatch_host_enqueue_s"] = telemetry.get("dispatch_host_enqueue_s", 0.0) + (time.perf_counter() - dispatch_started)
     return output[:, :tokens]
 
 
@@ -496,7 +473,6 @@ def sol_attn(
     compile_bucket_size: int | None = None,
     key_bias: torch.Tensor | None = None,
     mapped_neighbor_intervals: torch.Tensor | None = None,
-    telemetry: dict | None = None,
 ) -> torch.Tensor:
     """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
 
@@ -588,7 +564,6 @@ def sol_attn(
         valid_tokens=valid_tokens,
         key_bias=key_bias,
         mapped_neighbor_intervals=mapped_neighbor_intervals,
-        telemetry=telemetry,
     )
 
 

@@ -35,7 +35,8 @@ def load_kernel(device):
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("This experimental SOL integration currently targets single-GPU SM120 only")
     try:
-        from ._vendor.sol_attn import get_sol_attn_backend, sol_attn
+        from ._vendor.sol_attn import get_sol_attn_backend, interface, sol_attn
+        from .compiler_attribution import attribution_scope, install_hooks
         backend = get_sol_attn_backend(device)
         if backend != "cute_sm120":
             if sys.platform == "win32":
@@ -48,6 +49,7 @@ def load_kernel(device):
             )
         from ._vendor.sol_attn import preprocess  # noqa: F401
         from ._vendor.sol_attn.sm120 import make_kernel  # noqa: F401
+        compiler_namespace = install_hooks(interface)
     except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
         raise RuntimeError(f"Sana Sol-Attn initialization failed: {exc}") from exc
 
@@ -55,19 +57,20 @@ def load_kernel(device):
                sink_start=0, sink_tokens=0, key_bias=None,
                mapped_neighbor_intervals=None, _telemetry=None):
         _sink_blocks(sink_start, sink_tokens, k.shape[1])
-        return sol_attn(
-            q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
-            thresh_type=thresh_type, kv_splits=kv_splits,
-            sink_start=sink_start, sink_tokens=sink_tokens,
-            key_bias=key_bias,
-            mapped_neighbor_intervals=mapped_neighbor_intervals,
-            telemetry=_telemetry,
-        )
+        with attribution_scope(_telemetry):
+            return sol_attn(
+                q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
+                thresh_type=thresh_type, kv_splits=kv_splits,
+                sink_start=sink_start, sink_tokens=sink_tokens,
+                key_bias=key_bias,
+                mapped_neighbor_intervals=mapped_neighbor_intervals,
+            )
 
     kernel.backend_name = backend
     kernel.source_tree_verified = True
     kernel.block_size = BLOCK_SIZE
     kernel.supports_attribution = True
+    kernel.compiler_namespace = compiler_namespace
     return kernel
 
 
@@ -242,10 +245,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
 
-    layout_key = _bthd_layout_key(qb, kb, vb)
     # Descriptor values are intentionally absent: every map with this layout reuses
     # one compiled mapped ABI. The runtime tensor remains a kernel argument.
-    mapped_identity = (MAPPED_ABI_VERSION, True) if mapped_enabled else (MAPPED_ABI_VERSION, False)
     from .validation import build_arithmetic_key
     mode = (
         "ordinary_weighted_v1" if key_bias is not None
