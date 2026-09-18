@@ -27,3 +27,25 @@ def test_timed_lock_records_host_wait_only():
         with lock:
             time.sleep(0)
     assert telemetry["compile_lock_wait_s"] >= 0.0
+
+
+
+def test_cache_generation_changes_only_for_destructive_mutation():
+    cache = compiler_attribution._AttributedCache()
+    assert cache.destructive_generation == 0
+
+    first = lambda: None
+    cache[("a",)] = first
+    cache[("b",)] = lambda: None
+    assert cache.destructive_generation == 0
+
+    cache[("a",)] = lambda: None
+    assert cache.destructive_generation == 1
+
+    cache.pop(("b",))
+    assert cache.destructive_generation == 2
+
+    cache[("c",)] = lambda: None
+    assert cache.destructive_generation == 2
+    cache.clear()
+    assert cache.destructive_generation == 3
