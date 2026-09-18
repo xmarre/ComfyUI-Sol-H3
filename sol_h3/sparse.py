@@ -55,9 +55,14 @@ def load_kernel(device):
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
                sink_start=0, sink_tokens=0, key_bias=None,
-               mapped_neighbor_intervals=None, _telemetry=None):
+               mapped_neighbor_intervals=None, _telemetry=None,
+               _diagnostic_state=None, _diagnostic_sample=None):
         _sink_blocks(sink_start, sink_tokens, k.shape[1])
-        with attribution_scope(_telemetry):
+        with attribution_scope(
+            _telemetry,
+            diagnostic_state=_diagnostic_state,
+            diagnostic_sample=_diagnostic_sample,
+        ):
             return sol_attn(
                 q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
                 thresh_type=thresh_type, kv_splits=kv_splits,
@@ -70,6 +75,7 @@ def load_kernel(device):
     kernel.source_tree_verified = True
     kernel.block_size = BLOCK_SIZE
     kernel.supports_attribution = True
+    kernel.supports_cuda_diagnostics = True
     kernel.compiler_namespace = compiler_namespace
     return kernel
 
@@ -180,16 +186,22 @@ def _accumulate_attribution(state, phase, telemetry, host_wall_s=None):
             target[phase + "_" + name] = int(target.get(phase + "_" + name, 0)) + 1
 
 
-def _kernel_call(kernel, q, k, v, *, telemetry, **kwargs):
+def _kernel_call(
+    kernel, q, k, v, *, telemetry, diagnostic_state=None, diagnostic_sample=None, **kwargs
+):
     if getattr(kernel, "supports_attribution", False):
         kwargs["_telemetry"] = telemetry
+    if getattr(kernel, "supports_cuda_diagnostics", False):
+        kwargs["_diagnostic_state"] = diagnostic_state
+        kwargs["_diagnostic_sample"] = diagnostic_sample
     return kernel(q, k, v, **kwargs)
 
 
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,
               calibration_identity=None, mapped_neighbor_intervals=None,
-              mapped_calibration_identity=None, validation_bias_identity=None):
+              mapped_calibration_identity=None, validation_bias_identity=None,
+              validation_context=None):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
             or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
             or q.shape[0] != 1 or q.shape[-1] != 128
@@ -289,27 +301,43 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     )
     ticket = state.validation_state.begin(arithmetic_key)
     calibrating = ticket.validate
-    gate_started = time.perf_counter() if calibrating else None
+    diagnostics = state.cuda_diagnostics
+    diagnostic_context = {
+        "mode": mode,
+        "arithmetic_key_digest": ticket.digest or None,
+        **dict(validation_context or {}),
+    }
+    gate_sample = None
+    gate_started = None
     if calibrating:
+        gate_sample = diagnostics.begin_sample(
+            "arithmetic_gate", q.device, context=diagnostic_context, important=True
+        )
+        diagnostics.initial_stream_drain(gate_sample)
+        gate_started = time.perf_counter()
         gate_telemetry = {}
         try:
             all_selected_started = time.perf_counter()
-            got = _kernel_call(
-                state.kernel, qb, kb, vb, telemetry=gate_telemetry,
-                tau=config.tau, thresh_type="diag", kv_splits=1,
-                sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
-                mapped_neighbor_intervals=mapped_neighbor_intervals,
-            )
+            with diagnostics.span(gate_sample, "all_selected_call"):
+                got = _kernel_call(
+                    state.kernel, qb, kb, vb, telemetry=gate_telemetry,
+                    diagnostic_state=diagnostics, diagnostic_sample=gate_sample,
+                    tau=config.tau, thresh_type="diag", kv_splits=1,
+                    sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
+                    mapped_neighbor_intervals=mapped_neighbor_intervals,
+                )
             gate_telemetry["all_selected_host_wall_s"] = (
                 time.perf_counter() - all_selected_started
             )
             reference_started = time.perf_counter()
-            want = _dense_reference(q, k, v, None, key_bias=key_bias)
+            with diagnostics.span(gate_sample, "dense_reference"):
+                want = _dense_reference(q, k, v, None, key_bias=key_bias)
             gate_telemetry["reference_host_wall_s"] = (
                 time.perf_counter() - reference_started
             )
             reduction_started = time.perf_counter()
-            metrics = error_metrics(got, want)
+            with diagnostics.span(gate_sample, "error_reduction"):
+                metrics = error_metrics(got, want)
             gate_telemetry["reduction_host_wall_s"] = (
                 time.perf_counter() - reduction_started
             )
@@ -323,6 +351,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         state.validation_state.record_gate(
             ticket, mode=mode, gate_wall_s=gate_wall_s,
             metrics=metrics, telemetry=gate_telemetry,
+            context=validation_context,
         )
         state.validation_state.publish_success(ticket, metrics)
         # Compatibility telemetry only. Routing decisions use validation_state.
@@ -352,13 +381,18 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         sink_end = min(k.shape[2], exact_k_blocks[1] * BLOCK_SIZE)
         sink_tokens = max(0, sink_end - sink_start)
     production_telemetry = {}
-    production_started = time.perf_counter()
-    out = _kernel_call(
-        state.kernel, qb, kb, vb, telemetry=production_telemetry,
-        tau=config.tau, thresh_type="diag", kv_splits=1,
-        sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias,
-        mapped_neighbor_intervals=mapped_neighbor_intervals,
+    production_sample = diagnostics.begin_sample(
+        "production_sparse", q.device, context=diagnostic_context
     )
+    production_started = time.perf_counter()
+    with diagnostics.span(production_sample, "production_call"):
+        out = _kernel_call(
+            state.kernel, qb, kb, vb, telemetry=production_telemetry,
+            diagnostic_state=diagnostics, diagnostic_sample=production_sample,
+            tau=config.tau, thresh_type="diag", kv_splits=1,
+            sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias,
+            mapped_neighbor_intervals=mapped_neighbor_intervals,
+        )
     production_host_wall_s = time.perf_counter() - production_started
     _accumulate_attribution(
         state, "production_sparse", production_telemetry,

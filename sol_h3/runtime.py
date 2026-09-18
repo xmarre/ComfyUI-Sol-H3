@@ -6,6 +6,7 @@ import logging
 
 from .contracts import KEY, Config, adaln_status, prefix_length
 from .validation import ArithmeticValidationState, RuntimeLease
+from .diagnostics import CudaDiagnosticState
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from . import weighted_measure
 from .interop import (
@@ -73,6 +74,7 @@ class Request:
     runtime_attribution: dict = field(default_factory=dict)
     validation_state: ArithmeticValidationState = field(default_factory=ArithmeticValidationState)
     runtime_lease: RuntimeLease = field(default_factory=RuntimeLease)
+    cuda_diagnostics: CudaDiagnosticState = field(default_factory=CudaDiagnosticState.from_env)
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,7 @@ class SamplingWrapper:
             success = True
             return result
         finally:
+            state.cuda_diagnostics.resolve()
             _REQUEST.reset(token)
             log.info(
                 "Sol-H3 %s",
@@ -131,6 +134,7 @@ class SamplingWrapper:
                         "runtime_attribution": state.runtime_attribution,
                         "validation": state.validation_state.summary(),
                         "runtime_lease": state.runtime_lease.summary(),
+                        "cuda_diagnostics": state.cuda_diagnostics.summary(),
                     }
                 ),
             )
@@ -265,6 +269,25 @@ def _external_sequence_prefix(contract, layout, rows):
     if current_prefix != start:
         return None, "external_sequence_layout"
     return start, None
+
+
+FLOW_REQUEST_ID_KEY = "h3_flow_request_id_v1"
+FLOW_STAGE_ID_KEY = "h3_flow_stage_id_v1"
+FLOW_EVALUATION_ID_KEY = "h3_flow_evaluation_id_v1"
+FLOW_PARTITIONED_STAGE_KEY = "h3_flow_partitioned_stage_v1"
+
+
+def _validation_context(options, evaluation, block_index, *, owner_generation=None, route=None):
+    context = {
+        "flow_request_id": options.get(FLOW_REQUEST_ID_KEY),
+        "flow_stage_id": options.get(FLOW_STAGE_ID_KEY),
+        "flow_evaluation_id": options.get(FLOW_EVALUATION_ID_KEY),
+        "sol_evaluation": int(evaluation),
+        "block_index": int(block_index),
+        "owner_generation": owner_generation,
+        "route": route,
+    }
+    return context
 
 
 def _vdn_provider_api():
@@ -460,6 +483,13 @@ class BlockPatch:
                             validation_bias_identity=weighted_measure.arithmetic_bias_identity(
                                 generic_measure_contract, measure_plan
                             ),
+                            validation_context=_validation_context(
+                                current_options,
+                                evaluation,
+                                self.index,
+                                owner_generation=measure_plan.owner_generation,
+                                route="ordinary_weighted",
+                            ),
                         )
                     except KernelUnavailable as exc:
                         dense_plan = weighted_measure.prepare(
@@ -513,7 +543,13 @@ class BlockPatch:
 
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(q, k, v, prefix, config, state, dense_attention=dense_attention)
+                    result = attention(
+                        q, k, v, prefix, config, state,
+                        dense_attention=dense_attention,
+                        validation_context=_validation_context(
+                            current_options, evaluation, self.index, route="ordinary"
+                        ),
+                    )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     dense_provider = previous
@@ -566,7 +602,13 @@ class BlockPatch:
                     return native()
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(qc, kc, vc, sink_rows, config, state, recompute_prefix_queries=False)
+                    result = attention(
+                        qc, kc, vc, sink_rows, config, state,
+                        recompute_prefix_queries=False,
+                        validation_context=_validation_context(
+                            options, evaluation, self.index, route="vdn_legacy_local"
+                        ),
+                    )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
@@ -684,6 +726,9 @@ class BlockPatch:
                         recompute_prefix_queries=False,
                         mapped_neighbor_intervals=mapped_tensor,
                         mapped_calibration_identity=descriptor.descriptor_digest,
+                        validation_context=_validation_context(
+                            options, evaluation, self.index, route="vdn_mapped_v4"
+                        ),
                     )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)

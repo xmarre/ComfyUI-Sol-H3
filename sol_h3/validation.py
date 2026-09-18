@@ -373,7 +373,7 @@ class ArithmeticValidationState:
             self.stats["invalidations"] += 1
             self._pending_miss_reason = reason
 
-    def record_gate(self, ticket, *, mode, gate_wall_s, metrics, telemetry):
+    def record_gate(self, ticket, *, mode, gate_wall_s, metrics, telemetry, context=None):
         if gate_wall_s is None:
             self.untimed_gate_count += 1
         else:
@@ -387,6 +387,7 @@ class ArithmeticValidationState:
         if len(self.examples) < MAX_EXAMPLES:
             self.examples.append({
                 "mode": mode,
+                "context": dict(context or {}),
                 "arithmetic_key_digest": ticket.digest or None,
                 "compiler_key_digest": hashlib.sha256(
                     str(telemetry.get("compiler_key", "")).encode("utf-8")

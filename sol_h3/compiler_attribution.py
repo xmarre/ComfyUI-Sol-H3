@@ -1,7 +1,7 @@
 """Request-scoped host attribution for the unchanged packaged SM120 runtime."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 import functools
 import importlib
@@ -11,6 +11,7 @@ import time
 
 HOOK_ABI = "sol_h3_sm120_compiler_attribution_v1"
 _CURRENT = ContextVar("sol_h3_sm120_compiler_attribution", default=None)
+_CUDA_DIAGNOSTIC = ContextVar("sol_h3_sm120_cuda_diagnostic", default=None)
 _INSTALL_LOCK = threading.Lock()
 
 
@@ -26,13 +27,21 @@ class _DispatchProxy:
 
     def __call__(self, *args, **kwargs):
         telemetry = _CURRENT.get()
-        if telemetry is None:
+        diagnostic = _CUDA_DIAGNOSTIC.get()
+        if telemetry is None and diagnostic is None:
             return self.target(*args, **kwargs)
-        started = time.perf_counter()
+        started = time.perf_counter() if telemetry is not None else None
+        manager = (
+            diagnostic[0].span(diagnostic[1], "compiled_dispatch")
+            if diagnostic is not None
+            else nullcontext()
+        )
         try:
-            return self.target(*args, **kwargs)
+            with manager:
+                return self.target(*args, **kwargs)
         finally:
-            _add(telemetry, "dispatch_host_enqueue_s", time.perf_counter() - started)
+            if telemetry is not None:
+                _add(telemetry, "dispatch_host_enqueue_s", time.perf_counter() - started)
 
     def __getattr__(self, name):
         return getattr(self.target, name)
@@ -101,14 +110,17 @@ class _TimedLock:
 
 
 @contextmanager
-def attribution_scope(telemetry):
-    if telemetry is None:
-        yield
-        return
+def attribution_scope(telemetry, *, diagnostic_state=None, diagnostic_sample=None):
     token = _CURRENT.set(telemetry)
+    cuda_token = _CUDA_DIAGNOSTIC.set(
+        None
+        if diagnostic_state is None or diagnostic_sample is None
+        else (diagnostic_state, diagnostic_sample)
+    )
     try:
         yield
     finally:
+        _CUDA_DIAGNOSTIC.reset(cuda_token)
         _CURRENT.reset(token)
 
 
@@ -145,13 +157,21 @@ def install_hooks(interface):
         @functools.wraps(original_prepare)
         def prepare(*args, **kwargs):
             telemetry = _CURRENT.get()
-            if telemetry is None:
+            diagnostic = _CUDA_DIAGNOSTIC.get()
+            if telemetry is None and diagnostic is None:
                 return original_prepare(*args, **kwargs)
-            started = time.perf_counter()
+            started = time.perf_counter() if telemetry is not None else None
+            manager = (
+                diagnostic[0].span(diagnostic[1], "prepare")
+                if diagnostic is not None
+                else nullcontext()
+            )
             try:
-                return original_prepare(*args, **kwargs)
+                with manager:
+                    return original_prepare(*args, **kwargs)
             finally:
-                _add(telemetry, "prepare_jit_host_wall_s", time.perf_counter() - started)
+                if telemetry is not None:
+                    _add(telemetry, "prepare_jit_host_wall_s", time.perf_counter() - started)
 
         interface._compile_sm120 = compile_sm120
         preprocess.prepare = prepare

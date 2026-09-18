@@ -205,6 +205,8 @@ def _sm120_union(
     key_bias: torch.Tensor | None,
     mapped_neighbor_intervals: torch.Tensor | None,
     telemetry: dict | None = None,
+    diagnostic_state=None,
+    diagnostic_sample=None,
 ) -> torch.Tensor:
     """Execute one SM120 sparse attention union with optional bias + mapped metadata."""
     from ._vendor.sol_attn import interface
@@ -243,16 +245,22 @@ def _sm120_union(
     kv_rows = kb.shape[1]
     with torch.cuda.device(q.device):
         prepare_started = time.perf_counter()
-        kc, vc, threshold = prepare(
-            qb,
-            kb,
-            vb,
-            scale=float(scale),
-            tau=float(tau),
-            thresh_type="diag",
-            valid_tokens=q_rows,
-            valid_kv_tokens=kv_rows,
+        manager = (
+            diagnostic_state.span(diagnostic_sample, "prepare")
+            if diagnostic_state is not None
+            else __import__("contextlib").nullcontext()
         )
+        with manager:
+            kc, vc, threshold = prepare(
+                qb,
+                kb,
+                vb,
+                scale=float(scale),
+                tau=float(tau),
+                thresh_type="diag",
+                valid_tokens=q_rows,
+                valid_kv_tokens=kv_rows,
+            )
         if telemetry is not None:
             telemetry["prepare_jit_host_wall_s"] = telemetry.get("prepare_jit_host_wall_s", 0.0) + (time.perf_counter() - prepare_started)
         output = torch.empty_like(qb)
@@ -310,7 +318,13 @@ def _sm120_union(
             if telemetry is not None:
                 telemetry["compile_hit"] = True
         dispatch_started = time.perf_counter()
-        compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
+        manager = (
+            diagnostic_state.span(diagnostic_sample, "compiled_dispatch")
+            if diagnostic_state is not None
+            else __import__("contextlib").nullcontext()
+        )
+        with manager:
+            compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
         if telemetry is not None:
             telemetry["dispatch_host_enqueue_s"] = telemetry.get("dispatch_host_enqueue_s", 0.0) + (time.perf_counter() - dispatch_started)
     return output[0]
@@ -433,6 +447,16 @@ def partitioned_request_attention(
     state = _request_state()
     config = state.config
     evaluation = _forward_evaluation()
+    stage_runtime = transformer_options.get("h3_flow_partitioned_stage_v1")
+    validation_context = {
+        "flow_request_id": transformer_options.get("h3_flow_request_id_v1"),
+        "flow_stage_id": transformer_options.get("h3_flow_stage_id_v1"),
+        "flow_evaluation_id": transformer_options.get("h3_flow_evaluation_id_v1"),
+        "sol_evaluation": int(evaluation),
+        "block_index": int(block_index),
+        "owner_generation": getattr(stage_runtime, "owner_generation", None),
+        "route": f"partitioned_{kind}",
+    }
     from .interop import dense_evaluation_warmup
 
     warmup = dense_evaluation_warmup(config, evaluation, transformer_options)
@@ -539,36 +563,54 @@ def partitioned_request_attention(
         physical_identity=calibration_identity,
     )
     ticket = state.validation_state.begin(arithmetic_key)
+    diagnostics = state.cuda_diagnostics
+    diagnostic_context = {
+        "mode": mode,
+        "arithmetic_key_digest": ticket.digest or None,
+        **validation_context,
+    }
     if ticket.validate:
         from .sparse import _accumulate_attribution
+        gate_sample = diagnostics.begin_sample(
+            "partitioned_arithmetic_gate",
+            q.device,
+            context=diagnostic_context,
+            important=True,
+        )
+        diagnostics.initial_stream_drain(gate_sample)
         gate_started = time.perf_counter()
         gate_telemetry = {}
         try:
             all_selected_started = time.perf_counter()
-            got = _sm120_union(
-                q,
-                k,
-                v,
-                tau=config.tau,
-                scale=scale,
-                sink_rows=int(k.shape[0]),
-                key_bias=key_bias,
-                mapped_neighbor_intervals=mapped,
-                telemetry=gate_telemetry,
-            )
+            with diagnostics.span(gate_sample, "all_selected_call"):
+                got = _sm120_union(
+                    q,
+                    k,
+                    v,
+                    tau=config.tau,
+                    scale=scale,
+                    sink_rows=int(k.shape[0]),
+                    key_bias=key_bias,
+                    mapped_neighbor_intervals=mapped,
+                    telemetry=gate_telemetry,
+                    diagnostic_state=diagnostics,
+                    diagnostic_sample=gate_sample,
+                )
             gate_telemetry["all_selected_host_wall_s"] = (
                 time.perf_counter() - all_selected_started
             )
             reference_started = time.perf_counter()
-            want = _weighted_dense(q, k, v, key_bias, scale=scale)
+            with diagnostics.span(gate_sample, "dense_reference"):
+                want = _weighted_dense(q, k, v, key_bias, scale=scale)
             gate_telemetry["reference_host_wall_s"] = (
                 time.perf_counter() - reference_started
             )
             reduction_started = time.perf_counter()
-            gate = error_metrics(
-                got.transpose(0, 1).unsqueeze(0),
-                want.transpose(0, 1).unsqueeze(0),
-            )
+            with diagnostics.span(gate_sample, "error_reduction"):
+                gate = error_metrics(
+                    got.transpose(0, 1).unsqueeze(0),
+                    want.transpose(0, 1).unsqueeze(0),
+                )
             gate_telemetry["reduction_host_wall_s"] = (
                 time.perf_counter() - reduction_started
             )
@@ -586,6 +628,7 @@ def partitioned_request_attention(
         state.validation_state.record_gate(
             ticket, mode=mode, gate_wall_s=gate_wall_s,
             metrics=gate, telemetry=gate_telemetry,
+            context=validation_context,
         )
         state.validation_state.publish_success(ticket, gate)
         if len(state.gates) < 32:
@@ -606,18 +649,24 @@ def partitioned_request_attention(
 
     from .sparse import _accumulate_attribution
     production_telemetry = {}
-    production_started = time.perf_counter()
-    result = _sm120_union(
-        q,
-        k,
-        v,
-        tau=config.tau,
-        scale=scale,
-        sink_rows=exact_end,
-        key_bias=key_bias,
-        mapped_neighbor_intervals=mapped,
-        telemetry=production_telemetry,
+    production_sample = diagnostics.begin_sample(
+        "partitioned_production_sparse", q.device, context=diagnostic_context
     )
+    production_started = time.perf_counter()
+    with diagnostics.span(production_sample, "production_call"):
+        result = _sm120_union(
+            q,
+            k,
+            v,
+            tau=config.tau,
+            scale=scale,
+            sink_rows=exact_end,
+            key_bias=key_bias,
+            mapped_neighbor_intervals=mapped,
+            telemetry=production_telemetry,
+            diagnostic_state=diagnostics,
+            diagnostic_sample=production_sample,
+        )
     production_host_wall_s = time.perf_counter() - production_started
     _accumulate_attribution(
         state, "partitioned_production_sparse", production_telemetry,
