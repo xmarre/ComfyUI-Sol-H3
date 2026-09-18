@@ -209,6 +209,143 @@ def _kernel_call(
     return kernel(q, k, v, **kwargs)
 
 
+def _replay_ordinary_contract(
+    q,
+    k,
+    v,
+    *,
+    prefix,
+    exact_k_blocks,
+    key_bias,
+    mapped_neighbor_intervals,
+    config,
+    state,
+    arithmetic_key,
+    validation_context,
+):
+    target = state.replay_diagnostics.claim_ordinary(validation_context)
+    if target is None:
+        return
+    diagnostics = state.cuda_diagnostics
+    if not diagnostics.enabled:
+        if state.replay_diagnostics.configuration_error is None:
+            state.replay_diagnostics.configuration_error = (
+                "SOL_H3_REPLAY_DIAGNOSTICS requires SOL_H3_CUDA_DIAGNOSTICS"
+            )
+            state.replay_diagnostics.errors += 1
+        return
+
+    from .replay_diagnostics import clone_tensors_preserve_layout
+
+    context = {
+        "mode": arithmetic_key.get("mode"),
+        **dict(validation_context or {}),
+        "snapshot_logical_bytes": sum(
+            tensor.numel() * tensor.element_size() for tensor in (q, k, v)
+        ),
+    }
+    try:
+        replay_q, replay_k, replay_v = clone_tensors_preserve_layout((q, k, v))
+        replay_bias = None if key_bias is None else key_bias.clone()
+        replay_mapped = (
+            None
+            if mapped_neighbor_intervals is None
+            else mapped_neighbor_intervals.clone()
+        )
+        replay_qb, replay_kb, replay_vb = (
+            tensor.transpose(1, 2)
+            for tensor in (replay_q, replay_k, replay_v)
+        )
+        if exact_k_blocks is None:
+            sink_start, sink_tokens = 0, prefix
+        else:
+            sink_start = min(replay_k.shape[2], exact_k_blocks[0] * BLOCK_SIZE)
+            sink_end = min(replay_k.shape[2], exact_k_blocks[1] * BLOCK_SIZE)
+            sink_tokens = max(0, sink_end - sink_start)
+
+        def gate(sample, _arm):
+            telemetry = {}
+            all_selected_started = time.perf_counter()
+            with diagnostics.span(sample, "all_selected_call"):
+                got = _kernel_call(
+                    state.kernel,
+                    replay_qb,
+                    replay_kb,
+                    replay_vb,
+                    telemetry=telemetry,
+                    diagnostic_state=diagnostics,
+                    diagnostic_sample=sample,
+                    tau=config.tau,
+                    thresh_type="diag",
+                    kv_splits=1,
+                    sink_start=0,
+                    sink_tokens=replay_kb.shape[1],
+                    key_bias=replay_bias,
+                    mapped_neighbor_intervals=replay_mapped,
+                )
+            telemetry["all_selected_host_wall_s"] = (
+                time.perf_counter() - all_selected_started
+            )
+            reference_started = time.perf_counter()
+            with diagnostics.span(sample, "dense_reference"):
+                want = _dense_reference(
+                    replay_q,
+                    replay_k,
+                    replay_v,
+                    None,
+                    key_bias=replay_bias,
+                )
+            telemetry["reference_host_wall_s"] = (
+                time.perf_counter() - reference_started
+            )
+            reduction_started = time.perf_counter()
+            with diagnostics.span(sample, "error_reduction"):
+                metrics = error_metrics(got, want)
+            telemetry["reduction_host_wall_s"] = (
+                time.perf_counter() - reduction_started
+            )
+            del got, want
+            if not arithmetic_gate_passes(metrics):
+                raise RuntimeError(
+                    f"Sol-H3 replay all-selected arithmetic gate failed: {metrics}"
+                )
+            return metrics, telemetry
+
+        def production(sample, _arm):
+            telemetry = {}
+            with diagnostics.span(sample, "production_call"):
+                output = _kernel_call(
+                    state.kernel,
+                    replay_qb,
+                    replay_kb,
+                    replay_vb,
+                    telemetry=telemetry,
+                    diagnostic_state=diagnostics,
+                    diagnostic_sample=sample,
+                    tau=config.tau,
+                    thresh_type="diag",
+                    kv_splits=1,
+                    sink_start=sink_start,
+                    sink_tokens=sink_tokens,
+                    key_bias=replay_bias,
+                    mapped_neighbor_intervals=replay_mapped,
+                )
+            del output
+            return telemetry
+
+        state.replay_diagnostics.execute(
+            target=target,
+            arithmetic_key=arithmetic_key,
+            device=q.device,
+            context=context,
+            cuda_diagnostics=diagnostics,
+            gate=gate,
+            production=production,
+        )
+    except Exception as exc:
+        state.replay_diagnostics.record_capture_error(target, context, exc)
+
+
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,
               calibration_identity=None, mapped_neighbor_intervals=None,
@@ -313,9 +450,22 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         ),
         physical_identity=None,
     )
+    diagnostics = state.cuda_diagnostics
+    _replay_ordinary_contract(
+        q,
+        k,
+        v,
+        prefix=prefix,
+        exact_k_blocks=exact_k_blocks,
+        key_bias=key_bias,
+        mapped_neighbor_intervals=mapped_neighbor_intervals,
+        config=config,
+        state=state,
+        arithmetic_key=arithmetic_key,
+        validation_context=validation_context,
+    )
     ticket = state.validation_state.begin(arithmetic_key)
     calibrating = ticket.validate
-    diagnostics = state.cuda_diagnostics
     diagnostic_context = {
         "mode": mode,
         "arithmetic_key_digest": ticket.digest or None,
