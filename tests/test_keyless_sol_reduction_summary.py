@@ -27,10 +27,11 @@ def test_sol_reduction_k1_contract_is_versioned():
     )
 
 
-def test_sol_reduction_k1_reuses_released_vc_reduction():
+def test_sol_reduction_k1_reuses_exact_released_kv_reduction_for_vc():
     source = _source()
-    assert "from ._vendor.sol_attn.preprocess import _reduce_vc_kernel" in source
-    assert "_reduce_vc_kernel[grid](" in source
+    assert "from ._vendor.sol_attn.preprocess import _reduce_kv_kernel" in source
+    assert "_reduce_kv_kernel[grid](" in source
+    assert "scratch_kc4 = torch.empty_like(rc4)" in source
     assert "TensorDescriptor.from_tensor(" in source
 
 
