@@ -701,8 +701,10 @@ def route_summary_sol_reduction(
     """K1 v3 candidate aligned to the existing Sol RC/VC reduction contract.
 
     RC is derived from raw V with a TensorDescriptor/program layout matching the
-    released Sana block-reduction geometry.  VC is produced by the *same* pinned
-    Sana _reduce_vc_kernel used by the materialized QKV preprocessing path.
+    released Sana block-reduction geometry.  VC is produced by the exact pinned
+    Sana _reduce_kv_kernel used by the materialized QKV preprocessing path; raw V
+    is supplied as its unused K-side diagnostic input and only the VC result is
+    retained.
 
     This remains experimental and is not production dispatch.  It never writes a
     full [T,H,128] route tensor.
@@ -731,7 +733,7 @@ def route_summary_sol_reduction(
 
     from triton.tools.tensor_descriptor import TensorDescriptor
 
-    from ._vendor.sol_attn.preprocess import _reduce_vc_kernel
+    from ._vendor.sol_attn.preprocess import _reduce_kv_kernel
 
     rows, heads, _ = v.shape
     blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -743,6 +745,7 @@ def route_summary_sol_reduction(
         dtype=torch.bfloat16,
     )
     vc4 = torch.empty_like(rc4)
+    scratch_kc4 = torch.empty_like(rc4)
     v_desc = TensorDescriptor.from_tensor(
         vb,
         [1, BLOCK_SIZE, 1, tile_d],
@@ -777,8 +780,10 @@ def route_summary_sol_reduction(
         num_warps=8,
         num_stages=2,
     )
-    _reduce_vc_kernel[grid](
+    _reduce_kv_kernel[grid](
         v_desc,
+        v_desc,
+        scratch_kc4,
         vc4,
         rows,
         heads,
