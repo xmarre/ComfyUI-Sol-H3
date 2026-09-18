@@ -98,7 +98,10 @@ def test_sparse_bridge_preserves_comfy_strided_views_and_calibrates_per_layout(m
     sparse.attention(q2, k2, v2, 0, cfg, state, recompute_prefix_queries=False)
 
     assert len(state.gates) == 2
-    assert len(state.sparse_verified) == 2
+    validation = state.validation_state.summary()
+    assert validation["cache_entries"] == 2
+    assert validation["successes"] == 2
+    assert validation["hits"] == 1
     assert state.gates[0]["bthd_strides"] == [list(s) for s in expected_strides]
     assert state.gates[0]["bthd_strides"] != state.gates[1]["bthd_strides"]
     assert all(gate["materialized_qkv_bytes"] == 0 for gate in state.gates)

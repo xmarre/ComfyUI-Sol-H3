@@ -510,7 +510,7 @@ def partitioned_request_attention(
         }
     )
     from ._vendor.sol_attn import interface as sol_interface
-    state.runtime_lease.bind_partitioned(sol_interface, q.device)
+    compiler_namespace = state.runtime_lease.bind_partitioned(sol_interface, q.device)
     from .validation import build_arithmetic_key
     mode = (
         "partitioned_mapped_weighted_v1" if mapped is not None and key_bias is not None
@@ -526,6 +526,7 @@ def partitioned_request_attention(
         mode=mode,
         layout="thd",
         scale=scale,
+        compiler_namespace=compiler_namespace,
         mapped_abi=MAPPED_POLICY if mapped is not None else None,
         bias_range=None if prefix_k_range is None else list(prefix_k_range),
         bias_log_measure=None if prefix_k_range is None else float(prefix_log_key_measure),
@@ -539,27 +540,30 @@ def partitioned_request_attention(
         from .sparse import _accumulate_attribution
         gate_started = time.perf_counter()
         gate_telemetry = {}
-        got = _sm120_union(
-            q,
-            k,
-            v,
-            tau=config.tau,
-            scale=scale,
-            sink_rows=int(k.shape[0]),
-            key_bias=key_bias,
-            mapped_neighbor_intervals=mapped,
-            telemetry=gate_telemetry,
-        )
-        want = _weighted_dense(q, k, v, key_bias, scale=scale)
-        gate = error_metrics(
-            got.transpose(0, 1).unsqueeze(0),
-            want.transpose(0, 1).unsqueeze(0),
-        )
-        gate_wall_s = time.perf_counter() - gate_started
-        _accumulate_attribution(state, "partitioned_arithmetic_gate", gate_telemetry, gate_wall_s)
-        if not arithmetic_gate_passes(gate):
+        try:
+            got = _sm120_union(
+                q,
+                k,
+                v,
+                tau=config.tau,
+                scale=scale,
+                sink_rows=int(k.shape[0]),
+                key_bias=key_bias,
+                mapped_neighbor_intervals=mapped,
+                telemetry=gate_telemetry,
+            )
+            want = _weighted_dense(q, k, v, key_bias, scale=scale)
+            gate = error_metrics(
+                got.transpose(0, 1).unsqueeze(0),
+                want.transpose(0, 1).unsqueeze(0),
+            )
+            gate_wall_s = time.perf_counter() - gate_started
+            _accumulate_attribution(state, "partitioned_arithmetic_gate", gate_telemetry, gate_wall_s)
+            if not arithmetic_gate_passes(gate):
+                raise RuntimeError(f"partitioned Sol all-selected arithmetic gate failed: {gate}")
+        except BaseException:
             state.validation_state.publish_failure(ticket)
-            raise RuntimeError(f"partitioned Sol all-selected arithmetic gate failed: {gate}")
+            raise
         state.validation_state.publish_success(ticket, gate)
         state.validation_state.record_gate(
             ticket, mode=mode, gate_wall_s=gate_wall_s,
@@ -567,19 +571,19 @@ def partitioned_request_attention(
         )
         if len(state.gates) < 32:
             state.gates.append(
-            {
-                "route": PARTITIONED_REQUEST_ABI,
-                "kind": kind,
-                "shape": [1, q.shape[1], q.shape[0], q.shape[2]],
-                "kv_shape": [1, k.shape[1], k.shape[0], k.shape[2]],
-                "mapped_neighbor_abi": mapped is not None,
-                "key_measure_bias": key_bias is not None,
-                "gate_wall_s": gate_wall_s,
-                "attribution": dict(gate_telemetry),
-                "arithmetic_key_digest": ticket.digest or None,
-                **gate,
-            }
-        )
+                {
+                    "route": PARTITIONED_REQUEST_ABI,
+                    "kind": kind,
+                    "shape": [1, q.shape[1], q.shape[0], q.shape[2]],
+                    "kv_shape": [1, k.shape[1], k.shape[0], k.shape[2]],
+                    "mapped_neighbor_abi": mapped is not None,
+                    "key_measure_bias": key_bias is not None,
+                    "gate_wall_s": gate_wall_s,
+                    "attribution": dict(gate_telemetry),
+                    "arithmetic_key_digest": ticket.digest or None,
+                    **gate,
+                }
+            )
 
     from .sparse import _accumulate_attribution
     production_telemetry = {}
