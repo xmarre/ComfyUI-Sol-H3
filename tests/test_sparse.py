@@ -319,3 +319,44 @@ def test_fresh_request_revalidates_with_retained_executable(monkeypatch):
     assert second_summary["hits"] == 0
     assert second_summary["compile_misses"] == 0
     assert second_summary["compile_hits"] >= 2
+
+
+
+def test_compiler_namespace_generation_invalidates_same_request_proof(monkeypatch):
+    generation = {"value": 0}
+
+    def kernel(q, k, v, _telemetry=None, **kw):
+        if _telemetry is not None:
+            _telemetry["compiler_key"] = f"test-key-{generation['value']}"
+            _telemetry["compile_hit"] = True
+        bias = kw.get("key_bias")
+        mask = None if bias is None else bias.view(1, 1, 1, -1)
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=mask,
+        ).transpose(1, 2)
+
+    kernel.supports_attribution = True
+    kernel.compiler_namespace_provider = lambda: (
+        "persistent-executable",
+        generation["value"],
+    )
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: kernel)
+    q = torch.randn(1, 2, 9, 128).to(torch.bfloat16)
+    state = Request(Config(exact=False, backend="sol"))
+
+    sparse.attention(q, q, q, 0, state.config, state, recompute_prefix_queries=False)
+    sparse.attention(q, q, q, 0, state.config, state, recompute_prefix_queries=False)
+    before = state.validation_state.summary()
+    assert before["misses"] == 1
+    assert before["hits"] == 1
+    assert before["invalidations"] == 0
+
+    generation["value"] += 1
+    sparse.attention(q, q, q, 0, state.config, state, recompute_prefix_queries=False)
+    after = state.validation_state.summary()
+    assert after["invalidations"] == 1
+    assert after["misses"] == 2
+    assert after["hits"] == 1
