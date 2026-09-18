@@ -66,8 +66,9 @@ nvidia-cutlass-dsl, cuda-python and apache-tvm-ffi versions, and distinct
 ordinary and partitioned runtime/compiler identities. Device identity includes
 both the OS process ID and a random per-process generation nonce, so same-process
 campaign evidence does not rely on a recyclable PID alone. On CUDA it also
-records the device name, SM, memory size, multiprocessor count and driver version
-when available. Partitioned `_sm120_union` no longer rehashes the source tree on
+records the device name, CUDA UUID when exposed by PyTorch, SM, memory size,
+multiprocessor count and driver version when available. Partitioned
+`_sm120_union` no longer rehashes the source tree on
 every sparse subcall.
 
 Successful arithmetic proof entries remain request-local. The service is
