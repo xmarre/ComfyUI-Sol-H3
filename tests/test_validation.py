@@ -140,10 +140,9 @@ def test_success_cache_retains_no_tensor_objects():
 def test_arithmetic_key_changes_for_bias_scale_mapped_abi_and_stride():
     state = Request(Config(exact=False, backend="sol"))
     base = _key(state)
-    base_digest = state.validation_state.begin(base).digest
-    state.validation_state.publish_failure(
-        validation.ValidationTicket(base_digest, base, 0, 0, True, False)
-    )
+    base_ticket = state.validation_state.begin(base)
+    base_digest = base_ticket.digest
+    state.validation_state.publish_failure(base_ticket)
 
     keys = [
         _key(state, bias="other"),
@@ -209,14 +208,17 @@ def test_runtime_routes_bind_independently_without_identity_drift():
     lease.source_verified = True
     lease.source_generation = "source"
     lease.implementation_generation = "impl"
-    lease.device_identity = {"type": "cpu", "index": None, "process": 1}
+    lease.device_identity = validation._device_identity(torch.device("cpu"))
 
     def kernel():
         pass
 
     kernel.backend_name = "cute_sm120"
     kernel.block_size = 64
-    compile_fn = lambda: None
+
+    def compile_fn():
+        pass
+
     interface = SimpleNamespace(
         __file__="interface.py",
         _compile_sm120=compile_fn,
@@ -237,8 +239,11 @@ def test_runtime_route_replacement_fails_closed():
     lease.source_verified = True
     lease.source_generation = "source"
     lease.implementation_generation = "impl"
-    lease.device_identity = {"type": "cpu", "index": None, "process": 1}
-    compile_fn = lambda: None
+    lease.device_identity = validation._device_identity(torch.device("cpu"))
+
+    def compile_fn():
+        pass
+
     interface = SimpleNamespace(
         __file__="interface.py",
         _compile_sm120=compile_fn,
@@ -246,7 +251,11 @@ def test_runtime_route_replacement_fails_closed():
         MAPPED_NEIGHBOR_CONTRACT="mapped-v4",
     )
     lease.bind_partitioned(interface, torch.device("cpu"))
-    interface._compile_sm120 = lambda: None
+
+    def replacement_compile_fn():
+        pass
+
+    interface._compile_sm120 = replacement_compile_fn
     with pytest.raises(RuntimeError, match="partitioned runtime identity changed"):
         lease.bind_partitioned(interface, torch.device("cpu"))
 
@@ -272,7 +281,10 @@ def test_runtime_lease_verifies_source_once_across_routes(monkeypatch):
 
     kernel.backend_name = "cute_sm120"
     kernel.block_size = 64
-    compile_fn = lambda: None
+
+    def compile_fn():
+        pass
+
     interface = SimpleNamespace(
         __file__="interface.py",
         _compile_sm120=compile_fn,
