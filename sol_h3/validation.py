@@ -164,7 +164,12 @@ class RuntimeLease:
             getattr(kernel, "backend_name", None),
             getattr(kernel, "block_size", None),
         )
-        namespace = tuple(getattr(kernel, "compiler_namespace", ("test_substitute", id(kernel))))
+        namespace_provider = getattr(kernel, "compiler_namespace_provider", None)
+        namespace = tuple(
+            namespace_provider()
+            if callable(namespace_provider)
+            else getattr(kernel, "compiler_namespace", ("test_substitute", id(kernel)))
+        )
         with self._lock:
             changed = self.ordinary_runtime_identity is not None and (
                 self.ordinary_runtime_identity != identity
