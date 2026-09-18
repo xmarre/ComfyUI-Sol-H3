@@ -298,6 +298,165 @@ def validate_cuda_attribution(
     }
 
 
+
+def _replay_candidates(summaries: list[dict], target: str):
+    candidates = []
+    for index, summary in enumerate(summaries):
+        replay = summary.get("replay_diagnostics")
+        reports = replay.get("reports") if isinstance(replay, dict) else None
+        if not isinstance(reports, list):
+            continue
+        for report in reports:
+            if isinstance(report, dict) and report.get("target") == target:
+                candidates.append((index, summary, report))
+    return candidates
+
+
+def validate_cuda_attribution_across_summaries(
+    summaries: list[dict],
+    *,
+    required_replay_targets: tuple[str, ...],
+    require_compile_miss: bool = False,
+    require_no_compile_miss: bool = False,
+    require_replay_cold_miss: bool = False,
+) -> dict:
+    """Validate replay targets that necessarily span multiple Sol Requests.
+
+    Flow progressive low/probe/high sampler invocations can create separate
+    OUTER_SAMPLE/Sol Request lifetimes while retaining one Flow request ID.
+    The continuation-high replay target is selected by the Flow request ID of
+    the partitioned suffix, preventing an earlier first-chunk high stage from
+    being mistaken for the continuation high stage.
+    """
+    if not summaries:
+        raise DiagnosticEvidenceError("no Sol-H3 summaries were supplied")
+    targets = tuple(dict.fromkeys(required_replay_targets))
+    if not targets:
+        raise DiagnosticEvidenceError(
+            "multi-request replay validation requires at least one replay target"
+        )
+    if (
+        "ordinary_continuation_high" in targets
+        and "partitioned_suffix" not in targets
+    ):
+        raise DiagnosticEvidenceError(
+            "continuation-high multi-request validation also requires partitioned_suffix "
+            "to identify the continuation Flow request"
+        )
+
+    selected = {}
+    continuation_request_id = None
+    if "partitioned_suffix" in targets:
+        suffix = _replay_candidates(summaries, "partitioned_suffix")
+        if len(suffix) != 1:
+            raise DiagnosticEvidenceError(
+                "partitioned_suffix replay target is ambiguous across Sol Requests: "
+                f"found {len(suffix)} candidates"
+            )
+        selected["partitioned_suffix"] = suffix[0]
+        context = suffix[0][2].get("context")
+        continuation_request_id = (
+            context.get("flow_request_id") if isinstance(context, dict) else None
+        )
+        if "ordinary_continuation_high" in targets and not continuation_request_id:
+            raise DiagnosticEvidenceError(
+                "partitioned_suffix replay omitted its Flow request correlation ID"
+            )
+
+    for target in targets:
+        if target in selected:
+            continue
+        candidates = _replay_candidates(summaries, target)
+        if target == "ordinary_continuation_high":
+            candidates = [
+                candidate
+                for candidate in candidates
+                if isinstance(candidate[2].get("context"), dict)
+                and candidate[2]["context"].get("flow_request_id")
+                == continuation_request_id
+                and candidate[2]["context"].get("flow_stage") == "high"
+            ]
+        elif target == "ordinary_low" and continuation_request_id is not None:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if isinstance(candidate[2].get("context"), dict)
+                and candidate[2]["context"].get("flow_stage") == "low"
+                and candidate[2]["context"].get("flow_request_id")
+                != continuation_request_id
+            ]
+        if len(candidates) != 1:
+            raise DiagnosticEvidenceError(
+                f"required replay target {target!r} is ambiguous across Sol Requests: "
+                f"found {len(candidates)} candidates"
+            )
+        selected[target] = candidates[0]
+
+    by_summary = {}
+    for target, (index, summary, _report) in selected.items():
+        entry = by_summary.setdefault(index, {"summary": summary, "targets": []})
+        entry["targets"].append(target)
+
+    request_reports = []
+    replay_reports = {}
+    cuda_totals = {}
+    aggregate = {
+        "validation_hits": 0,
+        "validation_misses": 0,
+        "validation_failures": 0,
+        "compile_hits": 0,
+        "compile_misses": 0,
+        "gate_total_s": 0.0,
+        "production_host_wall_s": 0.0,
+        "selected_samples": 0,
+        "resolved_samples": 0,
+        "resolve_sync_wall_s": 0.0,
+    }
+    for index in sorted(by_summary):
+        item = by_summary[index]
+        report = validate_cuda_attribution(
+            item["summary"],
+            required_replay_targets=tuple(item["targets"]),
+            require_replay_cold_miss=require_replay_cold_miss,
+        )
+        request_reports.append(
+            {
+                "summary_index": index,
+                "targets": list(item["targets"]),
+                "request_id": report.get("request_id"),
+                "source_generation": report.get("source_generation"),
+                "implementation_generation": report.get("implementation_generation"),
+                "compile_hits": report.get("compile_hits"),
+                "compile_misses": report.get("compile_misses"),
+            }
+        )
+        replay_reports.update(report["replay_reports"])
+        for name in aggregate:
+            aggregate[name] += report[name]
+        for name, value in report["cuda_event_ms_totals"].items():
+            cuda_totals[name] = cuda_totals.get(name, 0.0) + float(value)
+
+    if require_compile_miss and aggregate["compile_misses"] < 1:
+        raise DiagnosticEvidenceError(
+            "selected replay Requests did not report the required compiler miss"
+        )
+    if require_no_compile_miss and aggregate["compile_misses"] != 0:
+        raise DiagnosticEvidenceError(
+            "selected replay Requests reported "
+            f"{aggregate['compile_misses']} compiler misses"
+        )
+
+    return {
+        "success": all(bool(by_summary[index]["summary"].get("success")) for index in by_summary),
+        **aggregate,
+        "request_ids": [item["request_id"] for item in request_reports],
+        "selected_summary_indices": [item["summary_index"] for item in request_reports],
+        "request_reports": request_reports,
+        "cuda_event_ms_totals": cuda_totals,
+        "replay_reports": replay_reports,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", required=True, type=Path)
@@ -322,24 +481,41 @@ def main() -> None:
         default=-1,
         help="Sol-H3 summary index in the log; default is the final request",
     )
+    parser.add_argument(
+        "--all-requests",
+        action="store_true",
+        help=(
+            "Resolve required replay targets across the full process log. "
+            "Use this for progressive low/continuation partitioned/high campaigns."
+        ),
+    )
     args = parser.parse_args()
 
     text = args.log.read_text(encoding="utf-8", errors="replace")
     summaries = extract_sol_summaries(text)
     try:
-        summary = summaries[args.request_index]
-    except IndexError as exc:
-        raise SystemExit(
-            f"request index {args.request_index} is outside {len(summaries)} summaries"
-        ) from exc
-    try:
-        report = validate_cuda_attribution(
-            summary,
-            require_compile_miss=args.require_compile_miss,
-            require_no_compile_miss=args.require_no_compile_miss,
-            required_replay_targets=tuple(args.require_replay_target),
-            require_replay_cold_miss=args.require_replay_cold_miss,
-        )
+        if args.all_requests:
+            report = validate_cuda_attribution_across_summaries(
+                summaries,
+                require_compile_miss=args.require_compile_miss,
+                require_no_compile_miss=args.require_no_compile_miss,
+                required_replay_targets=tuple(args.require_replay_target),
+                require_replay_cold_miss=args.require_replay_cold_miss,
+            )
+        else:
+            try:
+                summary = summaries[args.request_index]
+            except IndexError as exc:
+                raise DiagnosticEvidenceError(
+                    f"request index {args.request_index} is outside {len(summaries)} summaries"
+                ) from exc
+            report = validate_cuda_attribution(
+                summary,
+                require_compile_miss=args.require_compile_miss,
+                require_no_compile_miss=args.require_no_compile_miss,
+                required_replay_targets=tuple(args.require_replay_target),
+                require_replay_cold_miss=args.require_replay_cold_miss,
+            )
     except DiagnosticEvidenceError as exc:
         raise SystemExit(f"Sol-H3 CUDA attribution: FAIL: {exc}") from exc
     print(json.dumps({"status": "pass", **report}, indent=2, sort_keys=True))
