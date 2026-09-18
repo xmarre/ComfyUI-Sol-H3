@@ -181,9 +181,9 @@ class RuntimeLease:
 
     def bind_partitioned(self, interface, device):
         self.ensure_source_verified(device)
-        from .compiler_attribution import compiler_namespace, install_hooks
+        from .compiler_attribution import install_hooks
 
-        install_hooks(interface)
+        namespace = tuple(install_hooks(interface))
         original_compile = getattr(
             interface, "_sol_h3_original_compile_sm120", interface._compile_sm120
         )
@@ -194,7 +194,6 @@ class RuntimeLease:
             id(original_compile),
             getattr(interface, "MAPPED_NEIGHBOR_CONTRACT", None),
         )
-        namespace = tuple(compiler_namespace(interface))
         with self._lock:
             changed = self.partitioned_runtime_identity is not None and (
                 self.partitioned_runtime_identity != identity
