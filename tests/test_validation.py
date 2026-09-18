@@ -102,6 +102,11 @@ def test_runtime_lease_verifies_source_once(monkeypatch):
         "_device_identity",
         lambda device: {"type": "cpu", "index": None, "process": 1},
     )
+    monkeypatch.setattr(
+        validation,
+        "_distribution_version",
+        lambda name: f"version:{name}",
+    )
     import sol_h3.provenance as provenance
     monkeypatch.setattr(provenance, "verify_source", lambda: calls.append(True) or {
         "source": provenance.SOURCE,
@@ -114,6 +119,10 @@ def test_runtime_lease_verifies_source_once(monkeypatch):
     lease.ensure_source_verified(torch.device("cpu"))
     assert calls == [True]
     assert lease.source_verify_count == 1
+    assert lease.compiler_environment["triton"] == "version:triton"
+    assert lease.compiler_environment["nvidia_cutlass_dsl"] == "version:nvidia-cutlass-dsl"
+    assert lease.compiler_environment["cuda_python"] == "version:cuda-python"
+    assert lease.compiler_environment["apache_tvm_ffi"] == "version:apache-tvm-ffi"
 
 
 def test_partitioned_binding_does_not_change_ordinary_namespace(monkeypatch):
