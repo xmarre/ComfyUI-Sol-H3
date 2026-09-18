@@ -8,11 +8,13 @@ from __future__ import annotations
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 import hashlib
+import importlib.metadata
 import itertools
 import json
 import os
 import platform
 import struct
+import sys
 import threading
 import time
 
@@ -38,6 +40,25 @@ def _digest(value):
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def _distribution_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _cuda_driver_version():
+    try:
+        from cuda.bindings import driver
+
+        result = driver.cuDriverGetVersion()
+        if isinstance(result, tuple) and len(result) >= 2:
+            return int(result[1])
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    return None
+
+
 def _device_identity(device):
     import torch
 
@@ -49,11 +70,16 @@ def _device_identity(device):
             "process": os.getpid(),
         }
     index = torch.cuda.current_device() if device.index is None else int(device.index)
+    properties = torch.cuda.get_device_properties(index)
     return {
         "type": "cuda",
         "index": index,
         "current_device": int(torch.cuda.current_device()),
+        "name": str(properties.name),
+        "total_memory": int(properties.total_memory),
+        "multi_processor_count": int(properties.multi_processor_count),
         "sm": list(torch.cuda.get_device_capability(index)),
+        "cuda_driver_version": _cuda_driver_version(),
         "process": os.getpid(),
         # PyTorch owns the primary CUDA context in the supported runtime.  The
         # process/device pair is therefore the stable context generation until
@@ -117,6 +143,10 @@ class RuntimeLease:
                 "platform": platform.system(),
                 "torch": str(torch.__version__),
                 "torch_cuda": str(torch.version.cuda),
+                "triton": _distribution_version("triton"),
+                "nvidia_cutlass_dsl": _distribution_version("nvidia-cutlass-dsl"),
+                "cuda_python": _distribution_version("cuda-python"),
+                "apache_tvm_ffi": _distribution_version("apache-tvm-ffi"),
             }
             self.source_verify_s += elapsed
             self.source_verify_count += 1
@@ -124,8 +154,11 @@ class RuntimeLease:
 
     def bind_kernel(self, kernel, device):
         self.ensure_source_verified(device)
+        module_name = getattr(kernel, "__module__", type(kernel).__module__)
+        module = sys.modules.get(module_name)
         identity = (
-            getattr(kernel, "__module__", type(kernel).__module__),
+            module_name,
+            getattr(module, "__file__", None),
             getattr(kernel, "__qualname__", type(kernel).__qualname__),
             id(kernel),
             getattr(kernel, "backend_name", None),
