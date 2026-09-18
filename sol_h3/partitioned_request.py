@@ -18,6 +18,7 @@ from collections import OrderedDict
 import hashlib
 import json
 import math
+import time
 from typing import Any
 
 import torch
@@ -203,13 +204,14 @@ def _sm120_union(
     sink_rows: int,
     key_bias: torch.Tensor | None,
     mapped_neighbor_intervals: torch.Tensor | None,
+    telemetry: dict | None = None,
+    diagnostic_state=None,
+    diagnostic_sample=None,
 ) -> torch.Tensor:
     """Execute one SM120 sparse attention union with optional bias + mapped metadata."""
-    from .provenance import verify_source
     from ._vendor.sol_attn import interface
     from ._vendor.sol_attn.preprocess import prepare
 
-    verify_source()
     qb = q.unsqueeze(0)
     kb = k.unsqueeze(0)
     vb = v.unsqueeze(0)
@@ -242,16 +244,25 @@ def _sm120_union(
     batch, q_rows, heads, _ = qb.shape
     kv_rows = kb.shape[1]
     with torch.cuda.device(q.device):
-        kc, vc, threshold = prepare(
-            qb,
-            kb,
-            vb,
-            scale=float(scale),
-            tau=float(tau),
-            thresh_type="diag",
-            valid_tokens=q_rows,
-            valid_kv_tokens=kv_rows,
+        prepare_started = time.perf_counter()
+        manager = (
+            diagnostic_state.span(diagnostic_sample, "prepare")
+            if diagnostic_state is not None
+            else __import__("contextlib").nullcontext()
         )
+        with manager:
+            kc, vc, threshold = prepare(
+                qb,
+                kb,
+                vb,
+                scale=float(scale),
+                tau=float(tau),
+                thresh_type="diag",
+                valid_tokens=q_rows,
+                valid_kv_tokens=kv_rows,
+            )
+        if telemetry is not None:
+            telemetry["prepare_jit_host_wall_s"] = telemetry.get("prepare_jit_host_wall_s", 0.0) + (time.perf_counter() - prepare_started)
         output = torch.empty_like(qb)
         lse = torch.empty((batch, q_rows, heads), device=q.device, dtype=torch.float32)
         stream = interface._stream(q.device)
@@ -272,11 +283,19 @@ def _sm120_union(
             key_bias is not None,
             mapped_neighbor_intervals is not None,
         )
+        if telemetry is not None:
+            telemetry["compiler_key"] = repr(key)
         compiled = interface._compiled.get(key)
+        if telemetry is not None:
+            telemetry["compile_cache_initial_hit"] = compiled is not None
         if compiled is None:
+            lock_started = time.perf_counter()
             with interface._compile_lock:
+                if telemetry is not None:
+                    telemetry["compile_lock_wait_s"] = telemetry.get("compile_lock_wait_s", 0.0) + (time.perf_counter() - lock_started)
                 compiled = interface._compiled.get(key)
                 if compiled is None:
+                    compile_started = time.perf_counter()
                     compiled, args = interface._compile_sm120(
                         key,
                         tensors,
@@ -287,12 +306,156 @@ def _sm120_union(
                         key_bias is not None,
                         mapped_neighbor_intervals is not None,
                     )
+                    if telemetry is not None:
+                        telemetry["compile_body_s"] = telemetry.get("compile_body_s", 0.0) + (time.perf_counter() - compile_started)
+                        telemetry["compile_miss"] = True
                 else:
                     args = interface._to_cute_tensors(tensors)
+                    if telemetry is not None:
+                        telemetry["compile_race_hit"] = True
         else:
             args = interface._to_cute_tensors(tensors)
-        compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
+            if telemetry is not None:
+                telemetry["compile_hit"] = True
+        dispatch_started = time.perf_counter()
+        manager = (
+            diagnostic_state.span(diagnostic_sample, "compiled_dispatch")
+            if diagnostic_state is not None
+            else __import__("contextlib").nullcontext()
+        )
+        with manager:
+            compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
+        if telemetry is not None:
+            telemetry["dispatch_host_enqueue_s"] = telemetry.get("dispatch_host_enqueue_s", 0.0) + (time.perf_counter() - dispatch_started)
     return output[0]
+
+
+def _replay_partitioned_suffix(
+    q,
+    k,
+    v,
+    *,
+    key_bias,
+    mapped_neighbor_intervals,
+    exact_end,
+    config,
+    state,
+    arithmetic_key,
+    validation_context,
+    kind,
+):
+    target = state.replay_diagnostics.claim_partitioned_suffix(
+        kind=kind,
+        mapped=mapped_neighbor_intervals is not None,
+        force_dense=False,
+    )
+    if target is None:
+        return
+    diagnostics = state.cuda_diagnostics
+    if not diagnostics.enabled:
+        if state.replay_diagnostics.configuration_error is None:
+            state.replay_diagnostics.configuration_error = (
+                "SOL_H3_REPLAY_DIAGNOSTICS requires SOL_H3_CUDA_DIAGNOSTICS"
+            )
+            state.replay_diagnostics.errors += 1
+        return
+
+    from .replay_diagnostics import clone_tensors_preserve_layout
+
+    context = {
+        "mode": arithmetic_key.get("mode"),
+        **dict(validation_context or {}),
+        "snapshot_logical_bytes": sum(
+            tensor.numel() * tensor.element_size() for tensor in (q, k, v)
+        ),
+    }
+    try:
+        replay_q, replay_k, replay_v = clone_tensors_preserve_layout((q, k, v))
+        replay_bias = None if key_bias is None else key_bias.clone()
+        replay_mapped = (
+            None
+            if mapped_neighbor_intervals is None
+            else mapped_neighbor_intervals.clone()
+        )
+
+        def gate(sample, _arm):
+            telemetry = {}
+            all_selected_started = time.perf_counter()
+            with diagnostics.span(sample, "all_selected_call"):
+                got = _sm120_union(
+                    replay_q,
+                    replay_k,
+                    replay_v,
+                    tau=config.tau,
+                    scale=replay_q.shape[-1] ** -0.5,
+                    sink_rows=int(replay_k.shape[0]),
+                    key_bias=replay_bias,
+                    mapped_neighbor_intervals=replay_mapped,
+                    telemetry=telemetry,
+                    diagnostic_state=diagnostics,
+                    diagnostic_sample=sample,
+                )
+            telemetry["all_selected_host_wall_s"] = (
+                time.perf_counter() - all_selected_started
+            )
+            reference_started = time.perf_counter()
+            with diagnostics.span(sample, "dense_reference"):
+                want = _weighted_dense(
+                    replay_q,
+                    replay_k,
+                    replay_v,
+                    replay_bias,
+                    scale=replay_q.shape[-1] ** -0.5,
+                )
+            telemetry["reference_host_wall_s"] = (
+                time.perf_counter() - reference_started
+            )
+            reduction_started = time.perf_counter()
+            with diagnostics.span(sample, "error_reduction"):
+                metrics = error_metrics(
+                    got.transpose(0, 1).unsqueeze(0),
+                    want.transpose(0, 1).unsqueeze(0),
+                )
+            telemetry["reduction_host_wall_s"] = (
+                time.perf_counter() - reduction_started
+            )
+            del got, want
+            if not arithmetic_gate_passes(metrics):
+                raise RuntimeError(
+                    f"partitioned Sol replay arithmetic gate failed: {metrics}"
+                )
+            return metrics, telemetry
+
+        def production(sample, _arm):
+            telemetry = {}
+            with diagnostics.span(sample, "production_call"):
+                output = _sm120_union(
+                    replay_q,
+                    replay_k,
+                    replay_v,
+                    tau=config.tau,
+                    scale=replay_q.shape[-1] ** -0.5,
+                    sink_rows=exact_end,
+                    key_bias=replay_bias,
+                    mapped_neighbor_intervals=replay_mapped,
+                    telemetry=telemetry,
+                    diagnostic_state=diagnostics,
+                    diagnostic_sample=sample,
+                )
+            del output
+            return telemetry
+
+        state.replay_diagnostics.execute(
+            target=target,
+            arithmetic_key=arithmetic_key,
+            device=q.device,
+            context=context,
+            cuda_diagnostics=diagnostics,
+            gate=gate,
+            production=production,
+        )
+    except Exception as exc:
+        state.replay_diagnostics.record_capture_error(target, context, exc)
 
 
 def _descriptor_for_wire(
@@ -412,6 +575,17 @@ def partitioned_request_attention(
     state = _request_state()
     config = state.config
     evaluation = _forward_evaluation()
+    stage_runtime = transformer_options.get("h3_flow_partitioned_stage_v1")
+    validation_context = {
+        "flow_request_id": transformer_options.get("h3_flow_request_id_v1"),
+        "flow_stage": transformer_options.get("h3_flow_stage"),
+        "flow_stage_id": transformer_options.get("h3_flow_stage_id_v1"),
+        "flow_evaluation_id": transformer_options.get("h3_flow_evaluation_id_v1"),
+        "sol_evaluation": int(evaluation),
+        "block_index": int(block_index),
+        "owner_generation": getattr(stage_runtime, "owner_generation", None),
+        "route": f"partitioned_{kind}",
+    }
     from .interop import dense_evaluation_warmup
 
     warmup = dense_evaluation_warmup(config, evaluation, transformer_options)
@@ -488,59 +662,160 @@ def partitioned_request_attention(
             "descriptor_digest": None if descriptor is None else descriptor.descriptor_digest,
         }
     )
-    verified = getattr(state, "partitioned_sparse_verified", None)
-    if verified is None:
-        verified = set()
-        state.partitioned_sparse_verified = verified
-    layout_key = (
-        tuple(q.shape),
-        tuple(q.stride()),
-        tuple(k.shape),
-        tuple(k.stride()),
-        tuple(v.shape),
-        tuple(v.stride()),
-        calibration_identity,
+    from ._vendor.sol_attn import interface as sol_interface
+    runtime_changed = state.runtime_lease.bind_partitioned(sol_interface, q.device)
+    if runtime_changed:
+        state.validation_state.invalidate("new_runtime")
+        if hasattr(state, "partitioned_sparse_verified"):
+            state.partitioned_sparse_verified.clear()
+    from .validation import build_arithmetic_key
+    mode = (
+        "partitioned_mapped_weighted_v1" if mapped is not None and key_bias is not None
+        else "partitioned_mapped_v1" if mapped is not None
+        else "partitioned_weighted_v1" if key_bias is not None
+        else "partitioned_unweighted_v1"
     )
-    if layout_key not in verified:
-        got = _sm120_union(
+    arithmetic_key = build_arithmetic_key(
+        state=state,
+        q=q,
+        k=k,
+        v=v,
+        mode=mode,
+        layout="thd",
+        scale=scale,
+        mapped_abi=MAPPED_POLICY if mapped is not None else None,
+        bias_range=None if prefix_k_range is None else list(prefix_k_range),
+        bias_log_measure=None if prefix_k_range is None else float(prefix_log_key_measure),
+        bias_identity=semantic_digest if key_bias is not None else None,
+        # Conservative by design: current partitioned proof identity still
+        # retains map/group ownership until CUDA replay proves quotient safety.
+        physical_identity=calibration_identity,
+    )
+    _replay_partitioned_suffix(
+        q,
+        k,
+        v,
+        key_bias=key_bias,
+        mapped_neighbor_intervals=mapped,
+        exact_end=exact_end,
+        config=config,
+        state=state,
+        arithmetic_key=arithmetic_key,
+        validation_context=validation_context,
+        kind=kind,
+    )
+    ticket = state.validation_state.begin(arithmetic_key)
+    diagnostics = state.cuda_diagnostics
+    diagnostic_context = {
+        "mode": mode,
+        "arithmetic_key_digest": ticket.digest or None,
+        **validation_context,
+    }
+    if ticket.validate:
+        from .sparse import _accumulate_attribution
+        gate_sample = diagnostics.begin_sample(
+            "partitioned_arithmetic_gate",
+            q.device,
+            context=diagnostic_context,
+            important=True,
+        )
+        diagnostics.initial_stream_drain(gate_sample)
+        gate_started = time.perf_counter()
+        gate_telemetry = {}
+        try:
+            all_selected_started = time.perf_counter()
+            with diagnostics.span(gate_sample, "all_selected_call"):
+                got = _sm120_union(
+                    q,
+                    k,
+                    v,
+                    tau=config.tau,
+                    scale=scale,
+                    sink_rows=int(k.shape[0]),
+                    key_bias=key_bias,
+                    mapped_neighbor_intervals=mapped,
+                    telemetry=gate_telemetry,
+                    diagnostic_state=diagnostics,
+                    diagnostic_sample=gate_sample,
+                )
+            gate_telemetry["all_selected_host_wall_s"] = (
+                time.perf_counter() - all_selected_started
+            )
+            reference_started = time.perf_counter()
+            with diagnostics.span(gate_sample, "dense_reference"):
+                want = _weighted_dense(q, k, v, key_bias, scale=scale)
+            gate_telemetry["reference_host_wall_s"] = (
+                time.perf_counter() - reference_started
+            )
+            reduction_started = time.perf_counter()
+            with diagnostics.span(gate_sample, "error_reduction"):
+                gate = error_metrics(
+                    got.transpose(0, 1).unsqueeze(0),
+                    want.transpose(0, 1).unsqueeze(0),
+                )
+            gate_telemetry["reduction_host_wall_s"] = (
+                time.perf_counter() - reduction_started
+            )
+            gate_wall_s = time.perf_counter() - gate_started
+            _accumulate_attribution(
+                state, "partitioned_arithmetic_gate", gate_telemetry, gate_wall_s
+            )
+            if not arithmetic_gate_passes(gate):
+                raise RuntimeError(
+                    f"partitioned Sol all-selected arithmetic gate failed: {gate}"
+                )
+        except BaseException:
+            state.validation_state.publish_failure(ticket)
+            raise
+        state.validation_state.record_gate(
+            ticket, mode=mode, gate_wall_s=gate_wall_s,
+            metrics=gate, telemetry=gate_telemetry,
+            context=validation_context,
+        )
+        state.validation_state.publish_success(ticket, gate)
+        if len(state.gates) < 32:
+            state.gates.append(
+                {
+                    "route": PARTITIONED_REQUEST_ABI,
+                    "kind": kind,
+                    "shape": [1, q.shape[1], q.shape[0], q.shape[2]],
+                    "kv_shape": [1, k.shape[1], k.shape[0], k.shape[2]],
+                    "mapped_neighbor_abi": mapped is not None,
+                    "key_measure_bias": key_bias is not None,
+                    "gate_wall_s": gate_wall_s,
+                    "attribution": dict(gate_telemetry),
+                    "arithmetic_key_digest": ticket.digest or None,
+                    **gate,
+                }
+            )
+
+    from .sparse import _accumulate_attribution
+    production_telemetry = {}
+    production_sample = diagnostics.begin_sample(
+        "partitioned_production_sparse", q.device, context=diagnostic_context
+    )
+    production_started = time.perf_counter()
+    with diagnostics.span(production_sample, "production_call"):
+        result = _sm120_union(
             q,
             k,
             v,
             tau=config.tau,
             scale=scale,
-            sink_rows=int(k.shape[0]),
+            sink_rows=exact_end,
             key_bias=key_bias,
             mapped_neighbor_intervals=mapped,
+            telemetry=production_telemetry,
+            diagnostic_state=diagnostics,
+            diagnostic_sample=production_sample,
         )
-        want = _weighted_dense(q, k, v, key_bias, scale=scale)
-        gate = error_metrics(
-            got.transpose(0, 1).unsqueeze(0),
-            want.transpose(0, 1).unsqueeze(0),
-        )
-        if not arithmetic_gate_passes(gate):
-            raise RuntimeError(f"partitioned Sol all-selected arithmetic gate failed: {gate}")
-        verified.add(layout_key)
-        state.gates.append(
-            {
-                "route": PARTITIONED_REQUEST_ABI,
-                "kind": kind,
-                "shape": [1, q.shape[1], q.shape[0], q.shape[2]],
-                "kv_shape": [1, k.shape[1], k.shape[0], k.shape[2]],
-                "mapped_neighbor_abi": mapped is not None,
-                "key_measure_bias": key_bias is not None,
-                **gate,
-            }
-        )
-
-    result = _sm120_union(
-        q,
-        k,
-        v,
-        tau=config.tau,
-        scale=scale,
-        sink_rows=exact_end,
-        key_bias=key_bias,
-        mapped_neighbor_intervals=mapped,
+    production_host_wall_s = time.perf_counter() - production_started
+    _accumulate_attribution(
+        state, "partitioned_production_sparse", production_telemetry,
+        production_host_wall_s,
+    )
+    state.validation_state.record_production(
+        production_host_wall_s, production_telemetry
     )
     state.partitioned_sparse_calls = getattr(state, "partitioned_sparse_calls", 0) + 1
     state.partitioned_requested_q_rows = getattr(state, "partitioned_requested_q_rows", 0) + int(q.shape[0])
