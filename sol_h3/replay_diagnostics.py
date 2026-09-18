@@ -208,6 +208,24 @@ class ReplayDiagnosticState:
             },
         }
 
+    def record_capture_error(self, target, context, exc):
+        self.errors += 1
+        self._reports.append(
+            {
+                "target": target,
+                "context": dict(context or {}),
+                "arms": [],
+                "rng_restored": None,
+                "provider_history_reentered": False,
+                "vdn_runtime_reentered": False,
+                "bsa_pool_reentered": False,
+                "stream_policy": "current_stream_only",
+                "output_policy": "discarded",
+                "error": f"{type(exc).__name__}: {exc}",
+                "host_wall_s": 0.0,
+            }
+        )
+
     def execute(
         self,
         *,
