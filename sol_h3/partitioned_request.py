@@ -510,7 +510,11 @@ def partitioned_request_attention(
         }
     )
     from ._vendor.sol_attn import interface as sol_interface
-    state.runtime_lease.bind_partitioned(sol_interface, q.device)
+    runtime_changed = state.runtime_lease.bind_partitioned(sol_interface, q.device)
+    if runtime_changed:
+        state.validation_state.invalidate("new_runtime")
+        if hasattr(state, "partitioned_sparse_verified"):
+            state.partitioned_sparse_verified.clear()
     from .validation import build_arithmetic_key
     mode = (
         "partitioned_mapped_weighted_v1" if mapped is not None and key_bias is not None
@@ -540,6 +544,7 @@ def partitioned_request_attention(
         gate_started = time.perf_counter()
         gate_telemetry = {}
         try:
+            all_selected_started = time.perf_counter()
             got = _sm120_union(
                 q,
                 k,
@@ -551,10 +556,21 @@ def partitioned_request_attention(
                 mapped_neighbor_intervals=mapped,
                 telemetry=gate_telemetry,
             )
+            gate_telemetry["all_selected_host_wall_s"] = (
+                time.perf_counter() - all_selected_started
+            )
+            reference_started = time.perf_counter()
             want = _weighted_dense(q, k, v, key_bias, scale=scale)
+            gate_telemetry["reference_host_wall_s"] = (
+                time.perf_counter() - reference_started
+            )
+            reduction_started = time.perf_counter()
             gate = error_metrics(
                 got.transpose(0, 1).unsqueeze(0),
                 want.transpose(0, 1).unsqueeze(0),
+            )
+            gate_telemetry["reduction_host_wall_s"] = (
+                time.perf_counter() - reduction_started
             )
             gate_wall_s = time.perf_counter() - gate_started
             _accumulate_attribution(
@@ -607,7 +623,9 @@ def partitioned_request_attention(
         state, "partitioned_production_sparse", production_telemetry,
         production_host_wall_s,
     )
-    state.validation_state.record_production(production_host_wall_s)
+    state.validation_state.record_production(
+        production_host_wall_s, production_telemetry
+    )
     state.partitioned_sparse_calls = getattr(state, "partitioned_sparse_calls", 0) + 1
     state.partitioned_requested_q_rows = getattr(state, "partitioned_requested_q_rows", 0) + int(q.shape[0])
     state.partitioned_kernel_q_rows = getattr(state, "partitioned_kernel_q_rows", 0) + int(q.shape[0])

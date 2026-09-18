@@ -167,6 +167,9 @@ def _accumulate_attribution(state, phase, telemetry, host_wall_s=None):
         "compile_lock_wait_s",
         "compile_body_s",
         "dispatch_host_enqueue_s",
+        "all_selected_host_wall_s",
+        "reference_host_wall_s",
+        "reduction_host_wall_s",
         "source_verify_s",
     ):
         value = telemetry.get(name)
@@ -243,7 +246,10 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         state.kernel_device = q.device
     elif q.device != state.kernel_device:
         raise RuntimeError("SOL compute device changed within a sampling request")
-    state.runtime_lease.bind_kernel(state.kernel, q.device)
+    runtime_changed = state.runtime_lease.bind_kernel(state.kernel, q.device)
+    if runtime_changed:
+        state.validation_state.invalidate("new_runtime")
+        state.sparse_verified.clear()
 
     qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
@@ -287,14 +293,26 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     if calibrating:
         gate_telemetry = {}
         try:
+            all_selected_started = time.perf_counter()
             got = _kernel_call(
                 state.kernel, qb, kb, vb, telemetry=gate_telemetry,
                 tau=config.tau, thresh_type="diag", kv_splits=1,
                 sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
                 mapped_neighbor_intervals=mapped_neighbor_intervals,
             )
+            gate_telemetry["all_selected_host_wall_s"] = (
+                time.perf_counter() - all_selected_started
+            )
+            reference_started = time.perf_counter()
             want = _dense_reference(q, k, v, None, key_bias=key_bias)
+            gate_telemetry["reference_host_wall_s"] = (
+                time.perf_counter() - reference_started
+            )
+            reduction_started = time.perf_counter()
             metrics = error_metrics(got, want)
+            gate_telemetry["reduction_host_wall_s"] = (
+                time.perf_counter() - reduction_started
+            )
             gate_wall_s = time.perf_counter() - gate_started
             _accumulate_attribution(state, "arithmetic_gate", gate_telemetry, gate_wall_s)
             if not arithmetic_gate_passes(metrics):
@@ -346,7 +364,9 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         state, "production_sparse", production_telemetry,
         production_host_wall_s,
     )
-    state.validation_state.record_production(production_host_wall_s)
+    state.validation_state.record_production(
+        production_host_wall_s, production_telemetry
+    )
     if prefix and recompute_prefix_queries:
         out[:, :prefix] = _dense_reference(
             q[:, :, :prefix], k, v, dense_attention, key_bias=key_bias

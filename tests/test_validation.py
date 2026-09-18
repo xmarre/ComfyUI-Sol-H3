@@ -137,3 +137,26 @@ def test_partitioned_binding_does_not_change_ordinary_namespace(monkeypatch):
     lease.bind_kernel(Kernel(), torch.device("cpu"))
     ordinary = lease.compiler_namespace_for("ordinary_unweighted_v1")
     assert ordinary == ("ordinary",)
+
+
+def test_loaded_ordinary_runtime_replacement_reports_transition(monkeypatch):
+    lease = validation.RuntimeLease()
+    monkeypatch.setattr(
+        validation,
+        "_device_identity",
+        lambda device: {"type": "cpu", "index": None, "process": 1},
+    )
+    lease.source_verified = True
+    lease.source_generation = "source"
+    lease.implementation_generation = "impl"
+    lease.device_identity = {"type": "cpu", "index": None, "process": 1}
+
+    class Kernel:
+        backend_name = "cute_sm120"
+        block_size = 64
+
+        def __init__(self, generation):
+            self.compiler_namespace = ("compiler", generation)
+
+    assert lease.bind_kernel(Kernel(1), torch.device("cpu")) is False
+    assert lease.bind_kernel(Kernel(2), torch.device("cpu")) is True

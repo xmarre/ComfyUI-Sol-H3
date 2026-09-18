@@ -281,3 +281,41 @@ def test_gate_exception_releases_inflight_validation_owner(monkeypatch):
     with pytest.raises(RuntimeError, match="synthetic gate failure"):
         sparse.attention(q, q, q, 0, state.config, state)
     assert state.validation_state.summary()["failures"] == 1
+
+
+def test_fresh_request_revalidates_with_retained_executable(monkeypatch):
+    compiled = {"ready": False}
+
+    def kernel(q, k, v, _telemetry=None, **kw):
+        if _telemetry is not None:
+            _telemetry["compiler_key"] = "stable-test-key"
+            if compiled["ready"]:
+                _telemetry["compile_hit"] = True
+            else:
+                _telemetry["compile_miss"] = True
+                compiled["ready"] = True
+        bias = kw.get("key_bias")
+        mask = None if bias is None else bias.view(1, 1, 1, -1)
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask
+        ).transpose(1, 2)
+
+    kernel.supports_attribution = True
+    kernel.compiler_namespace = ("persistent-executable",)
+    monkeypatch.setattr(sparse, "load_kernel", lambda device: kernel)
+    q = torch.randn(1, 2, 9, 128).to(torch.bfloat16)
+
+    first = Request(Config(exact=False, backend="sol"))
+    sparse.attention(q, q, q, 0, first.config, first, recompute_prefix_queries=False)
+    first_summary = first.validation_state.summary()
+    assert first_summary["misses"] == 1
+    assert first_summary["compile_misses"] == 1
+    assert first_summary["compile_hits"] >= 1
+
+    second = Request(Config(exact=False, backend="sol"))
+    sparse.attention(q, q, q, 0, second.config, second, recompute_prefix_queries=False)
+    second_summary = second.validation_state.summary()
+    assert second_summary["misses"] == 1
+    assert second_summary["hits"] == 0
+    assert second_summary["compile_misses"] == 0
+    assert second_summary["compile_hits"] >= 2

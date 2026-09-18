@@ -131,13 +131,15 @@ class RuntimeLease:
             getattr(kernel, "backend_name", None),
             getattr(kernel, "block_size", None),
         )
-        namespace = getattr(kernel, "compiler_namespace", ("test_substitute", id(kernel)))
+        namespace = tuple(getattr(kernel, "compiler_namespace", ("test_substitute", id(kernel))))
         with self._lock:
-            if self.ordinary_runtime_identity is None:
-                self.ordinary_runtime_identity = identity
-                self.ordinary_compiler_namespace = tuple(namespace)
-            elif self.ordinary_runtime_identity != identity:
-                raise RuntimeError("Sol-H3 loaded ordinary kernel identity changed within one request")
+            changed = self.ordinary_runtime_identity is not None and (
+                self.ordinary_runtime_identity != identity
+                or self.ordinary_compiler_namespace != namespace
+            )
+            self.ordinary_runtime_identity = identity
+            self.ordinary_compiler_namespace = namespace
+            return changed
 
     def bind_partitioned(self, interface, device):
         self.ensure_source_verified(device)
@@ -154,13 +156,15 @@ class RuntimeLease:
             id(original_compile),
             getattr(interface, "MAPPED_NEIGHBOR_CONTRACT", None),
         )
-        namespace = compiler_namespace(interface)
+        namespace = tuple(compiler_namespace(interface))
         with self._lock:
-            if self.partitioned_runtime_identity is None:
-                self.partitioned_runtime_identity = identity
-                self.partitioned_compiler_namespace = tuple(namespace)
-            elif self.partitioned_runtime_identity != identity:
-                raise RuntimeError("Sol-H3 loaded partitioned kernel identity changed within one request")
+            changed = self.partitioned_runtime_identity is not None and (
+                self.partitioned_runtime_identity != identity
+                or self.partitioned_compiler_namespace != namespace
+            )
+            self.partitioned_runtime_identity = identity
+            self.partitioned_compiler_namespace = namespace
+            return changed
 
     def runtime_identity_for(self, mode):
         value = (
@@ -394,6 +398,9 @@ class ArithmeticValidationState:
                 "compile_body_s": telemetry.get("compile_body_s"),
                 "prepare_jit_host_wall_s": telemetry.get("prepare_jit_host_wall_s"),
                 "dispatch_host_enqueue_s": telemetry.get("dispatch_host_enqueue_s"),
+                "all_selected_host_wall_s": telemetry.get("all_selected_host_wall_s"),
+                "reference_host_wall_s": telemetry.get("reference_host_wall_s"),
+                "reduction_host_wall_s": telemetry.get("reduction_host_wall_s"),
                 **{
                     name: metrics.get(name)
                     for name in (
@@ -403,9 +410,16 @@ class ArithmeticValidationState:
                 },
             })
 
-    def record_production(self, host_wall_s):
+    def record_production(self, host_wall_s, telemetry=None):
+        telemetry = telemetry or {}
         self.stats["production_calls"] += 1
         self.production_host_wall_s += float(host_wall_s)
+        if telemetry.get("compile_hit"):
+            self.stats["compile_hits"] += 1
+        if telemetry.get("compile_miss"):
+            self.stats["compile_misses"] += 1
+        if telemetry.get("compile_race_hit"):
+            self.stats["compile_race_hits"] += 1
 
     def summary(self):
         return {
