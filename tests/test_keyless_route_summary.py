@@ -108,3 +108,16 @@ def test_native_route_summary_rejects_noncanonical_epsilon_before_launch(monkeyp
         summary.route_summary_reference(v, weight, math.nan, rope)
     assert summary.NORM_EPS == 1e-5
     assert summary.CONTRACT == "sol-h3-keyless-route-summary-v1"
+
+
+def test_materialized_native_route_diagnostic_fails_closed_without_cuda():
+    v = torch.ones(3, 2, summary.HEAD_DIM, dtype=torch.bfloat16)
+    weight = torch.ones(summary.HEAD_DIM, dtype=torch.bfloat16)
+    rope = _rope(v.shape[0])
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        summary.materialized_native_route_diagnostic(
+            v,
+            weight,
+            summary.NORM_EPS,
+            rope,
+        )
