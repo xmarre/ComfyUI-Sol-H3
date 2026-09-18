@@ -330,6 +330,134 @@ def _sm120_union(
     return output[0]
 
 
+def _replay_partitioned_suffix(
+    q,
+    k,
+    v,
+    *,
+    key_bias,
+    mapped_neighbor_intervals,
+    exact_end,
+    config,
+    state,
+    arithmetic_key,
+    validation_context,
+    kind,
+):
+    target = state.replay_diagnostics.claim_partitioned_suffix(
+        kind=kind,
+        mapped=mapped_neighbor_intervals is not None,
+        force_dense=False,
+    )
+    if target is None:
+        return
+    diagnostics = state.cuda_diagnostics
+    if not diagnostics.enabled:
+        if state.replay_diagnostics.configuration_error is None:
+            state.replay_diagnostics.configuration_error = (
+                "SOL_H3_REPLAY_DIAGNOSTICS requires SOL_H3_CUDA_DIAGNOSTICS"
+            )
+            state.replay_diagnostics.errors += 1
+        return
+
+    from .replay_diagnostics import clone_tensors_preserve_layout
+
+    context = {
+        "mode": arithmetic_key.get("mode"),
+        **dict(validation_context or {}),
+        "snapshot_logical_bytes": sum(
+            tensor.numel() * tensor.element_size() for tensor in (q, k, v)
+        ),
+    }
+    try:
+        replay_q, replay_k, replay_v = clone_tensors_preserve_layout((q, k, v))
+        replay_bias = None if key_bias is None else key_bias.clone()
+        replay_mapped = (
+            None
+            if mapped_neighbor_intervals is None
+            else mapped_neighbor_intervals.clone()
+        )
+
+        def gate(sample, _arm):
+            telemetry = {}
+            all_selected_started = time.perf_counter()
+            with diagnostics.span(sample, "all_selected_call"):
+                got = _sm120_union(
+                    replay_q,
+                    replay_k,
+                    replay_v,
+                    tau=config.tau,
+                    scale=replay_q.shape[-1] ** -0.5,
+                    sink_rows=int(replay_k.shape[0]),
+                    key_bias=replay_bias,
+                    mapped_neighbor_intervals=replay_mapped,
+                    telemetry=telemetry,
+                    diagnostic_state=diagnostics,
+                    diagnostic_sample=sample,
+                )
+            telemetry["all_selected_host_wall_s"] = (
+                time.perf_counter() - all_selected_started
+            )
+            reference_started = time.perf_counter()
+            with diagnostics.span(sample, "dense_reference"):
+                want = _weighted_dense(
+                    replay_q,
+                    replay_k,
+                    replay_v,
+                    replay_bias,
+                    scale=replay_q.shape[-1] ** -0.5,
+                )
+            telemetry["reference_host_wall_s"] = (
+                time.perf_counter() - reference_started
+            )
+            reduction_started = time.perf_counter()
+            with diagnostics.span(sample, "error_reduction"):
+                metrics = error_metrics(
+                    got.transpose(0, 1).unsqueeze(0),
+                    want.transpose(0, 1).unsqueeze(0),
+                )
+            telemetry["reduction_host_wall_s"] = (
+                time.perf_counter() - reduction_started
+            )
+            del got, want
+            if not arithmetic_gate_passes(metrics):
+                raise RuntimeError(
+                    f"partitioned Sol replay arithmetic gate failed: {metrics}"
+                )
+            return metrics, telemetry
+
+        def production(sample, _arm):
+            telemetry = {}
+            with diagnostics.span(sample, "production_call"):
+                output = _sm120_union(
+                    replay_q,
+                    replay_k,
+                    replay_v,
+                    tau=config.tau,
+                    scale=replay_q.shape[-1] ** -0.5,
+                    sink_rows=exact_end,
+                    key_bias=replay_bias,
+                    mapped_neighbor_intervals=replay_mapped,
+                    telemetry=telemetry,
+                    diagnostic_state=diagnostics,
+                    diagnostic_sample=sample,
+                )
+            del output
+            return telemetry
+
+        state.replay_diagnostics.execute(
+            target=target,
+            arithmetic_key=arithmetic_key,
+            device=q.device,
+            context=context,
+            cuda_diagnostics=diagnostics,
+            gate=gate,
+            production=production,
+        )
+    except Exception as exc:
+        state.replay_diagnostics.record_capture_error(target, context, exc)
+
+
 def _descriptor_for_wire(
     state,
     wire,
@@ -450,6 +578,7 @@ def partitioned_request_attention(
     stage_runtime = transformer_options.get("h3_flow_partitioned_stage_v1")
     validation_context = {
         "flow_request_id": transformer_options.get("h3_flow_request_id_v1"),
+        "flow_stage": transformer_options.get("h3_flow_stage"),
         "flow_stage_id": transformer_options.get("h3_flow_stage_id_v1"),
         "flow_evaluation_id": transformer_options.get("h3_flow_evaluation_id_v1"),
         "sol_evaluation": int(evaluation),
@@ -561,6 +690,19 @@ def partitioned_request_attention(
         # Conservative by design: current partitioned proof identity still
         # retains map/group ownership until CUDA replay proves quotient safety.
         physical_identity=calibration_identity,
+    )
+    _replay_partitioned_suffix(
+        q,
+        k,
+        v,
+        key_bias=key_bias,
+        mapped_neighbor_intervals=mapped,
+        exact_end=exact_end,
+        config=config,
+        state=state,
+        arithmetic_key=arithmetic_key,
+        validation_context=validation_context,
+        kind=kind,
     )
     ticket = state.validation_state.begin(arithmetic_key)
     diagnostics = state.cuda_diagnostics
