@@ -88,6 +88,10 @@ def test_provenance_and_interface_use_new_contract_without_relabeling_old_one():
     interface = _read("sol_h3/_vendor/sol_attn/interface.py")
     assert f"CONTRACT = '{SOURCE_CONTRACT}'" in provenance
     assert f'KEYLESS_FUSED_CONTRACT = "{SOURCE_CONTRACT}"' in interface
-    assert 'MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"' in interface
+    assert (
+        'MAPPED_NEIGHBOR_CONTRACT = '
+        '"sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"'
+        in interface
+    )
     assert "keyless_enabled=False" in interface
     assert "sol_attn_keyless(" in interface
