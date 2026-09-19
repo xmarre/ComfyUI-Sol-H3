@@ -44,6 +44,24 @@ def test_native_sm120_routes_selected_k_inside_cta_and_keeps_pv_raw():
     assert "route_inv_rms" not in source
 
 
+def test_native_keyless_specialization_preserves_historical_tensor_abi():
+    mainloop = _read("sol_h3/_vendor/sol_attn/sm120/mainloop.py")
+    interface = _read("sol_h3/_vendor/sol_attn/interface.py")
+    call_start = mainloop.index("    def __call__(")
+    call_end = mainloop.index("        softmax_scale:", call_start)
+    call_signature = mainloop[call_start:call_end]
+    assert "route_norm_weight" not in call_signature
+    assert "route_freqs" not in call_signature
+    assert "mKeyBias," in mainloop
+    assert "mMappedNeighborIntervals," in mainloop
+    assert "route_keyless_smem_in_place(" in mainloop
+    assert "route_freqs[batch_idx, absolute_row, 0, pair, 0, 0]" in mainloop
+    assert "route_freqs[batch_idx, absolute_row, 0, pair, 1, 0]" in mainloop
+    assert "route_norm_weight," in interface
+    assert "route_freqs," in interface
+    assert "q, k, v, output, kc, vc, threshold," in interface
+
+
 def test_native_k4_probe_binds_isolation_and_stays_threshold_free():
     source = _read("tools/keyless_k4_native_sm120_probe.py")
     assert 'PROBE_CONTRACT = "sol-h3-keyless-k4-native-sm120-probe-v1"' in source
