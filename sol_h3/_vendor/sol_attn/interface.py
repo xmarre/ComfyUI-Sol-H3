@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry, runtime mapped-neighbor metadata, and native Keyless selected-route execution; see tools/rectangular_sm120.patch, tools/mapped_neighbor_sm120.patch, and tools/keyless_fused_sm120.patch.
 """Public Sol-Attn interface."""
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import torch
 
 BLOCK_SIZE = 64
 MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"
+KEYLESS_FUSED_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-keyless-fused-v1"
 _CUTE_BACKENDS = {
     (9, 0): "cute_sm90",
     (10, 0): "cute_sm100",
@@ -206,6 +207,8 @@ def _compile_sm120(
     stream,
     key_bias_enabled,
     mapped_neighbors_enabled,
+    debug_route_trace=False,
+    keyless_enabled=False,
 ):
     import cutlass.cute as cute
 
@@ -214,6 +217,8 @@ def _compile_sm120(
     operator = make_kernel(
         key_bias_enabled=key_bias_enabled,
         mapped_neighbors_enabled=mapped_neighbors_enabled,
+        debug_route_trace=debug_route_trace,
+        keyless_enabled=keyless_enabled,
     )
     args = _to_cute_tensors(tensors)
     compiled = cute.compile(
@@ -406,6 +411,237 @@ def _sol_attn_cute(
     return output[:, :tokens]
 
 
+
+def _validate_keyless_native_inputs(
+    q,
+    v,
+    route_centroid,
+    value_sum,
+    threshold,
+    route_norm_weight,
+    route_freqs,
+    *,
+    sink_tokens,
+    sink_start,
+):
+    arch = _validate_inputs(
+        q,
+        v,
+        v,
+        "diag",
+        sink_tokens,
+        sink_start,
+    )
+    if arch != (12, 0):
+        raise RuntimeError("fused Keyless Sol-Attn requires SM120")
+    if _backend_for_arch(arch) != "cute_sm120":
+        raise RuntimeError("fused Keyless Sol-Attn requires the SM120 CuTe backend")
+
+    batch, q_tokens, heads, head_dim = q.shape
+    kv_tokens = int(v.shape[1])
+    blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+    q_tiles = (int(q_tokens) + BLOCK_SIZE - 1) // BLOCK_SIZE
+    expected_summary = (batch, blocks, heads, head_dim)
+    if tuple(route_centroid.shape) != expected_summary:
+        raise ValueError(
+            f"route_centroid must have shape {expected_summary}, "
+            f"got {tuple(route_centroid.shape)}"
+        )
+    if tuple(value_sum.shape) != expected_summary:
+        raise ValueError(
+            f"value_sum must have shape {expected_summary}, got {tuple(value_sum.shape)}"
+        )
+    if tuple(threshold.shape) != (batch, q_tiles, heads):
+        raise ValueError(
+            "threshold must be [B,ceil(Tq/64),H] for fused Keyless Sol-Attn"
+        )
+    if tuple(route_norm_weight.shape) != (head_dim,):
+        raise ValueError("route_norm_weight must be [128]")
+    expected_rope = (batch, kv_tokens, 1, 48, 2, 2)
+    if tuple(route_freqs.shape) != expected_rope:
+        raise ValueError(
+            f"route_freqs must have shape {expected_rope}, "
+            f"got {tuple(route_freqs.shape)}"
+        )
+
+    if route_centroid.dtype != torch.bfloat16 or value_sum.dtype != torch.bfloat16:
+        raise TypeError("Keyless route summaries must be BF16")
+    if threshold.dtype != torch.float32:
+        raise TypeError("Keyless threshold must be FP32")
+    if route_norm_weight.dtype != torch.bfloat16:
+        raise TypeError("Keyless route_norm_weight must be BF16")
+    if route_freqs.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError("Keyless route_freqs must be BF16 or FP32")
+    for name, tensor in (
+        ("route_centroid", route_centroid),
+        ("value_sum", value_sum),
+        ("threshold", threshold),
+        ("route_norm_weight", route_norm_weight),
+        ("route_freqs", route_freqs),
+    ):
+        if tensor.device != q.device:
+            raise ValueError(f"{name} must share the Q/V CUDA device")
+    if route_norm_weight.stride(0) != 1:
+        raise ValueError("route_norm_weight must be contiguous")
+    return arch
+
+
+def _sol_attn_keyless_cute(
+    q,
+    v,
+    route_centroid,
+    value_sum,
+    threshold,
+    route_norm_weight,
+    route_freqs,
+    *,
+    arch,
+    scale,
+    sink_tokens,
+    sink_start,
+    debug_route_trace,
+):
+    batch, q_tokens, heads, _ = q.shape
+    kv_tokens = int(v.shape[1])
+    q_tiles = (int(q_tokens) + BLOCK_SIZE - 1) // BLOCK_SIZE
+    kv_blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+    route_groups = (kv_blocks + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    with torch.cuda.device(q.device):
+        output = torch.empty_like(q)
+        if debug_route_trace:
+            lse_or_trace = torch.zeros(
+                (batch, q_tiles, heads, route_groups, 2),
+                device=q.device,
+                dtype=torch.int32,
+            )
+        else:
+            lse_or_trace = torch.empty(
+                (batch, q_tokens, heads),
+                device=q.device,
+                dtype=torch.float32,
+            )
+        sink_start_block, sink_end_block = _sink_block_range(
+            kv_tokens,
+            sink_start,
+            sink_tokens,
+        )
+        stream = _stream(q.device)
+        tensors = [
+            q,
+            v,
+            v,
+            output,
+            route_centroid,
+            value_sum,
+            threshold,
+            route_norm_weight,
+            route_freqs,
+            lse_or_trace,
+        ]
+        layout_key = tuple(
+            (
+                tuple(int(v) for v in tensor.shape),
+                tuple(int(v) for v in tensor.stride()),
+                str(tensor.dtype),
+            )
+            for tensor in tensors
+        )
+        key = (
+            q.device.index,
+            arch,
+            KEYLESS_FUSED_CONTRACT,
+            bool(debug_route_trace),
+            layout_key,
+        )
+        compiled = _compiled.get(key)
+        if compiled is None:
+            with _compile_lock:
+                compiled = _compiled.get(key)
+                if compiled is None:
+                    compiled, args = _compile_sm120(
+                        key,
+                        tensors,
+                        scale,
+                        sink_start_block,
+                        sink_end_block,
+                        stream,
+                        False,
+                        False,
+                        bool(debug_route_trace),
+                        True,
+                    )
+                else:
+                    args = _to_cute_tensors(tensors)
+        else:
+            args = _to_cute_tensors(tensors)
+        compiled(
+            *args,
+            scale,
+            sink_start_block,
+            sink_end_block,
+            stream=stream,
+        )
+    if debug_route_trace:
+        return output, lse_or_trace
+    return output
+
+
+def sol_attn_keyless(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    route_centroid: torch.Tensor,
+    value_sum: torch.Tensor,
+    threshold: torch.Tensor,
+    route_norm_weight: torch.Tensor,
+    route_freqs: torch.Tensor,
+    *,
+    scale: float | None = None,
+    sink_tokens: int = 0,
+    sink_start: int | None = None,
+    debug_route_trace: bool = False,
+):
+    """Run the SM120 no-global-route Keyless Sol candidate.
+
+    Q is already normalized/positioned.  The K TMA path receives raw V and
+    routes only selected exact K tiles inside bounded CTA shared memory before
+    QK MMA.  PV always consumes raw V.  RC/VC/threshold are caller-owned proven
+    K1/K3 summaries. Route metadata reuses the two historical optional SM120
+    tensor slots under the Keyless-only compile-time specialization. This entry
+    point never materializes a global route tensor.
+    """
+    arch = _validate_keyless_native_inputs(
+        q,
+        v,
+        route_centroid,
+        value_sum,
+        threshold,
+        route_norm_weight,
+        route_freqs,
+        sink_tokens=sink_tokens,
+        sink_start=sink_start,
+    )
+    if type(debug_route_trace) is not bool:
+        raise TypeError("debug_route_trace must be bool")
+    _validate_cute(arch, v.shape[1], 1)
+    scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("fused Keyless attention scale must be finite and positive")
+    return _sol_attn_keyless_cute(
+        q,
+        v,
+        route_centroid,
+        value_sum,
+        threshold,
+        route_norm_weight,
+        route_freqs,
+        arch=arch,
+        scale=scale,
+        sink_tokens=sink_tokens,
+        sink_start=sink_start,
+        debug_route_trace=debug_route_trace,
+    )
+
 def _pad_to_bucket(q, k, v, bucket_size: int):
     """Pad BTHD inputs to a stable compile shape while preserving a logical length."""
     tokens = q.shape[1]
@@ -567,4 +803,4 @@ def sol_attn(
     )
 
 
-__all__ = ["get_sol_attn_backend", "sol_attn"]
+__all__ = ["KEYLESS_FUSED_CONTRACT", "get_sol_attn_backend", "sol_attn", "sol_attn_keyless"]
