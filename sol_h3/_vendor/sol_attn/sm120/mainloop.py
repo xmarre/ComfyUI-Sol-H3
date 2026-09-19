@@ -1008,14 +1008,13 @@ def route_keyless_smem_in_place(
             sum_sq += cute.arch.shuffle_sync_down(sum_sq, offset)
         sum_sq = cute.arch.shuffle_sync(sum_sq, 0)
         if lane == 0:
-            inv_rms_scratch[row] = (
-                cute.math.rsqrt(
+            inv_rms = cutlass.Float32(0.0)
+            if valid:
+                inv_rms = cute.math.rsqrt(
                     sum_sq / cutlass.Float32(D) + cutlass.Float32(1.0e-5),
                     fastmath=True,
                 )
-                if valid
-                else cutlass.Float32(0.0)
-            )
+            inv_rms_scratch[row] = inv_rms
     cute.arch.fence_view_async_shared()
     cute.arch.sync_threads()
 
