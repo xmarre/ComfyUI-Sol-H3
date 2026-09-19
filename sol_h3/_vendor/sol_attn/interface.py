@@ -421,7 +421,6 @@ def _validate_keyless_native_inputs(
     route_centroid,
     value_sum,
     threshold,
-    route_inv_rms,
     route_norm_weight,
     route_cos,
     route_sin,
@@ -460,8 +459,6 @@ def _validate_keyless_native_inputs(
         raise ValueError(
             "threshold must be [B,ceil(Tq/64),H] for fused Keyless Sol-Attn"
         )
-    if tuple(route_inv_rms.shape) != (batch, kv_tokens, heads):
-        raise ValueError("route_inv_rms must be [B,Tv,H]")
     if tuple(route_norm_weight.shape) != (head_dim,):
         raise ValueError("route_norm_weight must be [128]")
     if tuple(route_cos.shape) != (batch, kv_tokens, 48):
@@ -471,8 +468,8 @@ def _validate_keyless_native_inputs(
 
     if route_centroid.dtype != torch.bfloat16 or value_sum.dtype != torch.bfloat16:
         raise TypeError("Keyless route summaries must be BF16")
-    if threshold.dtype != torch.float32 or route_inv_rms.dtype != torch.float32:
-        raise TypeError("Keyless threshold and inverse RMS must be FP32")
+    if threshold.dtype != torch.float32:
+        raise TypeError("Keyless threshold must be FP32")
     if route_norm_weight.dtype != torch.bfloat16:
         raise TypeError("Keyless route_norm_weight must be BF16")
     if route_cos.dtype not in (torch.bfloat16, torch.float32):
@@ -483,7 +480,6 @@ def _validate_keyless_native_inputs(
         ("route_centroid", route_centroid),
         ("value_sum", value_sum),
         ("threshold", threshold),
-        ("route_inv_rms", route_inv_rms),
         ("route_norm_weight", route_norm_weight),
         ("route_cos", route_cos),
         ("route_sin", route_sin),
@@ -501,7 +497,6 @@ def _sol_attn_keyless_cute(
     route_centroid,
     value_sum,
     threshold,
-    route_inv_rms,
     route_norm_weight,
     route_cos,
     route_sin,
@@ -550,7 +545,6 @@ def _sol_attn_keyless_cute(
             disabled_optional,
             disabled_optional,
             lse_or_trace,
-            route_inv_rms,
             route_norm_weight,
             route_cos,
             route_sin,
@@ -609,7 +603,6 @@ def sol_attn_keyless(
     route_centroid: torch.Tensor,
     value_sum: torch.Tensor,
     threshold: torch.Tensor,
-    route_inv_rms: torch.Tensor,
     route_norm_weight: torch.Tensor,
     route_cos: torch.Tensor,
     route_sin: torch.Tensor,
@@ -632,7 +625,6 @@ def sol_attn_keyless(
         route_centroid,
         value_sum,
         threshold,
-        route_inv_rms,
         route_norm_weight,
         route_cos,
         route_sin,
@@ -651,7 +643,6 @@ def sol_attn_keyless(
         route_centroid,
         value_sum,
         threshold,
-        route_inv_rms,
         route_norm_weight,
         route_cos,
         route_sin,
