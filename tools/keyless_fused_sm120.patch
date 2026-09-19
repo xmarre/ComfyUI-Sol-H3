@@ -11,7 +11,7 @@ index d37351d..9118542 100644
 -__all__ = ["get_sol_attn_backend", "sol_attn"]
 +__all__ = ["KEYLESS_FUSED_CONTRACT", "get_sol_attn_backend", "sol_attn", "sol_attn_keyless"]
 diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/interface.py
-index e63156d..d7dda2a 100644
+index e63156d..4a78e01 100644
 --- a/sol_h3/_vendor/sol_attn/interface.py
 +++ b/sol_h3/_vendor/sol_attn/interface.py
 @@ -1,4 +1,4 @@
@@ -46,15 +46,7 @@ index e63156d..d7dda2a 100644
      )
      args = _to_cute_tensors(tensors)
      compiled = cute.compile(
-@@ -374,6 +379,7 @@ def _sol_attn_cute(
-             tensors = [
-                 q, k, v, output, kc, vc, threshold,
-                 key_bias_arg, mapped_arg, lse,
-+                threshold, threshold, threshold,
-             ]
-             compiled = _compiled.get(key)
-             if compiled is None:
-@@ -406,6 +412,246 @@ def _sol_attn_cute(
+@@ -406,6 +411,237 @@ def _sol_attn_cute(
      return output[:, :tokens]
  
  
@@ -66,8 +58,7 @@ index e63156d..d7dda2a 100644
 +    value_sum,
 +    threshold,
 +    route_norm_weight,
-+    route_cos,
-+    route_sin,
++    route_freqs,
 +    *,
 +    sink_tokens,
 +    sink_start,
@@ -105,10 +96,12 @@ index e63156d..d7dda2a 100644
 +        )
 +    if tuple(route_norm_weight.shape) != (head_dim,):
 +        raise ValueError("route_norm_weight must be [128]")
-+    if tuple(route_cos.shape) != (batch, kv_tokens, 48):
-+        raise ValueError("route_cos must be [B,Tv,48]")
-+    if tuple(route_sin.shape) != tuple(route_cos.shape):
-+        raise ValueError("route_sin must match route_cos")
++    expected_rope = (batch, kv_tokens, 1, 48, 2, 2)
++    if tuple(route_freqs.shape) != expected_rope:
++        raise ValueError(
++            f"route_freqs must have shape {expected_rope}, "
++            f"got {tuple(route_freqs.shape)}"
++        )
 +
 +    if route_centroid.dtype != torch.bfloat16 or value_sum.dtype != torch.bfloat16:
 +        raise TypeError("Keyless route summaries must be BF16")
@@ -116,17 +109,14 @@ index e63156d..d7dda2a 100644
 +        raise TypeError("Keyless threshold must be FP32")
 +    if route_norm_weight.dtype != torch.bfloat16:
 +        raise TypeError("Keyless route_norm_weight must be BF16")
-+    if route_cos.dtype not in (torch.bfloat16, torch.float32):
-+        raise TypeError("Keyless route cos/sin must be BF16 or FP32")
-+    if route_sin.dtype != route_cos.dtype:
-+        raise TypeError("Keyless route cos/sin dtypes must match")
++    if route_freqs.dtype not in (torch.bfloat16, torch.float32):
++        raise TypeError("Keyless route_freqs must be BF16 or FP32")
 +    for name, tensor in (
 +        ("route_centroid", route_centroid),
 +        ("value_sum", value_sum),
 +        ("threshold", threshold),
 +        ("route_norm_weight", route_norm_weight),
-+        ("route_cos", route_cos),
-+        ("route_sin", route_sin),
++        ("route_freqs", route_freqs),
 +    ):
 +        if tensor.device != q.device:
 +            raise ValueError(f"{name} must share the Q/V CUDA device")
@@ -142,8 +132,7 @@ index e63156d..d7dda2a 100644
 +    value_sum,
 +    threshold,
 +    route_norm_weight,
-+    route_cos,
-+    route_sin,
++    route_freqs,
 +    *,
 +    arch,
 +    scale,
@@ -177,7 +166,6 @@ index e63156d..d7dda2a 100644
 +            sink_tokens,
 +        )
 +        stream = _stream(q.device)
-+        disabled_optional = threshold
 +        tensors = [
 +            q,
 +            v,
@@ -186,12 +174,9 @@ index e63156d..d7dda2a 100644
 +            route_centroid,
 +            value_sum,
 +            threshold,
-+            disabled_optional,
-+            disabled_optional,
-+            lse_or_trace,
 +            route_norm_weight,
-+            route_cos,
-+            route_sin,
++            route_freqs,
++            lse_or_trace,
 +        ]
 +        layout_key = tuple(
 +            (
@@ -248,8 +233,7 @@ index e63156d..d7dda2a 100644
 +    value_sum: torch.Tensor,
 +    threshold: torch.Tensor,
 +    route_norm_weight: torch.Tensor,
-+    route_cos: torch.Tensor,
-+    route_sin: torch.Tensor,
++    route_freqs: torch.Tensor,
 +    *,
 +    scale: float | None = None,
 +    sink_tokens: int = 0,
@@ -260,9 +244,10 @@ index e63156d..d7dda2a 100644
 +
 +    Q is already normalized/positioned.  The K TMA path receives raw V and
 +    routes only selected exact K tiles inside bounded CTA shared memory before
-+    QK MMA.  PV always
-+    consumes raw V.  RC/VC/threshold are caller-owned proven K1/K3 summaries;
-+    this entry point never materializes a global route tensor.
++    QK MMA.  PV always consumes raw V.  RC/VC/threshold are caller-owned proven
++    K1/K3 summaries. Route metadata reuses the two historical optional SM120
++    tensor slots under the Keyless-only compile-time specialization. This entry
++    point never materializes a global route tensor.
 +    """
 +    arch = _validate_keyless_native_inputs(
 +        q,
@@ -271,8 +256,7 @@ index e63156d..d7dda2a 100644
 +        value_sum,
 +        threshold,
 +        route_norm_weight,
-+        route_cos,
-+        route_sin,
++        route_freqs,
 +        sink_tokens=sink_tokens,
 +        sink_start=sink_start,
 +    )
@@ -289,8 +273,7 @@ index e63156d..d7dda2a 100644
 +        value_sum,
 +        threshold,
 +        route_norm_weight,
-+        route_cos,
-+        route_sin,
++        route_freqs,
 +        arch=arch,
 +        scale=scale,
 +        sink_tokens=sink_tokens,
@@ -301,7 +284,7 @@ index e63156d..d7dda2a 100644
  def _pad_to_bucket(q, k, v, bucket_size: int):
      """Pad BTHD inputs to a stable compile shape while preserving a logical length."""
      tokens = q.shape[1]
-@@ -567,4 +813,4 @@ def sol_attn(
+@@ -567,4 +803,4 @@ def sol_attn(
      )
  
  
@@ -328,7 +311,7 @@ index 57feb6f..01f3e14 100644
  
  
 diff --git a/sol_h3/_vendor/sol_attn/sm120/mainloop.py b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
-index 256fa0e..9f82511 100644
+index 256fa0e..11e194e 100644
 --- a/sol_h3/_vendor/sol_attn/sm120/mainloop.py
 +++ b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
 @@ -1,4 +1,4 @@
@@ -353,17 +336,7 @@ index 256fa0e..9f82511 100644
  
      @cute.kernel
      def kernel(
-@@ -74,6 +76,9 @@ def kernel(
-         mKeyBias: cute.Tensor,
-         mMappedNeighborIntervals: cute.Tensor,
-         mLSE: cute.Tensor,
-+        mRouteNormWeight: cute.Tensor,
-+        mRouteCos: cute.Tensor,
-+        mRouteSin: cute.Tensor,
-         tma_atom_Q: cute.CopyAtom,
-         tma_atom_K: cute.CopyAtom,
-         tma_atom_V: cute.CopyAtom,
-@@ -215,6 +220,9 @@ def kernel(
+@@ -215,6 +217,9 @@ def kernel(
          route_meta = cute.make_tensor(
              route_i32_ptr + 6 * N, cute.make_layout(2)
          )
@@ -373,17 +346,7 @@ index 256fa0e..9f82511 100644
  
          mQ_slice = mQ[None, None, head_idx, batch_idx]
          mK_slice = mK[None, None, head_idx, batch_idx]
-@@ -222,6 +230,9 @@ def kernel(
-         mO_slice = mO[None, None, head_idx, batch_idx]
-         mKC_slice = mKC[None, None, head_idx, batch_idx]
-         mVC_slice = mVC[None, None, head_idx, batch_idx]
-+        if cutlass.const_expr(self.keyless_enabled):
-+            mRouteCos_slice = mRouteCos[None, None, batch_idx]
-+            mRouteSin_slice = mRouteSin[None, None, batch_idx]
-         if cutlass.const_expr(not self.debug_route_trace):
-             mLSE_slice = mLSE[None, head_idx, batch_idx]
- 
-@@ -581,6 +592,20 @@ def kernel(
+@@ -581,6 +586,20 @@ def kernel(
                  exact_block = cutlass.Int32(route_indices[ordinal])
                  k_wait = K_pipeline.consumer_try_wait(K_consumer)
                  K_pipeline.consumer_wait(K_consumer, k_wait)
@@ -391,12 +354,12 @@ index 256fa0e..9f82511 100644
 +                    route_keyless_smem_in_place(
 +                        sK,
 +                        K_consumer.index,
-+                        mRouteNormWeight,
-+                        mRouteCos_slice,
-+                        mRouteSin_slice,
++                        mKeyBias,
++                        mMappedNeighborIntervals,
 +                        keyless_inv_rms,
 +                        exact_block,
 +                        token_count,
++                        batch_idx,
 +                        tidx,
 +                        warp,
 +                        lane,
@@ -404,40 +367,7 @@ index 256fa0e..9f82511 100644
                  gemm_smem_zero_acc(
                      tiled_mma_qk,
                      tSrS,
-@@ -729,6 +754,9 @@ def __call__(
-         key_bias: cute.Tensor,
-         mapped_neighbor_intervals: cute.Tensor,
-         lse: cute.Tensor,
-+        route_norm_weight: cute.Tensor,
-+        route_cos: cute.Tensor,
-+        route_sin: cute.Tensor,
-         softmax_scale: cutlass.Float32,
-         sink_start_block: cutlass.Int32,
-         sink_end_block: cutlass.Int32,
-@@ -742,6 +770,12 @@ def __call__(
-             layout_utils.select(t, [3, 1, 2, 0]) for t in (v, vc)
-         ]
-         o_mkl = layout_utils.select(o, [1, 3, 2, 0])
-+        if cutlass.const_expr(self.keyless_enabled):
-+            route_cos_tfb = layout_utils.select(route_cos, [1, 2, 0])
-+            route_sin_tfb = layout_utils.select(route_sin, [1, 2, 0])
-+        else:
-+            route_cos_tfb = route_cos
-+            route_sin_tfb = route_sin
-         if cutlass.const_expr(self.debug_route_trace):
-             lse_target = lse
-         else:
-@@ -905,6 +939,9 @@ class SharedStorage:
-             key_bias,
-             mapped_neighbor_intervals,
-             lse_target,
-+            route_norm_weight,
-+            route_cos_tfb,
-+            route_sin_tfb,
-             tma_atom_Q,
-             tma_atom_K,
-             tma_atom_V,
-@@ -930,6 +967,107 @@ class SharedStorage:
+@@ -930,6 +949,111 @@ class SharedStorage:
          )
  
  
@@ -446,11 +376,11 @@ index 256fa0e..9f82511 100644
 +    sK: cute.Tensor,
 +    stage: cutlass.Int32,
 +    route_norm_weight: cute.Tensor,
-+    route_cos: cute.Tensor,
-+    route_sin: cute.Tensor,
++    route_freqs: cute.Tensor,
 +    inv_rms_scratch: cute.Tensor,
 +    exact_block: cutlass.Int32,
 +    token_count: cutlass.Int32,
++    batch_idx: cutlass.Int32,
 +    tidx: cutlass.Int32,
 +    warp: cutlass.Int32,
 +    lane: cutlass.Int32,
@@ -510,8 +440,12 @@ index 256fa0e..9f82511 100644
 +                * inv_rms
 +                * cutlass.Float32(route_norm_weight[pair + 48])
 +            )
-+            cos_value = cutlass.Float32(route_cos[absolute_row, pair])
-+            sin_value = cutlass.Float32(route_sin[absolute_row, pair])
++            cos_value = cutlass.Float32(
++                route_freqs[batch_idx, absolute_row, 0, pair, 0, 0]
++            )
++            sin_value = cutlass.Float32(
++                route_freqs[batch_idx, absolute_row, 0, pair, 1, 0]
++            )
 +            sK[row, pair, stage] = cutlass.BFloat16(
 +                cutlass.Float32(first_norm) * cos_value
 +                - cutlass.Float32(second_norm) * sin_value
