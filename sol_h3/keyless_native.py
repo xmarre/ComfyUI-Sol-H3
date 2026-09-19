@@ -152,9 +152,6 @@ def run_native_candidate(
         tau=float(tau),
         scale=float(scale),
     )
-    route_cos = rope_freqs[:, :, 0, :, 0, 0]
-    route_sin = rope_freqs[:, :, 0, :, 1, 0]
-
     from ._vendor.sol_attn import sol_attn_keyless
 
     result = sol_attn_keyless(
@@ -164,8 +161,7 @@ def run_native_candidate(
         vcb,
         threshold,
         norm_weight,
-        route_cos,
-        route_sin,
+        rope_freqs,
         scale=float(scale),
         sink_start=sink_start,
         sink_tokens=sink_tokens,
