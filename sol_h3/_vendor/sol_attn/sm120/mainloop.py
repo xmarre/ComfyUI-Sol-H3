@@ -76,9 +76,6 @@ class SolAttnForwardSm120:
         mKeyBias: cute.Tensor,
         mMappedNeighborIntervals: cute.Tensor,
         mLSE: cute.Tensor,
-        mRouteNormWeight: cute.Tensor,
-        mRouteCos: cute.Tensor,
-        mRouteSin: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -230,9 +227,6 @@ class SolAttnForwardSm120:
         mO_slice = mO[None, None, head_idx, batch_idx]
         mKC_slice = mKC[None, None, head_idx, batch_idx]
         mVC_slice = mVC[None, None, head_idx, batch_idx]
-        if cutlass.const_expr(self.keyless_enabled):
-            mRouteCos_slice = mRouteCos[None, None, batch_idx]
-            mRouteSin_slice = mRouteSin[None, None, batch_idx]
         if cutlass.const_expr(not self.debug_route_trace):
             mLSE_slice = mLSE[None, head_idx, batch_idx]
 
@@ -596,12 +590,12 @@ class SolAttnForwardSm120:
                     route_keyless_smem_in_place(
                         sK,
                         K_consumer.index,
-                        mRouteNormWeight,
-                        mRouteCos_slice,
-                        mRouteSin_slice,
+                        mKeyBias,
+                        mMappedNeighborIntervals,
                         keyless_inv_rms,
                         exact_block,
                         token_count,
+                        batch_idx,
                         tidx,
                         warp,
                         lane,
@@ -754,9 +748,6 @@ class SolAttnForwardSm120:
         key_bias: cute.Tensor,
         mapped_neighbor_intervals: cute.Tensor,
         lse: cute.Tensor,
-        route_norm_weight: cute.Tensor,
-        route_cos: cute.Tensor,
-        route_sin: cute.Tensor,
         softmax_scale: cutlass.Float32,
         sink_start_block: cutlass.Int32,
         sink_end_block: cutlass.Int32,
@@ -770,12 +761,6 @@ class SolAttnForwardSm120:
             layout_utils.select(t, [3, 1, 2, 0]) for t in (v, vc)
         ]
         o_mkl = layout_utils.select(o, [1, 3, 2, 0])
-        if cutlass.const_expr(self.keyless_enabled):
-            route_cos_tfb = layout_utils.select(route_cos, [1, 2, 0])
-            route_sin_tfb = layout_utils.select(route_sin, [1, 2, 0])
-        else:
-            route_cos_tfb = route_cos
-            route_sin_tfb = route_sin
         if cutlass.const_expr(self.debug_route_trace):
             lse_target = lse
         else:
@@ -939,9 +924,6 @@ class SolAttnForwardSm120:
             key_bias,
             mapped_neighbor_intervals,
             lse_target,
-            route_norm_weight,
-            route_cos_tfb,
-            route_sin_tfb,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -972,11 +954,11 @@ def route_keyless_smem_in_place(
     sK: cute.Tensor,
     stage: cutlass.Int32,
     route_norm_weight: cute.Tensor,
-    route_cos: cute.Tensor,
-    route_sin: cute.Tensor,
+    route_freqs: cute.Tensor,
     inv_rms_scratch: cute.Tensor,
     exact_block: cutlass.Int32,
     token_count: cutlass.Int32,
+    batch_idx: cutlass.Int32,
     tidx: cutlass.Int32,
     warp: cutlass.Int32,
     lane: cutlass.Int32,
@@ -1036,8 +1018,12 @@ def route_keyless_smem_in_place(
                 * inv_rms
                 * cutlass.Float32(route_norm_weight[pair + 48])
             )
-            cos_value = cutlass.Float32(route_cos[absolute_row, pair])
-            sin_value = cutlass.Float32(route_sin[absolute_row, pair])
+            cos_value = cutlass.Float32(
+                route_freqs[batch_idx, absolute_row, 0, pair, 0, 0]
+            )
+            sin_value = cutlass.Float32(
+                route_freqs[batch_idx, absolute_row, 0, pair, 1, 0]
+            )
             sK[row, pair, stage] = cutlass.BFloat16(
                 cutlass.Float32(first_norm) * cos_value
                 - cutlass.Float32(second_norm) * sin_value
