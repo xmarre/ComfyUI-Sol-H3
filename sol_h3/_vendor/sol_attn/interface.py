@@ -379,7 +379,7 @@ def _sol_attn_cute(
             tensors = [
                 q, k, v, output, kc, vc, threshold,
                 key_bias_arg, mapped_arg, lse,
-                threshold, threshold, threshold, threshold,
+                threshold, threshold, threshold,
             ]
             compiled = _compiled.get(key)
             if compiled is None:
@@ -615,7 +615,8 @@ def sol_attn_keyless(
     """Run the SM120 no-global-route Keyless Sol candidate.
 
     Q is already normalized/positioned.  The K TMA path receives raw V and
-    routes only selected exact register fragments before QK MMA.  PV always
+    routes only selected exact K tiles inside bounded CTA shared memory before
+    QK MMA.  PV always
     consumes raw V.  RC/VC/threshold are caller-owned proven K1/K3 summaries;
     this entry point never materializes a global route tensor.
     """
