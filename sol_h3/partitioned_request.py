@@ -18,6 +18,7 @@ from collections import OrderedDict
 import hashlib
 import json
 import math
+import os
 import time
 from typing import Any
 
@@ -41,6 +42,12 @@ PARTITIONED_MAPPED_ROUTE = "partitioned_sol_mapped"
 MAX_BIAS_CACHE_ENTRIES = 64
 MAX_BIAS_CACHE_BYTES = 4 * 1024 * 1024
 BLOCK_SIZE = 64
+_FORCE_DENSE_SUFFIX_DIAGNOSTIC_ENV = "SOL_H3_FORCE_DENSE_PARTITIONED_SUFFIX_DIAGNOSTIC"
+
+
+def _force_dense_partitioned_suffix_diagnostic_enabled() -> bool:
+    value = os.environ.get(_FORCE_DENSE_SUFFIX_DIAGNOSTIC_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _sha256_json(value: Any) -> str:
@@ -442,7 +449,28 @@ def _replay_partitioned_suffix(
                     diagnostic_state=diagnostics,
                     diagnostic_sample=sample,
                 )
-            del output
+            # The existing arithmetic gate proves only the all-selected kernel
+            # against weighted dense attention. That does not test the sparse
+            # selection actually used in production. Replay is already an
+            # opt-in diagnostic path, so compare that exact sparse output with
+            # the same weighted dense reference before discarding both tensors.
+            with diagnostics.span(sample, "production_dense_reference"):
+                dense = _weighted_dense(
+                    replay_q,
+                    replay_k,
+                    replay_v,
+                    replay_bias,
+                    scale=replay_q.shape[-1] ** -0.5,
+                )
+            with diagnostics.span(sample, "production_error_reduction"):
+                production_error = error_metrics(
+                    output.transpose(0, 1).unsqueeze(0),
+                    dense.transpose(0, 1).unsqueeze(0),
+                )
+            for name, value in production_error.items():
+                if value is None or type(value) in {bool, int, float, str}:
+                    telemetry[f"production_vs_dense_{name}"] = value
+            del output, dense
             return telemetry
 
         state.replay_diagnostics.execute(
@@ -589,7 +617,12 @@ def partitioned_request_attention(
     from .interop import dense_evaluation_warmup
 
     warmup = dense_evaluation_warmup(config, evaluation, transformer_options)
-    dense_execution = bool(force_dense or warmup)
+    diagnostic_force_dense_suffix = bool(
+        not force_dense
+        and kind == "local"
+        and _force_dense_partitioned_suffix_diagnostic_enabled()
+    )
+    dense_execution = bool(force_dense or warmup or diagnostic_force_dense_suffix)
     key_bias = _key_bias(
         state,
         kv_rows=int(k.shape[0]),
@@ -622,9 +655,14 @@ def partitioned_request_attention(
     if dense_execution:
         result = _weighted_dense(q, k, v, key_bias, scale=scale)
         state.partitioned_dense_calls = getattr(state, "partitioned_dense_calls", 0) + 1
-        if warmup:
+        if diagnostic_force_dense_suffix:
+            state.partitioned_diagnostic_dense_suffix_calls += 1
+            mode = "dense_diagnostic_suffix"
+        elif force_dense:
+            mode = "dense_forced"
+        else:
             state.dense_calls += 1
-        mode = "dense_forced" if force_dense else "dense_warmup"
+            mode = "dense_warmup"
         fields = _completion_fields(
             evaluation=evaluation,
             semantic_digest=semantic_digest,
