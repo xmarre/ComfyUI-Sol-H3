@@ -10,10 +10,11 @@ import tempfile
 REVISION = '2936c47637380842aaa4a4488fac5006cc542b70'
 SUBTREE = 'models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn'
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4'
+CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-keyless-fused-v1'
 PATCHES = (
     ('rectangular-sm120-v3', ROOT / 'tools/rectangular_sm120.patch'),
     ('mapped-neighbor-sm120-v4', ROOT / 'tools/mapped_neighbor_sm120.patch'),
+    ('keyless-fused-sm120-v1', ROOT / 'tools/keyless_fused_sm120.patch'),
 )
 
 
@@ -108,7 +109,8 @@ def main():
         'contract': CONTRACT,
         'transformation': (
             'relative-imports-v1; rectangular-sm120-v3 (tools/rectangular_sm120.patch); '
-            'mapped-neighbor-sm120-v4 (tools/mapped_neighbor_sm120.patch)'
+            'mapped-neighbor-sm120-v4 (tools/mapped_neighbor_sm120.patch); '
+            'keyless-fused-sm120-v1 (tools/keyless_fused_sm120.patch)'
         ),
         # Legacy audit field remains the rectangular-v3 patch hash.
         'packaged_patch_sha256': patch_records[0]['sha256'],
