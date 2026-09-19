@@ -47,6 +47,7 @@ class SolAttnForwardSm120:
         prefetch_next_route_k: bool = True,
         key_bias_enabled: bool = False,
         mapped_neighbors_enabled: bool = False,
+        keyless_enabled: bool = False,
     ):
         self.dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
@@ -60,6 +61,7 @@ class SolAttnForwardSm120:
         self.prefetch_next_route_k = prefetch_next_route_k
         self.key_bias_enabled = key_bias_enabled
         self.mapped_neighbors_enabled = mapped_neighbors_enabled
+        self.keyless_enabled = keyless_enabled
 
     @cute.kernel
     def kernel(
@@ -74,6 +76,10 @@ class SolAttnForwardSm120:
         mKeyBias: cute.Tensor,
         mMappedNeighborIntervals: cute.Tensor,
         mLSE: cute.Tensor,
+        mRouteInvRms: cute.Tensor,
+        mRouteNormWeight: cute.Tensor,
+        mRouteCos: cute.Tensor,
+        mRouteSin: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -222,6 +228,10 @@ class SolAttnForwardSm120:
         mO_slice = mO[None, None, head_idx, batch_idx]
         mKC_slice = mKC[None, None, head_idx, batch_idx]
         mVC_slice = mVC[None, None, head_idx, batch_idx]
+        if cutlass.const_expr(self.keyless_enabled):
+            mRouteInvRms_slice = mRouteInvRms[None, head_idx, batch_idx]
+            mRouteCos_slice = mRouteCos[None, None, batch_idx]
+            mRouteSin_slice = mRouteSin[None, None, batch_idx]
         if cutlass.const_expr(not self.debug_route_trace):
             mLSE_slice = mLSE[None, head_idx, batch_idx]
 
@@ -310,6 +320,8 @@ class SolAttnForwardSm120:
         thr_copy_Q = smem_copy_Q.get_slice(tidx)
         thr_copy_K = smem_copy_K.get_slice(tidx)
         thr_copy_V = smem_copy_V.get_slice(tidx)
+        cK = cute.make_identity_tensor((N, D))
+        tKcK_copy = thr_copy_K.partition_D(cK)
         tSsQ_copy = thr_copy_Q.partition_S(sQ)
         tSrQ_copy = thr_copy_Q.retile(tSrQ)
         tSsK_copy = thr_copy_K.partition_S(sK)
@@ -581,14 +593,32 @@ class SolAttnForwardSm120:
                 exact_block = cutlass.Int32(route_indices[ordinal])
                 k_wait = K_pipeline.consumer_try_wait(K_consumer)
                 K_pipeline.consumer_wait(K_consumer, k_wait)
-                gemm_smem_zero_acc(
-                    tiled_mma_qk,
-                    tSrS,
-                    tSrQ,
-                    tSrK,
-                    tSsK_copy[None, None, None, K_consumer.index],
-                    smem_copy_K,
-                )
+                if cutlass.const_expr(self.keyless_enabled):
+                    gemm_smem_zero_acc_keyless(
+                        tiled_mma_qk,
+                        tSrS,
+                        tSrQ,
+                        tSrK,
+                        tSsK_copy[None, None, None, K_consumer.index],
+                        smem_copy_K,
+                        tKcK_copy,
+                        mV_slice,
+                        mRouteInvRms_slice,
+                        mRouteNormWeight,
+                        mRouteCos_slice,
+                        mRouteSin_slice,
+                        exact_block,
+                        token_count,
+                    )
+                else:
+                    gemm_smem_zero_acc(
+                        tiled_mma_qk,
+                        tSrS,
+                        tSrQ,
+                        tSrK,
+                        tSsK_copy[None, None, None, K_consumer.index],
+                        smem_copy_K,
+                    )
                 K_pipeline.consumer_release(K_consumer)
                 K_consumer.advance()
                 next_ordinal = ordinal + cutlass.Int32(1)
@@ -729,6 +759,10 @@ class SolAttnForwardSm120:
         key_bias: cute.Tensor,
         mapped_neighbor_intervals: cute.Tensor,
         lse: cute.Tensor,
+        route_inv_rms: cute.Tensor,
+        route_norm_weight: cute.Tensor,
+        route_cos: cute.Tensor,
+        route_sin: cute.Tensor,
         softmax_scale: cutlass.Float32,
         sink_start_block: cutlass.Int32,
         sink_end_block: cutlass.Int32,
@@ -742,6 +776,14 @@ class SolAttnForwardSm120:
             layout_utils.select(t, [3, 1, 2, 0]) for t in (v, vc)
         ]
         o_mkl = layout_utils.select(o, [1, 3, 2, 0])
+        if cutlass.const_expr(self.keyless_enabled):
+            route_inv_rms_thb = layout_utils.select(route_inv_rms, [1, 2, 0])
+            route_cos_tfb = layout_utils.select(route_cos, [1, 2, 0])
+            route_sin_tfb = layout_utils.select(route_sin, [1, 2, 0])
+        else:
+            route_inv_rms_thb = route_inv_rms
+            route_cos_tfb = route_cos
+            route_sin_tfb = route_sin
         if cutlass.const_expr(self.debug_route_trace):
             lse_target = lse
         else:
@@ -905,6 +947,10 @@ class SolAttnForwardSm120:
             key_bias,
             mapped_neighbor_intervals,
             lse_target,
+            route_inv_rms_thb,
+            route_norm_weight,
+            route_cos_tfb,
+            route_sin_tfb,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -927,6 +973,93 @@ class SolAttnForwardSm120:
             smem=self.shared_storage_t.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+        )
+
+
+@cute.jit
+def gemm_smem_zero_acc_keyless(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tCsB: cute.Tensor,
+    smem_tiled_copy_B: cute.TiledCopy,
+    tKcK_copy: cute.Tensor,
+    mV_slice: cute.Tensor,
+    route_inv_rms: cute.Tensor,
+    route_norm_weight: cute.Tensor,
+    route_cos: cute.Tensor,
+    route_sin: cute.Tensor,
+    exact_block: cutlass.Int32,
+    token_count: cutlass.Int32,
+):
+    """Route one selected raw-V K fragment in registers before QK MMA.
+
+    The K TMA path carries raw V.  The register fragment applies the exact
+    Keyless BF16-normalize / FP32 split-half-RoPE boundary, while PV continues
+    to consume the independent raw-V path unchanged.  No global route tensor
+    is produced.
+    """
+    acc.fill(0.0)
+    tCrB_copy = smem_tiled_copy_B.retile(tCrB)
+    for k_block in cutlass.range_constexpr(cute.size(tCsB.shape[2])):
+        cute.copy(
+            smem_tiled_copy_B,
+            tCsB[None, None, k_block],
+            tCrB_copy[None, None, k_block],
+        )
+        raw_fragment = tCrB_copy[None, None, k_block]
+        coords = tKcK_copy[None, None, k_block]
+        for i in cutlass.range_constexpr(cute.size(raw_fragment)):
+            row, d = coords[i]
+            absolute_row = exact_block * cutlass.Int32(N) + cutlass.Int32(row)
+            if absolute_row < token_count:
+                inv_rms = cutlass.Float32(route_inv_rms[absolute_row])
+                raw = cutlass.Float32(raw_fragment[i])
+                weight = cutlass.Float32(route_norm_weight[d])
+                norm = cutlass.BFloat16(raw * inv_rms * weight)
+                routed = cutlass.Float32(norm)
+                if d < 96:
+                    if d < 48:
+                        partner_d = d + 48
+                        pair_d = d
+                    else:
+                        partner_d = d - 48
+                        pair_d = d - 48
+                    partner_raw = cutlass.Float32(
+                        mV_slice[partner_d, absolute_row]
+                    )
+                    partner_weight = cutlass.Float32(
+                        route_norm_weight[partner_d]
+                    )
+                    partner_norm = cutlass.BFloat16(
+                        partner_raw * inv_rms * partner_weight
+                    )
+                    cos_value = cutlass.Float32(
+                        route_cos[absolute_row, pair_d]
+                    )
+                    sin_value = cutlass.Float32(
+                        route_sin[absolute_row, pair_d]
+                    )
+                    if d < 48:
+                        routed = (
+                            cutlass.Float32(norm) * cos_value
+                            - cutlass.Float32(partner_norm) * sin_value
+                        )
+                    else:
+                        routed = (
+                            cutlass.Float32(partner_norm) * sin_value
+                            + cutlass.Float32(norm) * cos_value
+                        )
+                raw_fragment[i] = cutlass.BFloat16(routed)
+            else:
+                raw_fragment[i] = cutlass.BFloat16(0.0)
+        cute.gemm(
+            tiled_mma,
+            acc,
+            tCrA[None, None, k_block],
+            tCrB[None, None, k_block],
+            acc,
         )
 
 
