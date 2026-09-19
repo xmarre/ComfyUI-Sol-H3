@@ -202,6 +202,30 @@ prove map-value independence; physical map/group identity remains in the
 partitioned arithmetic key until a separate descriptor-mutation proof establishes
 the required quotient safely.
 
+
+### Partitioned suffix sparse-route discriminator
+
+The mapped partitioned-suffix replay additionally compares the exact production
+sparse output against the weighted dense reference on the same detached Q/K/V,
+key-bias and mapped-neighbor snapshot. The report publishes finite/max/mean/relative-L2
+error metrics under `production_vs_dense_*`; these measurements are diagnostic
+evidence only and do not alter the live model output.
+
+A separate explicit causal arm can replace only partitioned local **suffix**
+attention calls that would otherwise be sparse with weighted dense attention:
+
+```bash
+export SOL_H3_FORCE_DENSE_PARTITIONED_SUFFIX_DIAGNOSTIC=1
+```
+
+The override does not change prefix-query forced-dense ownership and does not
+replace normal dense warmup calls. Sol summaries publish
+`partitioned_diagnostic_dense_suffix_calls` so a run cannot be mistaken for
+ordinary production. This arm is intended only to determine whether the
+prefix-dense/suffix-sparse routing transition contributes materially to a
+partitioned continuation defect; it is not a production fallback or a proposed
+permanent dense route.
+
 ## Cross-repository attribution
 
 Flow #51 adds request, stage, and model-evaluation correlation identifiers and
