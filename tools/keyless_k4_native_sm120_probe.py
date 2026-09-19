@@ -622,7 +622,8 @@ def main() -> None:
             "source/contract structure and real-SM120 arithmetic are separate gates",
             "decoded-media parity and end-to-end sampler behavior are not measured",
             "timing fields are exploratory and not a production speed claim",
-            "K5 mapped-neighbor/measure/selected-domain/Untwist/VDN/Flow compositions remain out of scope",
+            "K5 mapped-neighbor/measure/selected-domain/Untwist/VDN/Flow "
+            "compositions remain out of scope",
         ],
     }
 
