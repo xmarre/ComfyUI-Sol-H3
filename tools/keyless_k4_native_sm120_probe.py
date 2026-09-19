@@ -274,7 +274,6 @@ def _run_block(
             kv_rows=v_rows,
         )
         full_route_bytes = int(v_raw.numel() * v_raw.element_size())
-        inv_rms_bytes = int(v_rows * HEADS * 4)
         cases.append(
             {
                 "name": name,
@@ -304,10 +303,6 @@ def _run_block(
                 ),
                 "memory": {
                     "full_materialized_route_bytes": full_route_bytes,
-                    "route_inv_rms_bytes": inv_rms_bytes,
-                    "route_inv_rms_fraction_of_full_route": (
-                        inv_rms_bytes / full_route_bytes
-                    ),
                     "candidate_peak_allocated_delta_bytes": peak_delta,
                     "candidate_global_route_tensor": False,
                 },
@@ -402,7 +397,7 @@ def _extrema(blocks: list[dict[str, object]]) -> dict[str, object]:
             ),
         )
         return {
-            "value": float(item_value := row["candidate_vs_materialized_sol_scale"][field]),
+            "value": float(row["candidate_vs_materialized_sol_scale"][field]),
             "block_index": int(row["block_index"]),
             "case": str(row["name"]),
         }
@@ -615,8 +610,8 @@ def main() -> None:
         "observed_extrema": _extrema(blocks),
         "memory_strategy": {
             "candidate_global_route_tensor": False,
-            "selected_exact_route_storage": "SM120 register fragment only",
-            "route_scalar_staging": "FP32 [Tv,H] inverse RMS",
+            "selected_exact_route_storage": "bounded SM120 K shared-memory tile",
+            "selected_exact_rms": "computed inside CTA from the selected raw-V tile",
             "k1_route_scratch": "bounded b8 BF16 spill/reload",
             "cuda_free_bytes_after_evidence": int(free_bytes),
             "cuda_total_bytes": int(total_bytes),
