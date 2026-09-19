@@ -50,6 +50,15 @@ def _force_dense_partitioned_suffix_diagnostic_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _diagnostic_force_dense_suffix(*, kind: str, force_dense: bool, warmup: bool) -> bool:
+    return bool(
+        not force_dense
+        and not warmup
+        and kind == "local"
+        and _force_dense_partitioned_suffix_diagnostic_enabled()
+    )
+
+
 def _sha256_json(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -617,11 +626,10 @@ def partitioned_request_attention(
     from .interop import dense_evaluation_warmup
 
     warmup = dense_evaluation_warmup(config, evaluation, transformer_options)
-    diagnostic_force_dense_suffix = bool(
-        not force_dense
-        and not warmup
-        and kind == "local"
-        and _force_dense_partitioned_suffix_diagnostic_enabled()
+    diagnostic_force_dense_suffix = _diagnostic_force_dense_suffix(
+        kind=kind,
+        force_dense=bool(force_dense),
+        warmup=bool(warmup),
     )
     dense_execution = bool(force_dense or warmup or diagnostic_force_dense_suffix)
     key_bias = _key_bias(
