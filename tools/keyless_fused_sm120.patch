@@ -11,7 +11,7 @@ index d37351d..9118542 100644
 -__all__ = ["get_sol_attn_backend", "sol_attn"]
 +__all__ = ["KEYLESS_FUSED_CONTRACT", "get_sol_attn_backend", "sol_attn", "sol_attn_keyless"]
 diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/interface.py
-index e63156d..55c7369 100644
+index e63156d..df9d09b 100644
 --- a/sol_h3/_vendor/sol_attn/interface.py
 +++ b/sol_h3/_vendor/sol_attn/interface.py
 @@ -1,4 +1,4 @@
@@ -50,7 +50,7 @@ index e63156d..55c7369 100644
              tensors = [
                  q, k, v, output, kc, vc, threshold,
                  key_bias_arg, mapped_arg, lse,
-+                threshold, threshold, threshold, threshold,
++                threshold, threshold, threshold,
              ]
              compiled = _compiled.get(key)
              if compiled is None:
@@ -63,7 +63,7 @@ index e63156d..55c7369 100644
                          )
                      else:
                          args = _to_cute_tensors(tensors)
-@@ -406,6 +414,245 @@ def _sol_attn_cute(
+@@ -406,6 +414,246 @@ def _sol_attn_cute(
      return output[:, :tokens]
  
  
@@ -268,7 +268,8 @@ index e63156d..55c7369 100644
 +    """Run the SM120 no-global-route Keyless Sol candidate.
 +
 +    Q is already normalized/positioned.  The K TMA path receives raw V and
-+    routes only selected exact register fragments before QK MMA.  PV always
++    routes only selected exact K tiles inside bounded CTA shared memory before
++    QK MMA.  PV always
 +    consumes raw V.  RC/VC/threshold are caller-owned proven K1/K3 summaries;
 +    this entry point never materializes a global route tensor.
 +    """
@@ -309,7 +310,7 @@ index e63156d..55c7369 100644
  def _pad_to_bucket(q, k, v, bucket_size: int):
      """Pad BTHD inputs to a stable compile shape while preserving a logical length."""
      tokens = q.shape[1]
-@@ -567,4 +814,4 @@ def sol_attn(
+@@ -567,4 +815,4 @@ def sol_attn(
      )
  
  
@@ -336,7 +337,7 @@ index 57feb6f..01f3e14 100644
  
  
 diff --git a/sol_h3/_vendor/sol_attn/sm120/mainloop.py b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
-index 256fa0e..c1a9280 100644
+index 256fa0e..bbd6872 100644
 --- a/sol_h3/_vendor/sol_attn/sm120/mainloop.py
 +++ b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
 @@ -1,4 +1,4 @@
@@ -446,7 +447,7 @@ index 256fa0e..c1a9280 100644
              tma_atom_Q,
              tma_atom_K,
              tma_atom_V,
-@@ -930,6 +968,107 @@ class SharedStorage:
+@@ -930,6 +968,106 @@ class SharedStorage:
          )
  
  
@@ -490,14 +491,13 @@ index 256fa0e..c1a9280 100644
 +            sum_sq += cute.arch.shuffle_sync_down(sum_sq, offset)
 +        sum_sq = cute.arch.shuffle_sync(sum_sq, 0)
 +        if lane == 0:
-+            inv_rms_scratch[row] = (
-+                cute.math.rsqrt(
++            inv_rms = cutlass.Float32(0.0)
++            if valid:
++                inv_rms = cute.math.rsqrt(
 +                    sum_sq / cutlass.Float32(D) + cutlass.Float32(1.0e-5),
 +                    fastmath=True,
 +                )
-+                if valid
-+                else cutlass.Float32(0.0)
-+            )
++            inv_rms_scratch[row] = inv_rms
 +    cute.arch.fence_view_async_shared()
 +    cute.arch.sync_threads()
 +
