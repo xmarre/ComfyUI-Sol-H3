@@ -72,7 +72,12 @@ def test_replay_uses_fresh_then_fresh_then_retained_validation():
 
     def production(_sample, arm):
         productions.append(arm)
-        return {"compiler_key": "key", "compile_hit": True}
+        return {
+            "compiler_key": "key",
+            "compile_hit": True,
+            "production_vs_dense_max_abs": 0.125,
+            "production_vs_dense_rel_l2": 0.01,
+        }
 
     random.seed(73)
     before = random.getstate()
@@ -101,6 +106,9 @@ def test_replay_uses_fresh_then_fresh_then_retained_validation():
     assert report["arms"][2]["gate_performed"] is False
     assert report["arms"][2]["proof_hit"] is True
     assert report["arms"][2]["compile_misses"] == 0
+    for arm in report["arms"]:
+        assert arm["production_telemetry"]["production_vs_dense_max_abs"] == 0.125
+        assert arm["production_telemetry"]["production_vs_dense_rel_l2"] == 0.01
 
 
 def test_replay_target_selection_is_bounded_and_stage_specific():
