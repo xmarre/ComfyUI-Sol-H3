@@ -1,5 +1,5 @@
 """Sol-Attn."""
 
-from .interface import get_sol_attn_backend, sol_attn
+from .interface import KEYLESS_FUSED_CONTRACT, get_sol_attn_backend, sol_attn, sol_attn_keyless
 
-__all__ = ["get_sol_attn_backend", "sol_attn"]
+__all__ = ["KEYLESS_FUSED_CONTRACT", "get_sol_attn_backend", "sol_attn", "sol_attn_keyless"]
