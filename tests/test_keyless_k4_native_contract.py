@@ -31,10 +31,13 @@ def test_native_sm120_routes_selected_k_inside_cta_and_keeps_pv_raw():
     source = _read("sol_h3/_vendor/sol_attn/sm120/mainloop.py")
     assert "keyless_enabled: bool = False" in source
     assert "route_keyless_smem_in_place(" in source
-    assert "sK[row, d, stage] = cutlass.BFloat16(routed)" in source
+    assert "sK[row, pair, stage] = cutlass.BFloat16(" in source
+    assert "sK[row, pair + 48, stage] = cutlass.BFloat16(" in source
+    assert "sK[row, d, stage] = cutlass.BFloat16(" in source
     assert "sum_sq = cute.math.fma(value, value, sum_sq)" in source
     assert "cute.arch.shuffle_sync_down(sum_sq, offset)" in source
-    assert "mV_slice[partner_d, absolute_row]" in source
+    assert "first_raw = cutlass.Float32(sK[row, pair, stage])" in source
+    assert "second_raw = cutlass.Float32(sK[row, pair + 48, stage])" in source
     assert "gemm_smem_zero_acc(" in source
     assert "tma_atom_V" in source
     assert "tVgV[None, first_exact]" in source
