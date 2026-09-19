@@ -606,9 +606,9 @@ def sol_attn_keyless(
     Q is already normalized/positioned.  The K TMA path receives raw V and
     routes only selected exact K tiles inside bounded CTA shared memory before
     QK MMA.  PV always consumes raw V.  RC/VC/threshold are caller-owned proven
-    K1/K3 summaries; route metadata reuses the two historical optional SM120
-    tensor slots under the Keyless-only compile-time specialization.
-    this entry point never materializes a global route tensor.
+    K1/K3 summaries. Route metadata reuses the two historical optional SM120
+    tensor slots under the Keyless-only compile-time specialization. This entry
+    point never materializes a global route tensor.
     """
     arch = _validate_keyless_native_inputs(
         q,
