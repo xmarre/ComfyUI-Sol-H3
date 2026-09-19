@@ -28,9 +28,330 @@ ROPE_HALF_DIM = 48
 ROPE_ROT_DIM = 96
 NORM_EPS = 1e-5
 CONTRACT = "sol-h3-keyless-route-summary-v2"
+SOL_REDUCTION_CONTRACT = "sol-h3-keyless-route-summary-sol-reduction-v5"
 
 
 if triton is not None:
+
+    @triton.jit
+    def _reduce_route_rc_sol_kernel(
+        v_desc,
+        v_ptr,
+        weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        rc_ptr,
+        rows,
+        stride_vt: tl.constexpr,
+        stride_vh: tl.constexpr,
+        stride_vd: tl.constexpr,
+        stride_ct: tl.constexpr,
+        stride_cd: tl.constexpr,
+        stride_st: tl.constexpr,
+        stride_sd: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK: tl.constexpr,
+        TILE_D: tl.constexpr,
+        rope_half: tl.constexpr,
+        rope_rot: tl.constexpr,
+        eps: tl.constexpr,
+    ):
+        """Route-centroid candidate aligned to the released Sol reduction layout.
+
+        The raw V tile is loaded with the same TensorDescriptor geometry and
+        program-id ordering as Sana's released _reduce_kv_kernel.  Routing is
+        derived per physical row before the final reduction, so no global route
+        tensor is written.
+        """
+        d_tile, block, batch_head = (
+            tl.program_id(0),
+            tl.program_id(1),
+            tl.program_id(2),
+        )
+        batch, head = batch_head // H, batch_head % H
+        row_offsets = block * BLOCK + tl.arange(0, BLOCK)
+        d_offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
+        valid_rows = row_offsets < rows
+        valid_d = d_offsets < D
+        block_len = tl.minimum(BLOCK, rows - block * BLOCK)
+
+        raw = v_desc.load(
+            [batch, block * BLOCK, head, d_tile * TILE_D]
+        ).reshape([BLOCK, TILE_D]).to(tl.float32)
+        raw = tl.where(valid_rows[:, None] & valid_d[None, :], raw, 0.0)
+
+        # Match comfy-kitchen's CUDA rms_sum ordering for D=128: each warp
+        # lane accumulates d, d+32, d+64, d+96 with sequential FP32 FMAs,
+        # then the 32 lane partials are reduced. The earlier tl.sum over all
+        # 128 channels produced tiny row-wise norm differences that become
+        # selector-significant after block-centroid cancellation.
+        lane_offsets = tl.arange(0, 32)
+        lane_base = (
+            row_offsets[:, None] * stride_vt
+            + head * stride_vh
+            + lane_offsets[None, :] * stride_vd
+        )
+        lane0 = tl.load(
+            v_ptr + lane_base,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        lane1 = tl.load(
+            v_ptr + lane_base + 32 * stride_vd,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        lane2 = tl.load(
+            v_ptr + lane_base + 64 * stride_vd,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        lane3 = tl.load(
+            v_ptr + lane_base + 96 * stride_vd,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        lane_sum = tl.zeros((BLOCK, 32), dtype=tl.float32)
+        lane_sum = tl.fma(lane0, lane0, lane_sum)
+        lane_sum = tl.fma(lane1, lane1, lane_sum)
+        lane_sum = tl.fma(lane2, lane2, lane_sum)
+        lane_sum = tl.fma(lane3, lane3, lane_sum)
+        mean_square = tl.sum(lane_sum, axis=1) / D
+        inv_rms = tl.rsqrt(mean_square + eps)
+        weight = tl.load(
+            weight_ptr + d_offsets,
+            mask=valid_d,
+            other=0.0,
+        ).to(tl.float32)
+        norm = (raw * inv_rms[:, None] * weight[None, :]).to(tl.bfloat16)
+
+        rotating = d_offsets < rope_rot
+        first_half = d_offsets < rope_half
+        partner_d = tl.where(
+            first_half,
+            d_offsets + rope_half,
+            d_offsets - rope_half,
+        )
+        partner_offsets = (
+            row_offsets[:, None] * stride_vt
+            + head * stride_vh
+            + partner_d[None, :] * stride_vd
+        )
+        partner_raw = tl.load(
+            v_ptr + partner_offsets,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        partner_weight = tl.load(
+            weight_ptr + partner_d,
+            mask=rotating & (partner_d < D),
+            other=0.0,
+        ).to(tl.float32)
+        partner_norm = (
+            partner_raw * inv_rms[:, None] * partner_weight[None, :]
+        ).to(tl.bfloat16)
+
+        pair_d = tl.where(
+            first_half,
+            d_offsets,
+            d_offsets - rope_half,
+        )
+        cos_values = tl.load(
+            cos_ptr
+            + row_offsets[:, None] * stride_ct
+            + pair_d[None, :] * stride_cd,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=1.0,
+        ).to(tl.float32)
+        sin_values = tl.load(
+            sin_ptr
+            + row_offsets[:, None] * stride_st
+            + pair_d[None, :] * stride_sd,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        norm_math = norm.to(tl.float32)
+        partner_math = partner_norm.to(tl.float32)
+        first = norm_math * cos_values - partner_math * sin_values
+        second = partner_math * sin_values + norm_math * cos_values
+        route = tl.where(
+            first_half[None, :],
+            first,
+            tl.where(rotating[None, :], second, norm_math),
+        ).to(tl.bfloat16)
+        # Keep the masked route in BF16 before reduction. Triton 3.6.0 tl.sum
+        # does not implicitly promote BF16, so this now matches released Sol's
+        # exact k_summary = tl.sum(k_values, axis=0) / block_len semantics.
+        route = tl.where(
+            valid_rows[:, None] & valid_d[None, :],
+            route,
+            0.0,
+        ).to(tl.bfloat16)
+
+        summary = tl.sum(route, axis=0) / block_len
+        output_offsets = ((batch * N + block) * H + head) * D + d_offsets
+        tl.store(
+            rc_ptr + output_offsets,
+            summary,
+            mask=valid_d,
+        )
+
+
+    @triton.jit
+    def _materialize_sol_reduction_v4_route_kernel(
+        v_desc,
+        v_ptr,
+        weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        out_ptr,
+        rows,
+        stride_vt: tl.constexpr,
+        stride_vh: tl.constexpr,
+        stride_vd: tl.constexpr,
+        stride_ct: tl.constexpr,
+        stride_cd: tl.constexpr,
+        stride_st: tl.constexpr,
+        stride_sd: tl.constexpr,
+        stride_ot: tl.constexpr,
+        stride_oh: tl.constexpr,
+        stride_od: tl.constexpr,
+        H: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK: tl.constexpr,
+        TILE_D: tl.constexpr,
+        rope_half: tl.constexpr,
+        rope_rot: tl.constexpr,
+        eps: tl.constexpr,
+    ):
+        """Diagnostic-only materialization of the exact fused-v4 row arithmetic."""
+        d_tile, block, batch_head = (
+            tl.program_id(0),
+            tl.program_id(1),
+            tl.program_id(2),
+        )
+        batch, head = batch_head // H, batch_head % H
+        row_offsets = block * BLOCK + tl.arange(0, BLOCK)
+        d_offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
+        valid_rows = row_offsets < rows
+        valid_d = d_offsets < D
+
+        raw = v_desc.load(
+            [batch, block * BLOCK, head, d_tile * TILE_D]
+        ).reshape([BLOCK, TILE_D]).to(tl.float32)
+        raw = tl.where(valid_rows[:, None] & valid_d[None, :], raw, 0.0)
+
+        lane_offsets = tl.arange(0, 32)
+        lane_base = (
+            row_offsets[:, None] * stride_vt
+            + head * stride_vh
+            + lane_offsets[None, :] * stride_vd
+        )
+        lane0 = tl.load(
+            v_ptr + lane_base,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        lane1 = tl.load(
+            v_ptr + lane_base + 32 * stride_vd,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        lane2 = tl.load(
+            v_ptr + lane_base + 64 * stride_vd,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        lane3 = tl.load(
+            v_ptr + lane_base + 96 * stride_vd,
+            mask=valid_rows[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        lane_sum = tl.zeros((BLOCK, 32), dtype=tl.float32)
+        lane_sum = tl.fma(lane0, lane0, lane_sum)
+        lane_sum = tl.fma(lane1, lane1, lane_sum)
+        lane_sum = tl.fma(lane2, lane2, lane_sum)
+        lane_sum = tl.fma(lane3, lane3, lane_sum)
+        mean_square = tl.sum(lane_sum, axis=1) / D
+        inv_rms = tl.rsqrt(mean_square + eps)
+
+        weight = tl.load(
+            weight_ptr + d_offsets,
+            mask=valid_d,
+            other=0.0,
+        ).to(tl.float32)
+        norm = (raw * inv_rms[:, None] * weight[None, :]).to(tl.bfloat16)
+
+        rotating = d_offsets < rope_rot
+        first_half = d_offsets < rope_half
+        partner_d = tl.where(
+            first_half,
+            d_offsets + rope_half,
+            d_offsets - rope_half,
+        )
+        partner_offsets = (
+            row_offsets[:, None] * stride_vt
+            + head * stride_vh
+            + partner_d[None, :] * stride_vd
+        )
+        partner_raw = tl.load(
+            v_ptr + partner_offsets,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        partner_weight = tl.load(
+            weight_ptr + partner_d,
+            mask=rotating & (partner_d < D),
+            other=0.0,
+        ).to(tl.float32)
+        partner_norm = (
+            partner_raw * inv_rms[:, None] * partner_weight[None, :]
+        ).to(tl.bfloat16)
+
+        pair_d = tl.where(
+            first_half,
+            d_offsets,
+            d_offsets - rope_half,
+        )
+        cos_values = tl.load(
+            cos_ptr
+            + row_offsets[:, None] * stride_ct
+            + pair_d[None, :] * stride_cd,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=1.0,
+        ).to(tl.float32)
+        sin_values = tl.load(
+            sin_ptr
+            + row_offsets[:, None] * stride_st
+            + pair_d[None, :] * stride_sd,
+            mask=valid_rows[:, None] & rotating[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        norm_math = norm.to(tl.float32)
+        partner_math = partner_norm.to(tl.float32)
+        first = norm_math * cos_values - partner_math * sin_values
+        second = partner_math * sin_values + norm_math * cos_values
+        route = tl.where(
+            first_half[None, :],
+            first,
+            tl.where(rotating[None, :], second, norm_math),
+        ).to(tl.bfloat16)
+        route = tl.where(valid_rows[:, None] & valid_d[None, :], route, 0.0)
+
+        out_offsets = (
+            row_offsets[:, None] * stride_ot
+            + head * stride_oh
+            + d_offsets[None, :] * stride_od
+        )
+        tl.store(
+            out_ptr + out_offsets,
+            route,
+            mask=valid_rows[:, None] & valid_d[None, :],
+        )
 
     @triton.jit
     def _reduce_route_vc_kernel(
@@ -285,6 +606,8 @@ if triton is not None:
         )
 
 else:
+    _reduce_route_rc_sol_kernel = None
+    _materialize_sol_reduction_v4_route_kernel = None
     _reduce_route_vc_kernel = None
     _materialize_native_route_kernel = None
 
@@ -567,6 +890,185 @@ def materialized_fp32_rope_route_diagnostic(
     return out
 
 
+
+def materialized_sol_reduction_v4_route_diagnostic(
+    v: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    rope_freqs: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the exact current K1-v4 row route for diagnostic isolation.
+
+    This deliberately allocates a full route tensor and is therefore restricted
+    to the oracle/test path. Production K1-v4 still emits only bounded RC/VC
+    summaries. The purpose is to run the exact existing Sol reduction over the
+    same row arithmetic and distinguish row-route error from fused-reduction
+    arithmetic/layout error.
+    """
+    _validate_common(v, norm_weight, eps, rope_freqs)
+    if _materialize_sol_reduction_v4_route_kernel is None:
+        raise RuntimeError("K1-v4 route isolation requires Triton")
+    if v.dtype != torch.bfloat16 or norm_weight.dtype != torch.bfloat16:
+        raise TypeError("K1-v4 route isolation requires BF16 V and norm weight")
+    if v.device.type != "cuda":
+        raise RuntimeError("K1-v4 route isolation requires CUDA")
+    if torch.cuda.get_device_capability(v.device) != (12, 0):
+        raise RuntimeError("K1-v4 route isolation currently targets SM120 only")
+    if norm_weight.device != v.device or rope_freqs.device != v.device:
+        raise ValueError("K1-v4 route isolation tensors must share one CUDA device")
+    if float(eps) != NORM_EPS:
+        raise ValueError(f"K1-v4 route isolation currently requires eps={NORM_EPS}")
+
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    rows, heads, _ = v.shape
+    blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    tile_d = min(128, triton.next_power_of_2(HEAD_DIM))
+    vb = v.unsqueeze(0)
+    v_desc = TensorDescriptor.from_tensor(
+        vb,
+        [1, BLOCK_SIZE, 1, tile_d],
+    )
+    out = torch.empty_like(v)
+    cos = rope_freqs[0, :, 0, :, 0, 0]
+    sin = rope_freqs[0, :, 0, :, 1, 0]
+
+    grid = (triton.cdiv(HEAD_DIM, tile_d), blocks, heads)
+    _materialize_sol_reduction_v4_route_kernel[grid](
+        v_desc,
+        v,
+        norm_weight,
+        cos,
+        sin,
+        out,
+        rows,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        cos.stride(0),
+        cos.stride(1),
+        sin.stride(0),
+        sin.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        heads,
+        HEAD_DIM,
+        BLOCK_SIZE,
+        tile_d,
+        ROPE_HALF_DIM,
+        ROPE_ROT_DIM,
+        float(eps),
+        num_warps=8,
+        num_stages=2,
+    )
+    return out
+
+
+def route_summary_sol_reduction(
+    v: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    rope_freqs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K1 v5 candidate aligned to the exact existing Sol BF16 reduction.
+
+    RC keeps the v4 row-local route arithmetic, including the D=128
+    comfy-kitchen CUDA RMS lane/FMA ordering, but now reduces the BF16 route with
+    the same tl.sum expression as released Sana Sol. VC is produced by the exact
+    pinned Sana _reduce_kv_kernel used by the materialized QKV preprocessing path;
+    raw V is supplied as its unused K-side diagnostic input and only the VC result
+    is retained.
+
+    This remains experimental and is not production dispatch.  It never writes a
+    full [T,H,128] route tensor.
+    """
+    _validate_common(v, norm_weight, eps, rope_freqs)
+    if _reduce_route_rc_sol_kernel is None:
+        raise RuntimeError("Sol-reduction Keyless route summary requires Triton")
+    if v.dtype != torch.bfloat16 or norm_weight.dtype != torch.bfloat16:
+        raise TypeError(
+            "Sol-reduction Keyless route summary requires BF16 V and norm weight"
+        )
+    if v.device.type != "cuda":
+        raise RuntimeError("Sol-reduction Keyless route summary requires CUDA")
+    if torch.cuda.get_device_capability(v.device) != (12, 0):
+        raise RuntimeError(
+            "Sol-reduction Keyless route summary currently targets SM120 only"
+        )
+    if norm_weight.device != v.device or rope_freqs.device != v.device:
+        raise ValueError(
+            "Sol-reduction Keyless route summary tensors must share one CUDA device"
+        )
+    if float(eps) != NORM_EPS:
+        raise ValueError(
+            f"Sol-reduction Keyless route summary currently requires eps={NORM_EPS}"
+        )
+
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    from ._vendor.sol_attn.preprocess import _reduce_kv_kernel
+
+    rows, heads, _ = v.shape
+    blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    tile_d = min(128, triton.next_power_of_2(HEAD_DIM))
+    vb = v.unsqueeze(0)
+    rc5 = torch.empty(
+        (1, blocks, heads, HEAD_DIM),
+        device=v.device,
+        dtype=torch.bfloat16,
+    )
+    vc5 = torch.empty_like(rc5)
+    scratch_kc5 = torch.empty_like(rc5)
+    v_desc = TensorDescriptor.from_tensor(
+        vb,
+        [1, BLOCK_SIZE, 1, tile_d],
+    )
+    cos = rope_freqs[0, :, 0, :, 0, 0]
+    sin = rope_freqs[0, :, 0, :, 1, 0]
+
+    grid = (triton.cdiv(HEAD_DIM, tile_d), blocks, heads)
+    _reduce_route_rc_sol_kernel[grid](
+        v_desc,
+        v,
+        norm_weight,
+        cos,
+        sin,
+        rc5,
+        rows,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        cos.stride(0),
+        cos.stride(1),
+        sin.stride(0),
+        sin.stride(1),
+        heads,
+        blocks,
+        HEAD_DIM,
+        BLOCK_SIZE,
+        tile_d,
+        ROPE_HALF_DIM,
+        ROPE_ROT_DIM,
+        float(eps),
+        num_warps=8,
+        num_stages=2,
+    )
+    _reduce_kv_kernel[grid](
+        v_desc,
+        v_desc,
+        scratch_kc5,
+        vc5,
+        rows,
+        heads,
+        blocks,
+        HEAD_DIM,
+        BLOCK_SIZE,
+        tile_d,
+    )
+    return rc5[0], vc5[0]
+
+
 def route_summary(
     v: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -637,10 +1139,13 @@ __all__ = [
     "NORM_EPS",
     "ROPE_HALF_DIM",
     "ROPE_ROT_DIM",
+    "SOL_REDUCTION_CONTRACT",
     "materialized_route_reference",
     "materialized_native_route_diagnostic",
     "materialized_public_rounding_route_diagnostic",
     "materialized_fp32_rope_route_diagnostic",
+    "materialized_sol_reduction_v4_route_diagnostic",
     "route_summary",
     "route_summary_reference",
+    "route_summary_sol_reduction",
 ]
