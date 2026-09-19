@@ -13,8 +13,8 @@ from sol_h3.keyless_selector import (
 )
 
 
-def test_k3_contract_is_calibration_only_identity():
-    assert CONTRACT == "sol-h3-keyless-selector-k3-calibration-v1"
+def test_k3_contract_binds_proven_k1_route_identity():
+    assert CONTRACT == "sol-h3-keyless-selector-k3-v2-k1-route-identity"
 
 
 @pytest.mark.parametrize(

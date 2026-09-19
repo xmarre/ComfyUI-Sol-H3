@@ -1,10 +1,10 @@
 """K3 Keyless Sol selector isolation on top of the released SM120 routing policy.
 
-This module is diagnostic-only.  It lets a probe feed K1-produced routed
-centroids/value sums into the existing Sol threshold and CTA routing policy while
-keeping the exact-block K tensor materialized.  That deliberately isolates K3
-selector behavior from the later K4 task of deriving selected routed K tiles from
-raw V inside the CuTe mainloop.
+This module is diagnostic-only. It feeds proven K1-v6 routed centroids/raw-value
+sums into the existing Sol threshold and CTA routing policy while keeping the
+exact-block K tensor materialized from the exact K1 row-route identity. That
+isolates K3 selector behavior from the later K4 task of deriving selected route
+tiles from raw V inside the CuTe mainloop.
 
 Nothing here is installed into production dispatch.
 """
@@ -16,7 +16,7 @@ import threading
 import torch
 
 
-CONTRACT = "sol-h3-keyless-selector-k3-calibration-v1"
+CONTRACT = "sol-h3-keyless-selector-k3-v2-k1-route-identity"
 BLOCK_SIZE = 64
 ROUTE_GROUP_BLOCKS = 64
 TRACE_WORD_BITS = 32
