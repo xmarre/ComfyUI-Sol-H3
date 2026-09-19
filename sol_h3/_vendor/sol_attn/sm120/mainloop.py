@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry, runtime mapped-neighbor metadata, and native Keyless selected-route execution; see tools/rectangular_sm120.patch, tools/mapped_neighbor_sm120.patch, and tools/keyless_fused_sm120.patch.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
