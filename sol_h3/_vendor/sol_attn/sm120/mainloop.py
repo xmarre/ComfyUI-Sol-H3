@@ -596,7 +596,6 @@ class SolAttnForwardSm120:
                     route_keyless_smem_in_place(
                         sK,
                         K_consumer.index,
-                        mV_slice,
                         mRouteNormWeight,
                         mRouteCos_slice,
                         mRouteSin_slice,
@@ -972,7 +971,6 @@ class SolAttnForwardSm120:
 def route_keyless_smem_in_place(
     sK: cute.Tensor,
     stage: cutlass.Int32,
-    mV_slice: cute.Tensor,
     route_norm_weight: cute.Tensor,
     route_cos: cute.Tensor,
     route_sin: cute.Tensor,
@@ -989,9 +987,10 @@ def route_keyless_smem_in_place(
     pinned comfy-kitchen D=128 CUDA ordering exactly: each lane accumulates
     d,d+32,d+64,d+96 with FP32 FMA, then uses shuffle-down offsets
     16,8,4,2,1 and broadcasts lane 0.  The resulting per-row inverse RMS is
-    kept only in CTA scratch.  K staging is then overwritten with BF16 routed
-    values while partner channels are reread from global raw V, so no in-place
-    partner race can occur.  The independent PV pipeline remains raw V.
+    kept only in CTA scratch.  Each rotating split-half pair is owned by one
+    thread, so both BF16-normalized inputs are read before either shared-memory
+    destination is overwritten; the 96:128 tail is normalized separately.  The
+    independent PV pipeline remains raw V.
     """
     for row_base in cutlass.range_constexpr(0, N, 4):
         row = cutlass.Int32(row_base) + warp
@@ -1018,50 +1017,51 @@ def route_keyless_smem_in_place(
     cute.arch.fence_view_async_shared()
     cute.arch.sync_threads()
 
-    for element_base in cutlass.range_constexpr(0, N * D, THREADS):
-        linear = cutlass.Int32(element_base) + tidx
-        row = linear // cutlass.Int32(D)
-        d = linear - row * cutlass.Int32(D)
+    for pair_base in cutlass.range_constexpr(0, N * 48, THREADS):
+        linear = cutlass.Int32(pair_base) + tidx
+        row = linear // cutlass.Int32(48)
+        pair = linear - row * cutlass.Int32(48)
         absolute_row = exact_block * cutlass.Int32(N) + row
         if absolute_row < token_count:
             inv_rms = cutlass.Float32(inv_rms_scratch[row])
+            first_raw = cutlass.Float32(sK[row, pair, stage])
+            second_raw = cutlass.Float32(sK[row, pair + 48, stage])
+            first_norm = cutlass.BFloat16(
+                first_raw
+                * inv_rms
+                * cutlass.Float32(route_norm_weight[pair])
+            )
+            second_norm = cutlass.BFloat16(
+                second_raw
+                * inv_rms
+                * cutlass.Float32(route_norm_weight[pair + 48])
+            )
+            cos_value = cutlass.Float32(route_cos[absolute_row, pair])
+            sin_value = cutlass.Float32(route_sin[absolute_row, pair])
+            sK[row, pair, stage] = cutlass.BFloat16(
+                cutlass.Float32(first_norm) * cos_value
+                - cutlass.Float32(second_norm) * sin_value
+            )
+            sK[row, pair + 48, stage] = cutlass.BFloat16(
+                cutlass.Float32(first_norm) * sin_value
+                + cutlass.Float32(second_norm) * cos_value
+            )
+        else:
+            sK[row, pair, stage] = cutlass.BFloat16(0.0)
+            sK[row, pair + 48, stage] = cutlass.BFloat16(0.0)
+
+    for tail_base in cutlass.range_constexpr(0, N * 32, THREADS):
+        linear = cutlass.Int32(tail_base) + tidx
+        row = linear // cutlass.Int32(32)
+        d = cutlass.Int32(96) + linear - row * cutlass.Int32(32)
+        absolute_row = exact_block * cutlass.Int32(N) + row
+        if absolute_row < token_count:
             raw = cutlass.Float32(sK[row, d, stage])
-            weight = cutlass.Float32(route_norm_weight[d])
-            norm = cutlass.BFloat16(raw * inv_rms * weight)
-            routed = cutlass.Float32(norm)
-            if d < 96:
-                if d < 48:
-                    partner_d = d + 48
-                    pair_d = d
-                else:
-                    partner_d = d - 48
-                    pair_d = d - 48
-                partner_raw = cutlass.Float32(
-                    mV_slice[partner_d, absolute_row]
-                )
-                partner_weight = cutlass.Float32(
-                    route_norm_weight[partner_d]
-                )
-                partner_norm = cutlass.BFloat16(
-                    partner_raw * inv_rms * partner_weight
-                )
-                cos_value = cutlass.Float32(
-                    route_cos[absolute_row, pair_d]
-                )
-                sin_value = cutlass.Float32(
-                    route_sin[absolute_row, pair_d]
-                )
-                if d < 48:
-                    routed = (
-                        cutlass.Float32(norm) * cos_value
-                        - cutlass.Float32(partner_norm) * sin_value
-                    )
-                else:
-                    routed = (
-                        cutlass.Float32(partner_norm) * sin_value
-                        + cutlass.Float32(norm) * cos_value
-                    )
-            sK[row, d, stage] = cutlass.BFloat16(routed)
+            sK[row, d, stage] = cutlass.BFloat16(
+                raw
+                * cutlass.Float32(inv_rms_scratch[row])
+                * cutlass.Float32(route_norm_weight[d])
+            )
         else:
             sK[row, d, stage] = cutlass.BFloat16(0.0)
     cute.arch.fence_view_async_shared()
