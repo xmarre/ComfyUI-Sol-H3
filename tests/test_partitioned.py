@@ -4,8 +4,24 @@ import pytest
 import torch
 
 from sol_h3.partitioned import merge_lse_partitions, sm120_attention_with_lse
-from sol_h3.partitioned_request import _weighted_dense
+from sol_h3.partitioned_request import (
+    _force_dense_partitioned_suffix_diagnostic_enabled,
+    _weighted_dense,
+)
 
+
+
+def test_force_dense_partitioned_suffix_diagnostic_is_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("SOL_H3_FORCE_DENSE_PARTITIONED_SUFFIX_DIAGNOSTIC", raising=False)
+    assert _force_dense_partitioned_suffix_diagnostic_enabled() is False
+
+    for value in ("1", "true", "YES", "on"):
+        monkeypatch.setenv("SOL_H3_FORCE_DENSE_PARTITIONED_SUFFIX_DIAGNOSTIC", value)
+        assert _force_dense_partitioned_suffix_diagnostic_enabled() is True
+
+    for value in ("", "0", "false", "disabled"):
+        monkeypatch.setenv("SOL_H3_FORCE_DENSE_PARTITIONED_SUFFIX_DIAGNOSTIC", value)
+        assert _force_dense_partitioned_suffix_diagnostic_enabled() is False
 
 def test_lse_partition_merge_matches_explicit_dense_softmax():
     generator = torch.Generator(device="cpu").manual_seed(123)
