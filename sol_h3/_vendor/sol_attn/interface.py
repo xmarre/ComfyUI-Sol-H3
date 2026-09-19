@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry, runtime mapped-neighbor metadata, and native Keyless selected-route execution; see tools/rectangular_sm120.patch, tools/mapped_neighbor_sm120.patch, and tools/keyless_fused_sm120.patch.
 """Public Sol-Attn interface."""
 
 from __future__ import annotations
