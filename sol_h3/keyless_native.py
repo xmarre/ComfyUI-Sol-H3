@@ -19,7 +19,6 @@ import torch
 from .keyless_route_summary import (
     NORM_EPS,
     ROPE_HALF_DIM,
-    route_inv_rms,
     route_summary_sol_reduction,
 )
 from .keyless_selector import threshold_from_route_centroids
@@ -142,7 +141,6 @@ def run_native_candidate(
     _verified_vendor_contract()
 
     rc, vc = route_summary_sol_reduction(v, norm_weight, eps, rope_freqs)
-    inv_rms = route_inv_rms(v, eps)
     qb = q.unsqueeze(0)
     vb = v.unsqueeze(0)
     rcb = rc.unsqueeze(0)
@@ -165,7 +163,6 @@ def run_native_candidate(
         rcb,
         vcb,
         threshold,
-        inv_rms.unsqueeze(0),
         norm_weight,
         route_cos,
         route_sin,
