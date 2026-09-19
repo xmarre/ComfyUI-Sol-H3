@@ -1,8 +1,8 @@
 """Experimental no-global-route Keyless all-selected attention primitive.
 
 Phase K2 of the native Keyless SM120 design. The CUDA path reads raw projected V,
-derives the RMSNorm + H3 split-half-RoPE routing view one bounded N64 tile at a
-time, scores Q against that routing view, and accumulates the original raw V.
+derives the K1-identical RMSNorm + H3 split-half-RoPE routing view one bounded
+N64 tile at a time, scores Q against that routing view, and accumulates raw V.
 
 The primitive is intentionally not wired into production Sol dispatch. It exists
 to establish all-selected arithmetic and allocation behavior before sparse routing
@@ -33,7 +33,7 @@ except ImportError:
 
 BLOCK_M = 64
 BLOCK_N = 64
-CONTRACT = "sol-h3-keyless-exact-allselected-v2"
+CONTRACT = "sol-h3-keyless-exact-allselected-v3-k1-route-identity"
 CANONICAL_SCALE = HEAD_DIM ** -0.5
 
 
@@ -109,7 +109,42 @@ if triton is not None:
             )
             raw = raw_bf16.to(tl.float32)
 
-            mean_square = tl.sum(raw * raw, axis=1) / head_dim
+            # Match the proven K1 row-route arithmetic and comfy-kitchen's
+            # D=128 RMS accumulation shape: each logical lane accumulates
+            # d,d+32,d+64,d+96 sequentially with FP32 FMA before the
+            # 32-lane reduction. K1 evidence requires this exact boundary.
+            lane_offsets = tl.arange(0, 32)
+            lane_base = (
+                n[:, None] * stride_vt
+                + head * stride_vh
+                + lane_offsets[None, :] * stride_vd
+            )
+            lane0 = tl.load(
+                v_ptr + lane_base,
+                mask=valid_n[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            lane1 = tl.load(
+                v_ptr + lane_base + 32 * stride_vd,
+                mask=valid_n[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            lane2 = tl.load(
+                v_ptr + lane_base + 64 * stride_vd,
+                mask=valid_n[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            lane3 = tl.load(
+                v_ptr + lane_base + 96 * stride_vd,
+                mask=valid_n[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            lane_sum = tl.zeros((block_n, 32), dtype=tl.float32)
+            lane_sum = tl.fma(lane0, lane0, lane_sum)
+            lane_sum = tl.fma(lane1, lane1, lane_sum)
+            lane_sum = tl.fma(lane2, lane2, lane_sum)
+            lane_sum = tl.fma(lane3, lane3, lane_sum)
+            mean_square = tl.sum(lane_sum, axis=1) / head_dim
             inv_rms = tl.rsqrt(mean_square + eps)
             norm = (
                 raw * inv_rms[:, None] * weight[None, :]
@@ -294,7 +329,7 @@ def exact_attention(
     scale: float = CANONICAL_SCALE,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the experimental all-selected CUDA path without global route storage."""
+    """Run K2 v3 all-selected attention with K1-identical route arithmetic."""
     _validate_common(q, v, norm_weight, eps, rope_freqs, scale)
     if _keyless_exact_allselected_kernel is None:
         raise RuntimeError("Keyless exact attention requires Triton")
