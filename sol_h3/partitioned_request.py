@@ -619,6 +619,7 @@ def partitioned_request_attention(
     warmup = dense_evaluation_warmup(config, evaluation, transformer_options)
     diagnostic_force_dense_suffix = bool(
         not force_dense
+        and not warmup
         and kind == "local"
         and _force_dense_partitioned_suffix_diagnostic_enabled()
     )
