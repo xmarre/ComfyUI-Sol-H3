@@ -379,7 +379,6 @@ def _sol_attn_cute(
             tensors = [
                 q, k, v, output, kc, vc, threshold,
                 key_bias_arg, mapped_arg, lse,
-                threshold, threshold, threshold,
             ]
             compiled = _compiled.get(key)
             if compiled is None:
@@ -420,8 +419,7 @@ def _validate_keyless_native_inputs(
     value_sum,
     threshold,
     route_norm_weight,
-    route_cos,
-    route_sin,
+    route_freqs,
     *,
     sink_tokens,
     sink_start,
@@ -459,10 +457,12 @@ def _validate_keyless_native_inputs(
         )
     if tuple(route_norm_weight.shape) != (head_dim,):
         raise ValueError("route_norm_weight must be [128]")
-    if tuple(route_cos.shape) != (batch, kv_tokens, 48):
-        raise ValueError("route_cos must be [B,Tv,48]")
-    if tuple(route_sin.shape) != tuple(route_cos.shape):
-        raise ValueError("route_sin must match route_cos")
+    expected_rope = (batch, kv_tokens, 1, 48, 2, 2)
+    if tuple(route_freqs.shape) != expected_rope:
+        raise ValueError(
+            f"route_freqs must have shape {expected_rope}, "
+            f"got {tuple(route_freqs.shape)}"
+        )
 
     if route_centroid.dtype != torch.bfloat16 or value_sum.dtype != torch.bfloat16:
         raise TypeError("Keyless route summaries must be BF16")
@@ -470,17 +470,14 @@ def _validate_keyless_native_inputs(
         raise TypeError("Keyless threshold must be FP32")
     if route_norm_weight.dtype != torch.bfloat16:
         raise TypeError("Keyless route_norm_weight must be BF16")
-    if route_cos.dtype not in (torch.bfloat16, torch.float32):
-        raise TypeError("Keyless route cos/sin must be BF16 or FP32")
-    if route_sin.dtype != route_cos.dtype:
-        raise TypeError("Keyless route cos/sin dtypes must match")
+    if route_freqs.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError("Keyless route_freqs must be BF16 or FP32")
     for name, tensor in (
         ("route_centroid", route_centroid),
         ("value_sum", value_sum),
         ("threshold", threshold),
         ("route_norm_weight", route_norm_weight),
-        ("route_cos", route_cos),
-        ("route_sin", route_sin),
+        ("route_freqs", route_freqs),
     ):
         if tensor.device != q.device:
             raise ValueError(f"{name} must share the Q/V CUDA device")
@@ -496,8 +493,7 @@ def _sol_attn_keyless_cute(
     value_sum,
     threshold,
     route_norm_weight,
-    route_cos,
-    route_sin,
+    route_freqs,
     *,
     arch,
     scale,
@@ -531,7 +527,6 @@ def _sol_attn_keyless_cute(
             sink_tokens,
         )
         stream = _stream(q.device)
-        disabled_optional = threshold
         tensors = [
             q,
             v,
@@ -540,12 +535,9 @@ def _sol_attn_keyless_cute(
             route_centroid,
             value_sum,
             threshold,
-            disabled_optional,
-            disabled_optional,
-            lse_or_trace,
             route_norm_weight,
-            route_cos,
-            route_sin,
+            route_freqs,
+            lse_or_trace,
         ]
         layout_key = tuple(
             (
@@ -602,8 +594,7 @@ def sol_attn_keyless(
     value_sum: torch.Tensor,
     threshold: torch.Tensor,
     route_norm_weight: torch.Tensor,
-    route_cos: torch.Tensor,
-    route_sin: torch.Tensor,
+    route_freqs: torch.Tensor,
     *,
     scale: float | None = None,
     sink_tokens: int = 0,
@@ -614,8 +605,9 @@ def sol_attn_keyless(
 
     Q is already normalized/positioned.  The K TMA path receives raw V and
     routes only selected exact K tiles inside bounded CTA shared memory before
-    QK MMA.  PV always
-    consumes raw V.  RC/VC/threshold are caller-owned proven K1/K3 summaries;
+    QK MMA.  PV always consumes raw V.  RC/VC/threshold are caller-owned proven
+    K1/K3 summaries; route metadata reuses the two historical optional SM120
+    tensor slots under the Keyless-only compile-time specialization.
     this entry point never materializes a global route tensor.
     """
     arch = _validate_keyless_native_inputs(
@@ -625,8 +617,7 @@ def sol_attn_keyless(
         value_sum,
         threshold,
         route_norm_weight,
-        route_cos,
-        route_sin,
+        route_freqs,
         sink_tokens=sink_tokens,
         sink_start=sink_start,
     )
@@ -643,8 +634,7 @@ def sol_attn_keyless(
         value_sum,
         threshold,
         route_norm_weight,
-        route_cos,
-        route_sin,
+        route_freqs,
         arch=arch,
         scale=scale,
         sink_tokens=sink_tokens,
