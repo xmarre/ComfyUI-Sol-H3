@@ -11,6 +11,7 @@ import torch
 
 BLOCK_SIZE = 64
 MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"
+KEYLESS_FUSED_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-keyless-fused-v1"
 _CUTE_BACKENDS = {
     (9, 0): "cute_sm90",
     (10, 0): "cute_sm100",
@@ -206,6 +207,8 @@ def _compile_sm120(
     stream,
     key_bias_enabled,
     mapped_neighbors_enabled,
+    debug_route_trace=False,
+    keyless_enabled=False,
 ):
     import cutlass.cute as cute
 
@@ -214,6 +217,8 @@ def _compile_sm120(
     operator = make_kernel(
         key_bias_enabled=key_bias_enabled,
         mapped_neighbors_enabled=mapped_neighbors_enabled,
+        debug_route_trace=debug_route_trace,
+        keyless_enabled=keyless_enabled,
     )
     args = _to_cute_tensors(tensors)
     compiled = cute.compile(
@@ -374,6 +379,7 @@ def _sol_attn_cute(
             tensors = [
                 q, k, v, output, kc, vc, threshold,
                 key_bias_arg, mapped_arg, lse,
+                threshold, threshold, threshold, threshold,
             ]
             compiled = _compiled.get(key)
             if compiled is None:
@@ -391,6 +397,8 @@ def _sol_attn_cute(
                             stream,
                             key_bias is not None,
                             mapped_neighbor_intervals is not None,
+                            False,
+                            False,
                         )
                     else:
                         args = _to_cute_tensors(tensors)
