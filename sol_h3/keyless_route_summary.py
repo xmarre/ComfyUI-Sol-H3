@@ -1163,6 +1163,57 @@ def materialized_sol_reduction_v4_route_diagnostic(
 
 
 
+
+def route_inv_rms(
+    v: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Compute the exact D=128 row/head inverse RMS scalar used by Keyless routing.
+
+    This is the production K4 scalar staging primitive. It preserves the
+    comfy-kitchen D=128 lane/FMA reduction order already established by K1,
+    but stores only one FP32 scalar per physical V row/head. The fused SM120
+    executor uses those scalars to derive selected routed K tiles from raw V
+    inside CTA shared memory; no [T,H,128] route tensor is materialized.
+    """
+    if not torch.is_tensor(v) or v.ndim != 3 or v.shape[-1] != HEAD_DIM:
+        raise ValueError("Keyless route inverse RMS requires V [T,H,128]")
+    if v.shape[0] <= 0 or v.shape[1] <= 0:
+        raise ValueError("Keyless route inverse RMS requires nonempty rows and heads")
+    if v.stride(-1) != 1:
+        raise ValueError("Keyless route inverse RMS requires contiguous V head channels")
+    if not math.isfinite(float(eps)) or float(eps) != NORM_EPS:
+        raise ValueError(f"Keyless route inverse RMS requires eps={NORM_EPS}")
+    if _compute_route_inv_rms_kernel is None:
+        raise RuntimeError("Keyless route inverse RMS requires Triton")
+    if v.dtype != torch.bfloat16:
+        raise TypeError("Keyless route inverse RMS requires BF16 V")
+    if v.device.type != "cuda":
+        raise RuntimeError("Keyless route inverse RMS requires CUDA")
+    if torch.cuda.get_device_capability(v.device) != (12, 0):
+        raise RuntimeError("Keyless route inverse RMS currently targets SM120 only")
+
+    rows, heads, _ = v.shape
+    blocks = (rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    inv_rms = torch.empty((rows, heads), device=v.device, dtype=torch.float32)
+    _compute_route_inv_rms_kernel[(1, blocks, heads)](
+        v,
+        inv_rms,
+        rows,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        inv_rms.stride(0),
+        inv_rms.stride(1),
+        heads,
+        HEAD_DIM,
+        BLOCK_SIZE,
+        float(eps),
+        num_warps=8,
+        num_stages=2,
+    )
+    return inv_rms
+
 def route_centroid_split_rms_diagnostic(
     v: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -1790,5 +1841,6 @@ __all__ = [
     "route_summary",
     "route_summary_reference",
     "route_summary_sol_reduction",
+    "route_inv_rms",
     "route_summary_sol_reduction_v5_diagnostic",
 ]
