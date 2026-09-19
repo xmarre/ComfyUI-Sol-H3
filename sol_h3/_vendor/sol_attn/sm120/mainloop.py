@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry, runtime mapped-neighbor metadata, and native Keyless selected-route execution; see tools/rectangular_sm120.patch, tools/mapped_neighbor_sm120.patch, and tools/keyless_fused_sm120.patch.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
@@ -47,6 +47,7 @@ class SolAttnForwardSm120:
         prefetch_next_route_k: bool = True,
         key_bias_enabled: bool = False,
         mapped_neighbors_enabled: bool = False,
+        keyless_enabled: bool = False,
     ):
         self.dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
@@ -60,6 +61,7 @@ class SolAttnForwardSm120:
         self.prefetch_next_route_k = prefetch_next_route_k
         self.key_bias_enabled = key_bias_enabled
         self.mapped_neighbors_enabled = mapped_neighbors_enabled
+        self.keyless_enabled = keyless_enabled
 
     @cute.kernel
     def kernel(
@@ -214,6 +216,9 @@ class SolAttnForwardSm120:
         )
         route_meta = cute.make_tensor(
             route_i32_ptr + 6 * N, cute.make_layout(2)
+        )
+        keyless_inv_rms = cute.make_tensor(
+            route_f32_ptr + 6 * N + 2, cute.make_layout(N)
         )
 
         mQ_slice = mQ[None, None, head_idx, batch_idx]
@@ -581,6 +586,20 @@ class SolAttnForwardSm120:
                 exact_block = cutlass.Int32(route_indices[ordinal])
                 k_wait = K_pipeline.consumer_try_wait(K_consumer)
                 K_pipeline.consumer_wait(K_consumer, k_wait)
+                if cutlass.const_expr(self.keyless_enabled):
+                    route_keyless_smem_in_place(
+                        sK,
+                        K_consumer.index,
+                        mKeyBias,
+                        mMappedNeighborIntervals,
+                        keyless_inv_rms,
+                        exact_block,
+                        token_count,
+                        batch_idx,
+                        tidx,
+                        warp,
+                        lane,
+                    )
                 gemm_smem_zero_acc(
                     tiled_mma_qk,
                     tSrS,
@@ -928,6 +947,111 @@ class SolAttnForwardSm120:
             stream=stream,
             min_blocks_per_mp=1,
         )
+
+
+@cute.jit
+def route_keyless_smem_in_place(
+    sK: cute.Tensor,
+    stage: cutlass.Int32,
+    route_norm_weight: cute.Tensor,
+    route_freqs: cute.Tensor,
+    inv_rms_scratch: cute.Tensor,
+    exact_block: cutlass.Int32,
+    token_count: cutlass.Int32,
+    batch_idx: cutlass.Int32,
+    tidx: cutlass.Int32,
+    warp: cutlass.Int32,
+    lane: cutlass.Int32,
+):
+    """Transform one selected raw-V K tile in bounded shared memory.
+
+    Four warps process four physical rows at a time.  RMS reduction matches the
+    pinned comfy-kitchen D=128 CUDA ordering exactly: each lane accumulates
+    d,d+32,d+64,d+96 with FP32 FMA, then uses shuffle-down offsets
+    16,8,4,2,1 and broadcasts lane 0.  The resulting per-row inverse RMS is
+    kept only in CTA scratch.  Each rotating split-half pair is owned by one
+    thread, so both BF16-normalized inputs are read before either shared-memory
+    destination is overwritten; the 96:128 tail is normalized separately.  The
+    independent PV pipeline remains raw V.
+    """
+    for row_base in cutlass.range_constexpr(0, N, 4):
+        row = cutlass.Int32(row_base) + warp
+        absolute_row = exact_block * cutlass.Int32(N) + row
+        valid = absolute_row < token_count
+        sum_sq = cutlass.Float32(0.0)
+        if valid:
+            for channel_offset in (0, 32, 64, 96):
+                value = cutlass.Float32(
+                    sK[row, lane + cutlass.Int32(channel_offset), stage]
+                )
+                sum_sq = cute.math.fma(value, value, sum_sq)
+        for offset in (16, 8, 4, 2, 1):
+            sum_sq += cute.arch.shuffle_sync_down(sum_sq, offset)
+        sum_sq = cute.arch.shuffle_sync(sum_sq, 0)
+        if lane == 0:
+            inv_rms = cutlass.Float32(0.0)
+            if valid:
+                inv_rms = cute.math.rsqrt(
+                    sum_sq / cutlass.Float32(D) + cutlass.Float32(1.0e-5),
+                    fastmath=True,
+                )
+            inv_rms_scratch[row] = inv_rms
+    cute.arch.fence_view_async_shared()
+    cute.arch.sync_threads()
+
+    for pair_base in cutlass.range_constexpr(0, N * 48, THREADS):
+        linear = cutlass.Int32(pair_base) + tidx
+        row = linear // cutlass.Int32(48)
+        pair = linear - row * cutlass.Int32(48)
+        absolute_row = exact_block * cutlass.Int32(N) + row
+        if absolute_row < token_count:
+            inv_rms = cutlass.Float32(inv_rms_scratch[row])
+            first_raw = cutlass.Float32(sK[row, pair, stage])
+            second_raw = cutlass.Float32(sK[row, pair + 48, stage])
+            first_norm = cutlass.BFloat16(
+                first_raw
+                * inv_rms
+                * cutlass.Float32(route_norm_weight[pair])
+            )
+            second_norm = cutlass.BFloat16(
+                second_raw
+                * inv_rms
+                * cutlass.Float32(route_norm_weight[pair + 48])
+            )
+            cos_value = cutlass.Float32(
+                route_freqs[batch_idx, absolute_row, 0, pair, 0, 0]
+            )
+            sin_value = cutlass.Float32(
+                route_freqs[batch_idx, absolute_row, 0, pair, 1, 0]
+            )
+            sK[row, pair, stage] = cutlass.BFloat16(
+                cutlass.Float32(first_norm) * cos_value
+                - cutlass.Float32(second_norm) * sin_value
+            )
+            sK[row, pair + 48, stage] = cutlass.BFloat16(
+                cutlass.Float32(first_norm) * sin_value
+                + cutlass.Float32(second_norm) * cos_value
+            )
+        else:
+            sK[row, pair, stage] = cutlass.BFloat16(0.0)
+            sK[row, pair + 48, stage] = cutlass.BFloat16(0.0)
+
+    for tail_base in cutlass.range_constexpr(0, N * 32, THREADS):
+        linear = cutlass.Int32(tail_base) + tidx
+        row = linear // cutlass.Int32(32)
+        d = cutlass.Int32(96) + linear - row * cutlass.Int32(32)
+        absolute_row = exact_block * cutlass.Int32(N) + row
+        if absolute_row < token_count:
+            raw = cutlass.Float32(sK[row, d, stage])
+            sK[row, d, stage] = cutlass.BFloat16(
+                raw
+                * cutlass.Float32(inv_rms_scratch[row])
+                * cutlass.Float32(route_norm_weight[d])
+            )
+        else:
+            sK[row, d, stage] = cutlass.BFloat16(0.0)
+    cute.arch.fence_view_async_shared()
+    cute.arch.sync_threads()
 
 
 @cute.jit
