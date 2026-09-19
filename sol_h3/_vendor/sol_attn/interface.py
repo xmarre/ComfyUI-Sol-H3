@@ -397,8 +397,6 @@ def _sol_attn_cute(
                             stream,
                             key_bias is not None,
                             mapped_neighbor_intervals is not None,
-                            False,
-                            False,
                         )
                     else:
                         args = _to_cute_tensors(tensors)
