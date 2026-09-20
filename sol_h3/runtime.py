@@ -57,6 +57,7 @@ class Request:
     vdn_rectangular_sol_calls: int = 0
     vdn_requested_q_rows: int = 0
     vdn_kernel_q_rows: int = 0
+    partitioned_diagnostic_dense_suffix_calls: int = 0
     vdn_square_expanded_calls: int = 0
     vdn_square_requested_rows: int = 0
     vdn_square_kernel_rows: int = 0
@@ -126,6 +127,7 @@ class SamplingWrapper:
                         "vdn_rectangular_sol_calls": state.vdn_rectangular_sol_calls,
                         "vdn_requested_q_rows": state.vdn_requested_q_rows,
                         "vdn_kernel_q_rows": state.vdn_kernel_q_rows,
+                        "partitioned_diagnostic_dense_suffix_calls": state.partitioned_diagnostic_dense_suffix_calls,
                         "mapped_descriptor_cache_entries": len(state.mapped_descriptor_cache),
                         "mapped_descriptor_cache_bytes": state.mapped_descriptor_bytes,
                         "vdn_square_expanded_calls": state.vdn_square_expanded_calls,

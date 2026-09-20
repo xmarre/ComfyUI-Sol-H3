@@ -282,7 +282,7 @@ def _accept_partitioned_receipt(item) -> bool:
             return False
 
     if route == PARTITIONED_DENSE_ROUTE:
-        if execution_mode not in {"dense_forced", "dense_warmup"} or kernel_contract is not None:
+        if execution_mode not in {"dense_forced", "dense_warmup", "dense_diagnostic_suffix"} or kernel_contract is not None:
             return False
     elif route == PARTITIONED_MAPPED_ROUTE:
         if (

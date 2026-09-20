@@ -113,18 +113,60 @@ def _add_replay(summary, target="partitioned_suffix", *, first_compile_misses=1)
                         "proof_hit": False,
                         "gate_performed": True,
                         "compile_misses": first_compile_misses,
+                        **(
+                            {
+                                "production_telemetry": {
+                                    "production_vs_dense_finite": True,
+                                    "production_vs_dense_max_abs": 0.25,
+                                    "production_vs_dense_mean_abs": 0.01,
+                                    "production_vs_dense_rel_l2": 0.02,
+                                    "production_vs_dense_reference_peak_abs": 8.0,
+                                    "production_vs_dense_catastrophic_max_abs_limit": 32.0,
+                                }
+                            }
+                            if target == "partitioned_suffix"
+                            else {}
+                        ),
                     },
                     {
                         "arm": arms[1],
                         "proof_hit": False,
                         "gate_performed": True,
                         "compile_misses": 0,
+                        **(
+                            {
+                                "production_telemetry": {
+                                    "production_vs_dense_finite": True,
+                                    "production_vs_dense_max_abs": 0.25,
+                                    "production_vs_dense_mean_abs": 0.01,
+                                    "production_vs_dense_rel_l2": 0.02,
+                                    "production_vs_dense_reference_peak_abs": 8.0,
+                                    "production_vs_dense_catastrophic_max_abs_limit": 32.0,
+                                }
+                            }
+                            if target == "partitioned_suffix"
+                            else {}
+                        ),
                     },
                     {
                         "arm": arms[2],
                         "proof_hit": True,
                         "gate_performed": False,
                         "compile_misses": 0,
+                        **(
+                            {
+                                "production_telemetry": {
+                                    "production_vs_dense_finite": True,
+                                    "production_vs_dense_max_abs": 0.25,
+                                    "production_vs_dense_mean_abs": 0.01,
+                                    "production_vs_dense_rel_l2": 0.02,
+                                    "production_vs_dense_reference_peak_abs": 8.0,
+                                    "production_vs_dense_catastrophic_max_abs_limit": 32.0,
+                                }
+                            }
+                            if target == "partitioned_suffix"
+                            else {}
+                        ),
                     },
                 ],
                 "rng_restored": True,
@@ -150,6 +192,14 @@ def _add_replay(summary, target="partitioned_suffix", *, first_compile_misses=1)
                     "prepare": 0.5,
                     "compiled_dispatch": 1.0,
                     "production_call": 1.5,
+                    **(
+                        {
+                            "production_dense_reference": 2.0,
+                            "production_error_reduction": 2.5,
+                        }
+                        if target == "partitioned_suffix"
+                        else {}
+                    ),
                 },
             }
         )
@@ -190,7 +240,22 @@ def test_replay_evidence_distinguishes_executable_and_proof_lifetimes():
     assert replay["first_compile_misses"] == 1
     assert replay["primed_compile_misses"] == 0
     assert replay["retained_proof_hit"] is True
+    assert len(replay["production_vs_dense"]) == 3
+    assert replay["production_vs_dense"][0]["max_abs"] == pytest.approx(0.25)
+    assert replay["production_vs_dense"][0]["rel_l2"] == pytest.approx(0.02)
 
+
+
+def test_partitioned_suffix_replay_rejects_missing_sparse_vs_dense_metric():
+    summary = _add_replay(_summary())
+    del summary["replay_diagnostics"]["reports"][0]["arms"][0]["production_telemetry"][
+        "production_vs_dense_rel_l2"
+    ]
+    with pytest.raises(DiagnosticEvidenceError, match="production_vs_dense_rel_l2"):
+        validate_cuda_attribution(
+            summary,
+            required_replay_targets=("partitioned_suffix",),
+        )
 
 def test_replay_cold_requirement_rejects_already_primed_first_arm():
     summary = _add_replay(_summary(), first_compile_misses=0)

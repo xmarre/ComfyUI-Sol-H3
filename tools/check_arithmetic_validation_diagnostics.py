@@ -235,8 +235,13 @@ def validate_cuda_attribution(
                         f"replay target {target!r} arm {arm_name!r} lacks one production CUDA sample"
                     )
                 spans = matching_production[0].get("cuda_event_ms")
-                if not isinstance(spans, dict) or not replay_production_required.issubset(spans):
-                    missing = sorted(replay_production_required - set(spans or {}))
+                required_production_spans = set(replay_production_required)
+                if target == "partitioned_suffix":
+                    required_production_spans.update(
+                        {"production_dense_reference", "production_error_reduction"}
+                    )
+                if not isinstance(spans, dict) or not required_production_spans.issubset(spans):
+                    missing = sorted(required_production_spans - set(spans or {}))
                     raise DiagnosticEvidenceError(
                         f"replay production sample is missing required spans: {missing}"
                     )
@@ -264,11 +269,51 @@ def validate_cuda_attribution(
                     raise DiagnosticEvidenceError(
                         "replay gate CUDA sample omitted its clean-start drain receipt"
                     )
+            production_vs_dense = []
+            if target == "partitioned_suffix":
+                metric_names = (
+                    "finite",
+                    "max_abs",
+                    "mean_abs",
+                    "rel_l2",
+                    "reference_peak_abs",
+                    "catastrophic_max_abs_limit",
+                )
+                for arm in arms:
+                    telemetry = arm.get("production_telemetry")
+                    if not isinstance(telemetry, dict):
+                        raise DiagnosticEvidenceError(
+                            "partitioned_suffix replay omitted production telemetry"
+                        )
+                    metrics = {}
+                    for name in metric_names:
+                        key = f"production_vs_dense_{name}"
+                        if key not in telemetry:
+                            raise DiagnosticEvidenceError(
+                                f"partitioned_suffix replay omitted {key}"
+                            )
+                        value = telemetry[key]
+                        if name == "finite":
+                            if value is not True:
+                                raise DiagnosticEvidenceError(
+                                    "partitioned_suffix sparse-vs-dense replay was non-finite"
+                                )
+                            metrics[name] = True
+                        else:
+                            metrics[name] = _number(
+                                value,
+                                f"partitioned_suffix.{arm.get('arm')}.{key}",
+                            )
+                    production_vs_dense.append(
+                        {"arm": arm.get("arm"), **metrics}
+                    )
+
             replay_reports[target] = {
                 "first_compile_misses": int(first.get("compile_misses", 0)),
                 "primed_compile_misses": int(primed.get("compile_misses", 0)),
                 "retained_proof_hit": bool(retained.get("proof_hit")),
                 "host_wall_s": _number(report.get("host_wall_s", 0.0), "replay.host_wall_s"),
+                "production_vs_dense": production_vs_dense,
             }
 
     return {
