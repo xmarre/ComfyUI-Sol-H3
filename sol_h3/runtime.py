@@ -5,6 +5,10 @@ import json
 import logging
 
 from .contracts import KEY, Config, adaln_status, prefix_length
+from .validation import ArithmeticValidationState, RuntimeLease
+from .diagnostics import CudaDiagnosticState
+from .replay_diagnostics import ReplayDiagnosticState
+from .sparse import validation_scope
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from . import weighted_measure
 from .interop import (
@@ -23,6 +27,7 @@ from .interop import (
 log = logging.getLogger("comfy.sol_h3")
 _REQUEST = ContextVar("sol_h3_request", default=None)
 _FORWARD = ContextVar("sol_h3_forward", default=None)
+CUDA_DIAGNOSTICS_KEY = "sol_h3_cuda_diagnostics_v1"
 
 
 @dataclass
@@ -52,6 +57,7 @@ class Request:
     vdn_rectangular_sol_calls: int = 0
     vdn_requested_q_rows: int = 0
     vdn_kernel_q_rows: int = 0
+    partitioned_diagnostic_dense_suffix_calls: int = 0
     vdn_square_expanded_calls: int = 0
     vdn_square_requested_rows: int = 0
     vdn_square_kernel_rows: int = 0
@@ -69,6 +75,11 @@ class Request:
     native_reason: str | None = None
     last_routes: tuple | None = None
     backend_transitions: int = 0
+    runtime_attribution: dict = field(default_factory=dict)
+    validation_state: ArithmeticValidationState = field(default_factory=ArithmeticValidationState)
+    runtime_lease: RuntimeLease = field(default_factory=RuntimeLease)
+    cuda_diagnostics: CudaDiagnosticState = field(default_factory=CudaDiagnosticState.from_env)
+    replay_diagnostics: ReplayDiagnosticState = field(default_factory=ReplayDiagnosticState.from_env)
 
 
 @dataclass(frozen=True)
@@ -84,6 +95,7 @@ class SamplingWrapper:
             success = True
             return result
         finally:
+            state.cuda_diagnostics.resolve()
             _REQUEST.reset(token)
             log.info(
                 "Sol-H3 %s",
@@ -115,6 +127,7 @@ class SamplingWrapper:
                         "vdn_rectangular_sol_calls": state.vdn_rectangular_sol_calls,
                         "vdn_requested_q_rows": state.vdn_requested_q_rows,
                         "vdn_kernel_q_rows": state.vdn_kernel_q_rows,
+                        "partitioned_diagnostic_dense_suffix_calls": state.partitioned_diagnostic_dense_suffix_calls,
                         "mapped_descriptor_cache_entries": len(state.mapped_descriptor_cache),
                         "mapped_descriptor_cache_bytes": state.mapped_descriptor_bytes,
                         "vdn_square_expanded_calls": state.vdn_square_expanded_calls,
@@ -124,6 +137,11 @@ class SamplingWrapper:
                         "exact_blocks": state.exact_blocks,
                         "inherited_dense_backends": sorted(state.dense_attention_backends),
                         "arithmetic_gates": state.gates,
+                        "runtime_attribution": state.runtime_attribution,
+                        "validation": state.validation_state.summary(),
+                        "runtime_lease": state.runtime_lease.summary(),
+                        "cuda_diagnostics": state.cuda_diagnostics.summary(),
+                        "replay_diagnostics": state.replay_diagnostics.summary(),
                     }
                 ),
             )
@@ -140,6 +158,8 @@ class DiffusionWrapper:
         state = _REQUEST.get()
         if state is None or state.config != self.config:
             raise RuntimeError("Sol-H3 must execute inside its native OUTER_SAMPLE lifecycle")
+        if state.cuda_diagnostics.enabled:
+            options[CUDA_DIAGNOSTICS_KEY] = state.cuda_diagnostics
         model = executor.class_obj
         seen = set()
         routes = []
@@ -154,6 +174,9 @@ class DiffusionWrapper:
             return result
         finally:
             _FORWARD.reset(token)
+            # Diagnostic mode is allowed to synchronize only at this existing
+            # H3 model-evaluation boundary. Production mode is a no-op.
+            state.cuda_diagnostics.drain_pending()
 
 
 def _shape_reason(q, k, v, heads, mask, kw, *, rectangular=False):
@@ -258,6 +281,27 @@ def _external_sequence_prefix(contract, layout, rows):
     if current_prefix != start:
         return None, "external_sequence_layout"
     return start, None
+
+
+FLOW_REQUEST_ID_KEY = "h3_flow_request_id_v1"
+FLOW_STAGE_KEY = "h3_flow_stage"
+FLOW_STAGE_ID_KEY = "h3_flow_stage_id_v1"
+FLOW_EVALUATION_ID_KEY = "h3_flow_evaluation_id_v1"
+FLOW_PARTITIONED_STAGE_KEY = "h3_flow_partitioned_stage_v1"
+
+
+def _validation_context(options, evaluation, block_index, *, owner_generation=None, route=None):
+    context = {
+        "flow_request_id": options.get(FLOW_REQUEST_ID_KEY),
+        "flow_stage": options.get(FLOW_STAGE_KEY),
+        "flow_stage_id": options.get(FLOW_STAGE_ID_KEY),
+        "flow_evaluation_id": options.get(FLOW_EVALUATION_ID_KEY),
+        "sol_evaluation": int(evaluation),
+        "block_index": int(block_index),
+        "owner_generation": owner_generation,
+        "route": route,
+    }
+    return context
 
 
 def _vdn_provider_api():
@@ -444,13 +488,25 @@ class BlockPatch:
 
                     from .sparse import attention, KernelUnavailable
                     try:
-                        result = attention(
-                            q, k, v, prefix, config, state,
-                            dense_attention=weighted_prefix_dense,
-                            key_bias=measure_plan.key_log_measure,
-                            exact_k_blocks=measure_plan.exact_k_block_range,
-                            calibration_identity=measure_plan.semantic_digest,
-                        )
+                        with validation_scope(
+                            _validation_context(
+                                current_options,
+                                evaluation,
+                                self.index,
+                                owner_generation=measure_plan.owner_generation,
+                                route="ordinary_weighted",
+                            )
+                        ):
+                            result = attention(
+                                q, k, v, prefix, config, state,
+                                dense_attention=weighted_prefix_dense,
+                                key_bias=measure_plan.key_log_measure,
+                                exact_k_blocks=measure_plan.exact_k_block_range,
+                                calibration_identity=measure_plan.semantic_digest,
+                                validation_bias_identity=weighted_measure.arithmetic_bias_identity(
+                                    generic_measure_contract, measure_plan
+                                ),
+                            )
                     except KernelUnavailable as exc:
                         dense_plan = weighted_measure.prepare(
                             state, current_options, generic_measure_contract, **bind_kwargs,
@@ -503,7 +559,15 @@ class BlockPatch:
 
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(q, k, v, prefix, config, state, dense_attention=dense_attention)
+                    with validation_scope(
+                        _validation_context(
+                            current_options, evaluation, self.index, route="ordinary"
+                        )
+                    ):
+                        result = attention(
+                            q, k, v, prefix, config, state,
+                            dense_attention=dense_attention,
+                        )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     dense_provider = previous
@@ -556,7 +620,15 @@ class BlockPatch:
                     return native()
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(qc, kc, vc, sink_rows, config, state, recompute_prefix_queries=False)
+                    with validation_scope(
+                        _validation_context(
+                            options, evaluation, self.index, route="vdn_legacy_local"
+                        )
+                    ):
+                        result = attention(
+                            qc, kc, vc, sink_rows, config, state,
+                            recompute_prefix_queries=False,
+                        )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
@@ -669,12 +741,17 @@ class BlockPatch:
 
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(
-                        qc, kc, vc, sink_rows, config, state,
-                        recompute_prefix_queries=False,
-                        mapped_neighbor_intervals=mapped_tensor,
-                        mapped_calibration_identity=descriptor.descriptor_digest,
-                    )
+                    with validation_scope(
+                        _validation_context(
+                            options, evaluation, self.index, route="vdn_mapped_v4"
+                        )
+                    ):
+                        result = attention(
+                            qc, kc, vc, sink_rows, config, state,
+                            recompute_prefix_queries=False,
+                            mapped_neighbor_intervals=mapped_tensor,
+                            mapped_calibration_identity=descriptor.descriptor_digest,
+                        )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
@@ -798,3 +875,18 @@ def install(model, config):
             )
     log.info("Sol-H3 active: %s; AdaLN precompute=%s", config.metadata(), adaln_status(inner))
     return cloned
+
+
+def invalidate_arithmetic_validation(reason="numerical_transition"):
+    """Invalidate successful arithmetic proofs for the active OUTER_SAMPLE request."""
+    state = _REQUEST.get()
+    if state is None:
+        raise RuntimeError(
+            "Sol-H3 arithmetic validation invalidation requires an active OUTER_SAMPLE request"
+        )
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("arithmetic validation invalidation reason must be a nonempty string")
+    state.validation_state.invalidate(reason)
+    state.sparse_verified.clear()
+    if hasattr(state, "partitioned_sparse_verified"):
+        state.partitioned_sparse_verified.clear()

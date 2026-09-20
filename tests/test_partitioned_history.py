@@ -152,6 +152,21 @@ def test_owned_partitioned_dense_receipt_is_accepted():
     assert _owned(item)
 
 
+
+def test_owned_partitioned_diagnostic_dense_suffix_receipt_is_explicit():
+    fields = _fields(execution_mode="dense_diagnostic_suffix")
+    item = ("sol_h3", 3, PARTITIONED_DENSE_ROUTE, fields)
+    assert _owned(item)
+
+    invalid = _fields(execution_mode="dense_unknown")
+    bad = ("sol_h3", 3, PARTITIONED_DENSE_ROUTE, invalid)
+    state = SimpleNamespace(partitioned_validated_receipts={(3, invalid)})
+    token = _REQUEST.set(state)
+    try:
+        assert not _accept_partitioned_receipt(bad)
+    finally:
+        _REQUEST.reset(token)
+
 def test_partitioned_receipt_requires_request_owned_completion():
     fields = _fields()
     item = ("sol_h3", 3, PARTITIONED_DENSE_ROUTE, fields)

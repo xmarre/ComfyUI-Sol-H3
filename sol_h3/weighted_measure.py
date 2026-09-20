@@ -6,6 +6,8 @@ import dis
 import hashlib
 import importlib
 import marshal
+import math
+import struct
 import threading
 import types
 import uuid
@@ -433,6 +435,51 @@ def prepare(
             raise RuntimeError("cached Sol-H3 attention-measure exact K range is stale")
     return plan
 
+
+
+def arithmetic_bias_identity(request, plan):
+    """Return a host-only exact FP32-bias identity when the core contract is available.
+
+    A caller that cannot prove the canonical request receives a volatile identity.
+    That keeps execution compatible while forcing conservative revalidation rather
+    than reusing a proof under an underspecified bias.
+    """
+    core = _core(required=False)
+    if core is None:
+        return {
+            "unrepresentable_bias_identity": True,
+            "volatile_generation": uuid.uuid4().hex,
+        }
+    try:
+        normalized = core.normalize(request)
+    except (TypeError, ValueError, KeyError):
+        return {
+            "unrepresentable_bias_identity": True,
+            "volatile_generation": uuid.uuid4().hex,
+        }
+
+    def fp32_hex(value):
+        rounded = struct.unpack(">f", struct.pack(">f", float(value)))[0]
+        return rounded.hex()
+
+    segments = []
+    for segment in normalized["segments"]:
+        log_measure = math.log(segment["mass_num"]) - math.log(segment["mass_den"])
+        segments.append({
+            "start": segment["start"],
+            "stop": segment["stop"],
+            "log_measure_fp32": fp32_hex(log_measure),
+        })
+    return {
+        "semantic_digest": plan.semantic_digest,
+        "provider_identity": plan.provider_identity,
+        "owner_generation": plan.owner_generation,
+        "preprocess_digest": plan.preprocess_digest,
+        "exact_range_digest": plan.exact_range_digest,
+        "key_log_measure_dtype": str(plan.key_log_measure.dtype),
+        "reference_mask_dtype": None,
+        "segments": segments,
+    }
 
 def dense(q, k, v, heads, plan, *, scale=None, output_heads=False):
     """Exact all-row weighted fallback over already-preprocessed BHND tensors."""
