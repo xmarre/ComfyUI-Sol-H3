@@ -18,11 +18,27 @@ from tools.run_mapped_neighbor_probe import (
 )
 
 
-def test_current_sol_probe_sources_match_reviewed_blob_identities():
+def test_current_sol_probe_sources_match_or_fail_closed_after_source_revision():
+    from sol_h3.provenance import CONTRACT
+
     root = Path(__file__).resolve().parents[1]
-    reports = _source_gate(root, EXPECTED_SOL_BLOBS, "sol")
-    assert {item["relative_path"] for item in reports} == set(EXPECTED_SOL_BLOBS)
-    assert all(item["git_blob_sha"] == EXPECTED_SOL_BLOBS[item["relative_path"]] for item in reports)
+    preserved = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"
+    if CONTRACT == preserved:
+        reports = _source_gate(root, EXPECTED_SOL_BLOBS, "sol")
+        assert {item["relative_path"] for item in reports} == set(
+            EXPECTED_SOL_BLOBS
+        )
+        assert all(
+            item["git_blob_sha"] == EXPECTED_SOL_BLOBS[item["relative_path"]]
+            for item in reports
+        )
+        return
+
+    # Later Sol source contracts must not silently reinterpret the preserved
+    # mapped-neighbor production evidence. The old runner remains pinned to its
+    # reviewed blobs and therefore has to reject the changed current source.
+    with pytest.raises(RuntimeError, match="differs from reviewed production bytes"):
+        _source_gate(root, EXPECTED_SOL_BLOBS, "sol")
 
 
 @pytest.mark.skipif(not os.environ.get("VDN_PATH"), reason="set VDN_PATH for production VDN source gate")

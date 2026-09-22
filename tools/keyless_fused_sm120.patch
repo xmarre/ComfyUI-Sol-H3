@@ -1,0 +1,481 @@
+diff --git a/sol_h3/_vendor/sol_attn/__init__.py b/sol_h3/_vendor/sol_attn/__init__.py
+index d37351d..9118542 100644
+--- a/sol_h3/_vendor/sol_attn/__init__.py
++++ b/sol_h3/_vendor/sol_attn/__init__.py
+@@ -1,5 +1,5 @@
+ """Sol-Attn."""
+ 
+-from .interface import get_sol_attn_backend, sol_attn
++from .interface import KEYLESS_FUSED_CONTRACT, get_sol_attn_backend, sol_attn, sol_attn_keyless
+ 
+-__all__ = ["get_sol_attn_backend", "sol_attn"]
++__all__ = ["KEYLESS_FUSED_CONTRACT", "get_sol_attn_backend", "sol_attn", "sol_attn_keyless"]
+diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/interface.py
+index e63156d..4a78e01 100644
+--- a/sol_h3/_vendor/sol_attn/interface.py
++++ b/sol_h3/_vendor/sol_attn/interface.py
+@@ -1,4 +1,4 @@
+-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
++# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry, runtime mapped-neighbor metadata, and native Keyless selected-route execution; see tools/rectangular_sm120.patch, tools/mapped_neighbor_sm120.patch, and tools/keyless_fused_sm120.patch.
+ """Public Sol-Attn interface."""
+ 
+ from __future__ import annotations
+@@ -11,6 +11,7 @@
+ 
+ BLOCK_SIZE = 64
+ MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"
++KEYLESS_FUSED_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-keyless-fused-v1"
+ _CUTE_BACKENDS = {
+     (9, 0): "cute_sm90",
+     (10, 0): "cute_sm100",
+@@ -206,6 +207,8 @@ def _compile_sm120(
+     stream,
+     key_bias_enabled,
+     mapped_neighbors_enabled,
++    debug_route_trace=False,
++    keyless_enabled=False,
+ ):
+     import cutlass.cute as cute
+ 
+@@ -214,6 +217,8 @@ def _compile_sm120(
+     operator = make_kernel(
+         key_bias_enabled=key_bias_enabled,
+         mapped_neighbors_enabled=mapped_neighbors_enabled,
++        debug_route_trace=debug_route_trace,
++        keyless_enabled=keyless_enabled,
+     )
+     args = _to_cute_tensors(tensors)
+     compiled = cute.compile(
+@@ -406,6 +411,237 @@ def _sol_attn_cute(
+     return output[:, :tokens]
+ 
+ 
++
++def _validate_keyless_native_inputs(
++    q,
++    v,
++    route_centroid,
++    value_sum,
++    threshold,
++    route_norm_weight,
++    route_freqs,
++    *,
++    sink_tokens,
++    sink_start,
++):
++    arch = _validate_inputs(
++        q,
++        v,
++        v,
++        "diag",
++        sink_tokens,
++        sink_start,
++    )
++    if arch != (12, 0):
++        raise RuntimeError("fused Keyless Sol-Attn requires SM120")
++    if _backend_for_arch(arch) != "cute_sm120":
++        raise RuntimeError("fused Keyless Sol-Attn requires the SM120 CuTe backend")
++
++    batch, q_tokens, heads, head_dim = q.shape
++    kv_tokens = int(v.shape[1])
++    blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
++    q_tiles = (int(q_tokens) + BLOCK_SIZE - 1) // BLOCK_SIZE
++    expected_summary = (batch, blocks, heads, head_dim)
++    if tuple(route_centroid.shape) != expected_summary:
++        raise ValueError(
++            f"route_centroid must have shape {expected_summary}, "
++            f"got {tuple(route_centroid.shape)}"
++        )
++    if tuple(value_sum.shape) != expected_summary:
++        raise ValueError(
++            f"value_sum must have shape {expected_summary}, got {tuple(value_sum.shape)}"
++        )
++    if tuple(threshold.shape) != (batch, q_tiles, heads):
++        raise ValueError(
++            "threshold must be [B,ceil(Tq/64),H] for fused Keyless Sol-Attn"
++        )
++    if tuple(route_norm_weight.shape) != (head_dim,):
++        raise ValueError("route_norm_weight must be [128]")
++    expected_rope = (batch, kv_tokens, 1, 48, 2, 2)
++    if tuple(route_freqs.shape) != expected_rope:
++        raise ValueError(
++            f"route_freqs must have shape {expected_rope}, "
++            f"got {tuple(route_freqs.shape)}"
++        )
++
++    if route_centroid.dtype != torch.bfloat16 or value_sum.dtype != torch.bfloat16:
++        raise TypeError("Keyless route summaries must be BF16")
++    if threshold.dtype != torch.float32:
++        raise TypeError("Keyless threshold must be FP32")
++    if route_norm_weight.dtype != torch.bfloat16:
++        raise TypeError("Keyless route_norm_weight must be BF16")
++    if route_freqs.dtype not in (torch.bfloat16, torch.float32):
++        raise TypeError("Keyless route_freqs must be BF16 or FP32")
++    for name, tensor in (
++        ("route_centroid", route_centroid),
++        ("value_sum", value_sum),
++        ("threshold", threshold),
++        ("route_norm_weight", route_norm_weight),
++        ("route_freqs", route_freqs),
++    ):
++        if tensor.device != q.device:
++            raise ValueError(f"{name} must share the Q/V CUDA device")
++    if route_norm_weight.stride(0) != 1:
++        raise ValueError("route_norm_weight must be contiguous")
++    return arch
++
++
++def _sol_attn_keyless_cute(
++    q,
++    v,
++    route_centroid,
++    value_sum,
++    threshold,
++    route_norm_weight,
++    route_freqs,
++    *,
++    arch,
++    scale,
++    sink_tokens,
++    sink_start,
++    debug_route_trace,
++):
++    batch, q_tokens, heads, _ = q.shape
++    kv_tokens = int(v.shape[1])
++    q_tiles = (int(q_tokens) + BLOCK_SIZE - 1) // BLOCK_SIZE
++    kv_blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
++    route_groups = (kv_blocks + BLOCK_SIZE - 1) // BLOCK_SIZE
++
++    with torch.cuda.device(q.device):
++        output = torch.empty_like(q)
++        if debug_route_trace:
++            lse_or_trace = torch.zeros(
++                (batch, q_tiles, heads, route_groups, 2),
++                device=q.device,
++                dtype=torch.int32,
++            )
++        else:
++            lse_or_trace = torch.empty(
++                (batch, q_tokens, heads),
++                device=q.device,
++                dtype=torch.float32,
++            )
++        sink_start_block, sink_end_block = _sink_block_range(
++            kv_tokens,
++            sink_start,
++            sink_tokens,
++        )
++        stream = _stream(q.device)
++        tensors = [
++            q,
++            v,
++            v,
++            output,
++            route_centroid,
++            value_sum,
++            threshold,
++            route_norm_weight,
++            route_freqs,
++            lse_or_trace,
++        ]
++        layout_key = tuple(
++            (
++                tuple(int(v) for v in tensor.shape),
++                tuple(int(v) for v in tensor.stride()),
++                str(tensor.dtype),
++            )
++            for tensor in tensors
++        )
++        key = (
++            q.device.index,
++            arch,
++            KEYLESS_FUSED_CONTRACT,
++            bool(debug_route_trace),
++            layout_key,
++        )
++        compiled = _compiled.get(key)
++        if compiled is None:
++            with _compile_lock:
++                compiled = _compiled.get(key)
++                if compiled is None:
++                    compiled, args = _compile_sm120(
++                        key,
++                        tensors,
++                        scale,
++                        sink_start_block,
++                        sink_end_block,
++                        stream,
++                        False,
++                        False,
++                        bool(debug_route_trace),
++                        True,
++                    )
++                else:
++                    args = _to_cute_tensors(tensors)
++        else:
++            args = _to_cute_tensors(tensors)
++        compiled(
++            *args,
++            scale,
++            sink_start_block,
++            sink_end_block,
++            stream=stream,
++        )
++    if debug_route_trace:
++        return output, lse_or_trace
++    return output
++
++
++def sol_attn_keyless(
++    q: torch.Tensor,
++    v: torch.Tensor,
++    route_centroid: torch.Tensor,
++    value_sum: torch.Tensor,
++    threshold: torch.Tensor,
++    route_norm_weight: torch.Tensor,
++    route_freqs: torch.Tensor,
++    *,
++    scale: float | None = None,
++    sink_tokens: int = 0,
++    sink_start: int | None = None,
++    debug_route_trace: bool = False,
++):
++    """Run the SM120 no-global-route Keyless Sol candidate.
++
++    Q is already normalized/positioned.  The K TMA path receives raw V and
++    routes only selected exact K tiles inside bounded CTA shared memory before
++    QK MMA.  PV always consumes raw V.  RC/VC/threshold are caller-owned proven
++    K1/K3 summaries. Route metadata reuses the two historical optional SM120
++    tensor slots under the Keyless-only compile-time specialization. This entry
++    point never materializes a global route tensor.
++    """
++    arch = _validate_keyless_native_inputs(
++        q,
++        v,
++        route_centroid,
++        value_sum,
++        threshold,
++        route_norm_weight,
++        route_freqs,
++        sink_tokens=sink_tokens,
++        sink_start=sink_start,
++    )
++    if type(debug_route_trace) is not bool:
++        raise TypeError("debug_route_trace must be bool")
++    _validate_cute(arch, v.shape[1], 1)
++    scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
++    if not math.isfinite(scale) or scale <= 0.0:
++        raise ValueError("fused Keyless attention scale must be finite and positive")
++    return _sol_attn_keyless_cute(
++        q,
++        v,
++        route_centroid,
++        value_sum,
++        threshold,
++        route_norm_weight,
++        route_freqs,
++        arch=arch,
++        scale=scale,
++        sink_tokens=sink_tokens,
++        sink_start=sink_start,
++        debug_route_trace=debug_route_trace,
++    )
++
+ def _pad_to_bucket(q, k, v, bucket_size: int):
+     """Pad BTHD inputs to a stable compile shape while preserving a logical length."""
+     tokens = q.shape[1]
+@@ -567,4 +803,4 @@ def sol_attn(
+     )
+ 
+ 
+-__all__ = ["get_sol_attn_backend", "sol_attn"]
++__all__ = ["KEYLESS_FUSED_CONTRACT", "get_sol_attn_backend", "sol_attn", "sol_attn_keyless"]
+diff --git a/sol_h3/_vendor/sol_attn/sm120/kernel.py b/sol_h3/_vendor/sol_attn/sm120/kernel.py
+index 57feb6f..01f3e14 100644
+--- a/sol_h3/_vendor/sol_attn/sm120/kernel.py
++++ b/sol_h3/_vendor/sol_attn/sm120/kernel.py
+@@ -10,6 +10,7 @@ def make_kernel(
+     prefetch_next_route_k: bool = True,
+     key_bias_enabled: bool = False,
+     mapped_neighbors_enabled: bool = False,
++    keyless_enabled: bool = False,
+ ):
+     return SolAttnForwardSm120(
+         debug_route_trace=debug_route_trace,
+@@ -17,6 +18,7 @@ def make_kernel(
+         prefetch_next_route_k=prefetch_next_route_k,
+         key_bias_enabled=key_bias_enabled,
+         mapped_neighbors_enabled=mapped_neighbors_enabled,
++        keyless_enabled=keyless_enabled,
+     )
+ 
+ 
+diff --git a/sol_h3/_vendor/sol_attn/sm120/mainloop.py b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
+index 256fa0e..11e194e 100644
+--- a/sol_h3/_vendor/sol_attn/sm120/mainloop.py
++++ b/sol_h3/_vendor/sol_attn/sm120/mainloop.py
+@@ -1,4 +1,4 @@
+-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
++# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry, runtime mapped-neighbor metadata, and native Keyless selected-route execution; see tools/rectangular_sm120.patch, tools/mapped_neighbor_sm120.patch, and tools/keyless_fused_sm120.patch.
+ # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ # SPDX-License-Identifier: Apache-2.0
+ """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
+@@ -47,6 +47,7 @@ def __init__(
+         prefetch_next_route_k: bool = True,
+         key_bias_enabled: bool = False,
+         mapped_neighbors_enabled: bool = False,
++        keyless_enabled: bool = False,
+     ):
+         self.dtype = cutlass.BFloat16
+         self.acc_dtype = cutlass.Float32
+@@ -60,6 +61,7 @@ def __init__(
+         self.prefetch_next_route_k = prefetch_next_route_k
+         self.key_bias_enabled = key_bias_enabled
+         self.mapped_neighbors_enabled = mapped_neighbors_enabled
++        self.keyless_enabled = keyless_enabled
+ 
+     @cute.kernel
+     def kernel(
+@@ -215,6 +217,9 @@ def kernel(
+         route_meta = cute.make_tensor(
+             route_i32_ptr + 6 * N, cute.make_layout(2)
+         )
++        keyless_inv_rms = cute.make_tensor(
++            route_f32_ptr + 6 * N + 2, cute.make_layout(N)
++        )
+ 
+         mQ_slice = mQ[None, None, head_idx, batch_idx]
+         mK_slice = mK[None, None, head_idx, batch_idx]
+@@ -581,6 +586,20 @@ def kernel(
+                 exact_block = cutlass.Int32(route_indices[ordinal])
+                 k_wait = K_pipeline.consumer_try_wait(K_consumer)
+                 K_pipeline.consumer_wait(K_consumer, k_wait)
++                if cutlass.const_expr(self.keyless_enabled):
++                    route_keyless_smem_in_place(
++                        sK,
++                        K_consumer.index,
++                        mKeyBias,
++                        mMappedNeighborIntervals,
++                        keyless_inv_rms,
++                        exact_block,
++                        token_count,
++                        batch_idx,
++                        tidx,
++                        warp,
++                        lane,
++                    )
+                 gemm_smem_zero_acc(
+                     tiled_mma_qk,
+                     tSrS,
+@@ -930,6 +949,111 @@ class SharedStorage:
+         )
+ 
+ 
++@cute.jit
++def route_keyless_smem_in_place(
++    sK: cute.Tensor,
++    stage: cutlass.Int32,
++    route_norm_weight: cute.Tensor,
++    route_freqs: cute.Tensor,
++    inv_rms_scratch: cute.Tensor,
++    exact_block: cutlass.Int32,
++    token_count: cutlass.Int32,
++    batch_idx: cutlass.Int32,
++    tidx: cutlass.Int32,
++    warp: cutlass.Int32,
++    lane: cutlass.Int32,
++):
++    """Transform one selected raw-V K tile in bounded shared memory.
++
++    Four warps process four physical rows at a time.  RMS reduction matches the
++    pinned comfy-kitchen D=128 CUDA ordering exactly: each lane accumulates
++    d,d+32,d+64,d+96 with FP32 FMA, then uses shuffle-down offsets
++    16,8,4,2,1 and broadcasts lane 0.  The resulting per-row inverse RMS is
++    kept only in CTA scratch.  Each rotating split-half pair is owned by one
++    thread, so both BF16-normalized inputs are read before either shared-memory
++    destination is overwritten; the 96:128 tail is normalized separately.  The
++    independent PV pipeline remains raw V.
++    """
++    for row_base in cutlass.range_constexpr(0, N, 4):
++        row = cutlass.Int32(row_base) + warp
++        absolute_row = exact_block * cutlass.Int32(N) + row
++        valid = absolute_row < token_count
++        sum_sq = cutlass.Float32(0.0)
++        if valid:
++            for channel_offset in (0, 32, 64, 96):
++                value = cutlass.Float32(
++                    sK[row, lane + cutlass.Int32(channel_offset), stage]
++                )
++                sum_sq = cute.math.fma(value, value, sum_sq)
++        for offset in (16, 8, 4, 2, 1):
++            sum_sq += cute.arch.shuffle_sync_down(sum_sq, offset)
++        sum_sq = cute.arch.shuffle_sync(sum_sq, 0)
++        if lane == 0:
++            inv_rms = cutlass.Float32(0.0)
++            if valid:
++                inv_rms = cute.math.rsqrt(
++                    sum_sq / cutlass.Float32(D) + cutlass.Float32(1.0e-5),
++                    fastmath=True,
++                )
++            inv_rms_scratch[row] = inv_rms
++    cute.arch.fence_view_async_shared()
++    cute.arch.sync_threads()
++
++    for pair_base in cutlass.range_constexpr(0, N * 48, THREADS):
++        linear = cutlass.Int32(pair_base) + tidx
++        row = linear // cutlass.Int32(48)
++        pair = linear - row * cutlass.Int32(48)
++        absolute_row = exact_block * cutlass.Int32(N) + row
++        if absolute_row < token_count:
++            inv_rms = cutlass.Float32(inv_rms_scratch[row])
++            first_raw = cutlass.Float32(sK[row, pair, stage])
++            second_raw = cutlass.Float32(sK[row, pair + 48, stage])
++            first_norm = cutlass.BFloat16(
++                first_raw
++                * inv_rms
++                * cutlass.Float32(route_norm_weight[pair])
++            )
++            second_norm = cutlass.BFloat16(
++                second_raw
++                * inv_rms
++                * cutlass.Float32(route_norm_weight[pair + 48])
++            )
++            cos_value = cutlass.Float32(
++                route_freqs[batch_idx, absolute_row, 0, pair, 0, 0]
++            )
++            sin_value = cutlass.Float32(
++                route_freqs[batch_idx, absolute_row, 0, pair, 1, 0]
++            )
++            sK[row, pair, stage] = cutlass.BFloat16(
++                cutlass.Float32(first_norm) * cos_value
++                - cutlass.Float32(second_norm) * sin_value
++            )
++            sK[row, pair + 48, stage] = cutlass.BFloat16(
++                cutlass.Float32(first_norm) * sin_value
++                + cutlass.Float32(second_norm) * cos_value
++            )
++        else:
++            sK[row, pair, stage] = cutlass.BFloat16(0.0)
++            sK[row, pair + 48, stage] = cutlass.BFloat16(0.0)
++
++    for tail_base in cutlass.range_constexpr(0, N * 32, THREADS):
++        linear = cutlass.Int32(tail_base) + tidx
++        row = linear // cutlass.Int32(32)
++        d = cutlass.Int32(96) + linear - row * cutlass.Int32(32)
++        absolute_row = exact_block * cutlass.Int32(N) + row
++        if absolute_row < token_count:
++            raw = cutlass.Float32(sK[row, d, stage])
++            sK[row, d, stage] = cutlass.BFloat16(
++                raw
++                * cutlass.Float32(inv_rms_scratch[row])
++                * cutlass.Float32(route_norm_weight[d])
++            )
++        else:
++            sK[row, d, stage] = cutlass.BFloat16(0.0)
++    cute.arch.fence_view_async_shared()
++    cute.arch.sync_threads()
++
++
+ @cute.jit
+ def gemm_smem_zero_acc(
+     tiled_mma: cute.TiledMma,

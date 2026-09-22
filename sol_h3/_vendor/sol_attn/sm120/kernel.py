@@ -10,6 +10,7 @@ def make_kernel(
     prefetch_next_route_k: bool = True,
     key_bias_enabled: bool = False,
     mapped_neighbors_enabled: bool = False,
+    keyless_enabled: bool = False,
 ):
     return SolAttnForwardSm120(
         debug_route_trace=debug_route_trace,
@@ -17,6 +18,7 @@ def make_kernel(
         prefetch_next_route_k=prefetch_next_route_k,
         key_bias_enabled=key_bias_enabled,
         mapped_neighbors_enabled=mapped_neighbors_enabled,
+        keyless_enabled=keyless_enabled,
     )
 
 
