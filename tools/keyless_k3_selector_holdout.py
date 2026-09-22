@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Recalibrate K3 against the proven K1-v6 route identity on real H3.
+"""Evaluate the frozen exact K3-v2 selector gate on unseen real-H3 windows.
 
-K1-v6 supplies routed centroids/value sums from raw V through its bounded-b8
-spill/reload primitive. The reference materializes the exact K1 row route only
-on the diagnostic side and feeds it through the released Sol reducer. Candidate
-and reference then use the same materialized exact K1 route for selected exact
-blocks, so this run isolates only K3 threshold/selector/approximate-summary
-semantics after the upstream K1 mismatch was corrected.
+The K3-v2 calibration established exact equality for routed centroids, raw value
+sums, thresholds, route ballots, and sparse outputs when candidate K1-v6
+summaries are compared with the exact K1-route materialized reference.
 
-The run is threshold-free calibration evidence only. No K3 gate is frozen by it.
+This holdout freezes that exact-equality gate before evaluating four deterministic
+windows that are disjoint from the K3-v2 calibration windows. The full exact K1
+route remains diagnostic/reference-only; this is not K4 or provider promotion.
 """
 from __future__ import annotations
 
@@ -27,6 +26,7 @@ if _DEFAULT_COMFY_ROOT.joinpath("comfy").is_dir():
 
 import torch  # noqa: E402
 
+import keyless_k3_selector_probe as calibration_probe  # noqa: E402
 import keyless_real_h3_replay_probe as replay_fixture  # noqa: E402
 from sol_h3.keyless_real_h3_replay import (  # noqa: E402
     tensor_metrics,
@@ -48,8 +48,12 @@ from sol_h3.keyless_selector import (  # noqa: E402
 )
 
 
-PROBE_CONTRACT = "sol-h3-keyless-k3-selector-probe-v2"
-EVIDENCE_CONTRACT = "sol-h3-keyless-k3-selector-calibration-v2"
+PROBE_CONTRACT = "sol-h3-keyless-k3-selector-holdout-probe-v1"
+EVIDENCE_CONTRACT = "sol-h3-keyless-k3-selector-holdout-v1"
+EXACT_GATE_CONTRACT = "sol-h3-keyless-k3-v2-exact-gate-v1"
+CALIBRATION_EVIDENCE_SHA256 = (
+    "ea2daae99e6c3df515b9d8a03a9fb4b8b2920601d843b7363fb63309d7eff836"
+)
 REQUIRED_K1_CONTRACT = "sol-h3-keyless-route-summary-sol-reduction-v6-bounded-b8"
 REQUIRED_K3_CONTRACT = "sol-h3-keyless-selector-k3-v2-k1-route-identity"
 K1_V9_EVIDENCE_SHA256 = (
@@ -61,191 +65,33 @@ K2_V3_HOLDOUT_SHA256 = (
 HISTORICAL_K3_V1_SHA256 = (
     "8017876a937fe8a25287a231ccf8a331422514f36241a80675d52ef39a96d71b"
 )
+FROZEN_TAU = 1.0
 HEADS = 56
 HIDDEN = 5376
-SCALE = HEAD_DIM ** -0.5
 
+K3_V2_EXACT_GATE = {
+    "contract": EXACT_GATE_CONTRACT,
+    "calibration_contract": calibration_probe.EVIDENCE_CONTRACT,
+    "calibration_sha256": CALIBRATION_EVIDENCE_SHA256,
+    "calibration_case_count": 12,
+    "tau": FROZEN_TAU,
+    "route_centroid_max_abs": 0.0,
+    "raw_value_sum_max_abs": 0.0,
+    "threshold_max_abs": 0.0,
+    "route_trace_differing_bits": 0,
+    "output_max_abs": 0.0,
+}
 
-
-def _native_selector_provenance(device: torch.device) -> dict[str, object]:
-    """Verify and record the exact packaged source/backend/compiler stack."""
-    from importlib.metadata import PackageNotFoundError, version as distribution_version
-
-    from sol_h3._vendor.sol_attn import get_sol_attn_backend
-    from sol_h3.provenance import CONTRACT as SOURCE_CONTRACT
-    from sol_h3.provenance import REVISION as SOURCE_REVISION
-    from sol_h3.provenance import SOURCE as SOURCE_NAME
-    from sol_h3.provenance import verify_source
-
-    manifest = verify_source()
-    backend = get_sol_attn_backend(device)
-    if backend != "cute_sm120":
-        raise RuntimeError(
-            f"K3 selector calibration requires verified cute_sm120, got {backend!r}"
-        )
-
-    distributions = {}
-    for name in (
-        "nvidia-cutlass-dsl",
-        "cuda-python",
-        "triton",
-        "torch",
-    ):
-        try:
-            distributions[name] = distribution_version(name)
-        except PackageNotFoundError:
-            distributions[name] = None
-
-    return {
-        "source": SOURCE_NAME,
-        "revision": SOURCE_REVISION,
-        "contract": SOURCE_CONTRACT,
-        "manifest_source": manifest.get("source"),
-        "manifest_revision": manifest.get("revision"),
-        "manifest_contract": manifest.get("contract"),
-        "backend": backend,
-        "device_name": torch.cuda.get_device_name(device),
-        "compute_capability": list(torch.cuda.get_device_capability(device)),
-        "torch_version": torch.__version__,
-        "torch_cuda": torch.version.cuda,
-        "distributions": distributions,
-    }
-
-
-K3_CALIBRATION_CASES = (
-    ("head-257x1537-nosink", "head", 257, 1537, 0, 0),
-    ("quarter-385x2049-prefix128", "quarter", 385, 2049, 0, 128),
-    ("middle-769x4097-offset192", "middle", 769, 4097, 1024, 192),
-    ("tail-1025x8193-prefix256", "tail", 1025, 8193, 0, 256),
+K3_V2_HOLDOUT_CASES = (
+    ("two-twentyfourth-385x2049-nosink", 2, 24, 385, 2049, 0, 0),
+    ("three-sixteenth-513x513-prefix64", 3, 16, 513, 513, 0, 64),
+    ("six-sixteenth-769x1537-offset192", 6, 16, 769, 1537, 512, 192),
+    ("ten-sixteenth-1025x1537-prefix192", 10, 16, 1025, 1537, 0, 192),
 )
 
 
-def _resolve_start(total_rows: int, span: int, anchor: str) -> int:
-    if span <= 0 or span > total_rows:
-        raise ValueError(f"K3 span {span} does not fit captured length {total_rows}")
-    available = total_rows - span
-    if anchor == "head":
-        return 0
-    if anchor == "quarter":
-        return available // 4
-    if anchor == "middle":
-        return available // 2
-    if anchor == "tail":
-        return available
-    raise ValueError(f"unsupported K3 anchor {anchor!r}")
-
-
-def _case_extrema(blocks: list[dict[str, object]]) -> dict[str, object]:
-    flat = [
-        {"block_index": int(block["block_index"]), **case}
-        for block in blocks
-        for case in block["cases"]
-    ]
-    if not flat:
-        raise RuntimeError("K3 calibration produced no cases")
-
-    def maximum(metric: str, field: str) -> dict[str, object]:
-        row = max(flat, key=lambda item: float(item[metric][field]))
-        return {
-            "value": float(row[metric][field]),
-            "block_index": int(row["block_index"]),
-            "case": str(row["name"]),
-        }
-
-    def maximum_scale(metric: str, field: str) -> dict[str, object]:
-        def value(item):
-            raw = item[metric].get(field)
-            return float(raw) if raw is not None else float("-inf")
-
-        row = max(flat, key=value)
-        return {
-            "value": value(row),
-            "block_index": int(row["block_index"]),
-            "case": str(row["name"]),
-        }
-
-    def maximum_ulp(metric: str) -> dict[str, object]:
-        def value(item):
-            raw = item[metric]["worst"]["abs_error_in_want_bf16_ulps"]
-            return float(raw) if raw is not None else float("inf")
-
-        row = max(flat, key=value)
-        return {
-            "value": value(row),
-            "block_index": int(row["block_index"]),
-            "case": str(row["name"]),
-        }
-
-    trace_diff = max(
-        flat,
-        key=lambda item: int(item["route_trace"]["differing_bits"]),
-    )
-    trace_fraction = max(
-        flat,
-        key=lambda item: float(item["route_trace"]["differing_bit_fraction"]),
-    )
-    return {
-        "case_count": len(flat),
-        "all_route_centroids_exact": all(
-            float(item["route_centroid"]["max_abs"]) == 0.0 for item in flat
-        ),
-        "all_raw_value_sums_exact": all(
-            float(item["raw_value_sum"]["max_abs"]) == 0.0 for item in flat
-        ),
-        "all_thresholds_exact": all(
-            float(item["threshold"]["max_abs"]) == 0.0 for item in flat
-        ),
-        "all_route_traces_equal": all(
-            bool(item["route_trace"]["equal"]) for item in flat
-        ),
-        "all_outputs_exact": all(
-            float(item["output"]["max_abs"]) == 0.0 for item in flat
-        ),
-        "maximum_route_trace_differing_bits": {
-            "value": int(trace_diff["route_trace"]["differing_bits"]),
-            "block_index": int(trace_diff["block_index"]),
-            "case": str(trace_diff["name"]),
-        },
-        "maximum_route_trace_differing_bit_fraction": {
-            "value": float(trace_fraction["route_trace"]["differing_bit_fraction"]),
-            "block_index": int(trace_fraction["block_index"]),
-            "case": str(trace_fraction["name"]),
-        },
-        "route_centroid": {
-            "rel_l2": maximum("route_centroid", "rel_l2"),
-            "mean_abs": maximum("route_centroid", "mean_abs"),
-            "max_abs": maximum("route_centroid", "max_abs"),
-            "max_abs_over_want_abs_max": maximum_scale(
-                "route_centroid_scale", "max_abs_over_want_abs_max"
-            ),
-            "mean_abs_over_want_mean_abs": maximum_scale(
-                "route_centroid_scale", "mean_abs_over_want_mean_abs"
-            ),
-            "worst_bf16_ulps": maximum_ulp("route_centroid_scale"),
-        },
-        "threshold": {
-            "rel_l2": maximum("threshold", "rel_l2"),
-            "mean_abs": maximum("threshold", "mean_abs"),
-            "max_abs": maximum("threshold", "max_abs"),
-        },
-        "output": {
-            "rel_l2": maximum("output", "rel_l2"),
-            "mean_abs": maximum("output", "mean_abs"),
-            "max_abs": maximum("output", "max_abs"),
-            "max_abs_over_want_abs_max": maximum_scale(
-                "output_scale", "max_abs_over_want_abs_max"
-            ),
-            "mean_abs_over_want_mean_abs": maximum_scale(
-                "output_scale", "mean_abs_over_want_mean_abs"
-            ),
-            "worst_bf16_ulps": maximum_ulp("output_scale"),
-        },
-        "raw_value_sum_max_abs": maximum("raw_value_sum", "max_abs"),
-        "k1_route_vs_comfy_route": {
-            "rel_l2": maximum("k1_route_vs_comfy_route", "rel_l2"),
-            "max_abs": maximum("k1_route_vs_comfy_route", "max_abs"),
-        },
-    }
+def _exact_tensor_pass(metrics: dict[str, object], field: str) -> bool:
+    return bool(metrics.get("finite")) and float(metrics[field]) == 0.0
 
 
 def _run_block(
@@ -255,12 +101,11 @@ def _run_block(
     checkpoint_kind: str,
     checkpoint_sha256: str,
     device: torch.device,
-    tau: float,
 ) -> dict[str, object]:
     if record.case.rope_freqs is None or not torch.is_tensor(record.case.rope_freqs):
         raise RuntimeError(f"capture block {record.block_index} has no exact H3 RoPE")
     if record.attention_input.ndim != 2 or record.attention_input.shape[1] != HIDDEN:
-        raise RuntimeError("K3 capture attention input has invalid hidden geometry")
+        raise RuntimeError("K3 holdout capture attention input has invalid geometry")
 
     q_weight, v_weight, q_norm, route_norm, metadata, names = (
         replay_fixture._load_block_weights(
@@ -275,9 +120,22 @@ def _run_block(
 
     from sol_h3._vendor.sol_attn.preprocess import prepare
 
-    for name, anchor, q_rows, v_rows, sink_start, sink_tokens in K3_CALIBRATION_CASES:
+    for (
+        name,
+        numerator,
+        denominator,
+        q_rows,
+        v_rows,
+        sink_start,
+        sink_tokens,
+    ) in K3_V2_HOLDOUT_CASES:
         span = max(q_rows, v_rows)
-        start = _resolve_start(total_rows, span, anchor)
+        start = replay_fixture._resolve_fractional_start(
+            total_rows,
+            span,
+            numerator,
+            denominator,
+        )
 
         q_raw = replay_fixture._project(
             record.attention_input,
@@ -305,6 +163,7 @@ def _run_block(
             rows=v_rows,
             device=device,
         )
+
         q = replay_fixture._comfy_position(q_raw, q_norm, q_rope)
         comfy_route = replay_fixture._comfy_position(v_raw, route_norm, v_rope)
         k1_route = materialized_sol_reduction_v4_route_diagnostic(
@@ -330,16 +189,16 @@ def _run_block(
             qb,
             candidate_rc,
             kv_rows=v_rows,
-            tau=tau,
-            scale=SCALE,
+            tau=FROZEN_TAU,
+            scale=calibration_probe.SCALE,
         )
 
         reference_rc, reference_vc, reference_threshold = prepare(
             qb,
             kb,
             vb,
-            tau=tau,
-            scale=SCALE,
+            tau=FROZEN_TAU,
+            scale=calibration_probe.SCALE,
             thresh_type="diag",
             valid_tokens=q_rows,
             valid_kv_tokens=v_rows,
@@ -354,7 +213,7 @@ def _run_block(
             candidate_rc,
             candidate_vc,
             candidate_threshold,
-            scale=SCALE,
+            scale=calibration_probe.SCALE,
             sink_start=sink_start,
             sink_tokens=sink_tokens,
         )
@@ -369,57 +228,84 @@ def _run_block(
             reference_rc,
             reference_vc,
             reference_threshold,
-            scale=SCALE,
+            scale=calibration_probe.SCALE,
             sink_start=sink_start,
             sink_tokens=sink_tokens,
         )
         torch.cuda.synchronize(device)
         reference_ms = (time.perf_counter() - reference_started) * 1000.0
 
-        trace = route_trace_metrics(
+        rc_metrics = tensor_metrics(candidate_rc, reference_rc)
+        vc_metrics = tensor_metrics(candidate_vc, reference_vc)
+        threshold_metrics = tensor_metrics(
+            candidate_threshold,
+            reference_threshold,
+        )
+        trace_metrics = route_trace_metrics(
             candidate_trace,
             reference_trace,
             kv_rows=v_rows,
         )
-        sink_blocks = sink_block_range(
-            kv_rows=v_rows,
-            sink_start=sink_start,
-            sink_tokens=sink_tokens,
-        )
+        output_metrics = tensor_metrics(candidate_output, reference_output)
+
+        passes = {
+            "route_centroid": _exact_tensor_pass(rc_metrics, "max_abs"),
+            "raw_value_sum": _exact_tensor_pass(vc_metrics, "max_abs"),
+            "threshold": _exact_tensor_pass(threshold_metrics, "max_abs"),
+            "route_trace": (
+                bool(trace_metrics["equal"])
+                and int(trace_metrics["differing_bits"]) == 0
+            ),
+            "output": _exact_tensor_pass(output_metrics, "max_abs"),
+        }
+        passes["all"] = all(passes.values())
+
         cases.append(
             {
                 "name": name,
-                "anchor": anchor,
-                "q_start": start,
+                "fraction": {
+                    "numerator": numerator,
+                    "denominator": denominator,
+                },
+                "start": start,
                 "q_rows": q_rows,
-                "v_start": start,
                 "v_rows": v_rows,
                 "sink_start": sink_start,
                 "sink_tokens": sink_tokens,
-                "sink_blocks": list(sink_blocks),
-                "route_centroid": tensor_metrics(candidate_rc, reference_rc),
-                "route_centroid_scale": tensor_scale_diagnostics(
-                    candidate_rc, reference_rc
+                "sink_blocks": list(
+                    sink_block_range(
+                        kv_rows=v_rows,
+                        sink_start=sink_start,
+                        sink_tokens=sink_tokens,
+                    )
                 ),
-                "raw_value_sum": tensor_metrics(candidate_vc, reference_vc),
-                "k1_route_vs_comfy_route": tensor_metrics(k1_route, comfy_route),
+                "route_centroid": rc_metrics,
+                "route_centroid_scale": tensor_scale_diagnostics(
+                    candidate_rc,
+                    reference_rc,
+                ),
+                "raw_value_sum": vc_metrics,
+                "threshold": threshold_metrics,
+                "route_trace": trace_metrics,
+                "output": output_metrics,
+                "output_scale": tensor_scale_diagnostics(
+                    candidate_output,
+                    reference_output,
+                ),
+                "k1_route_vs_comfy_route": tensor_metrics(
+                    k1_route,
+                    comfy_route,
+                ),
                 "k1_route_vs_comfy_route_scale": tensor_scale_diagnostics(
                     k1_route,
                     comfy_route,
                 ),
-                "threshold": tensor_metrics(
-                    candidate_threshold, reference_threshold
-                ),
-                "route_trace": trace,
-                "output": tensor_metrics(candidate_output, reference_output),
-                "output_scale": tensor_scale_diagnostics(
-                    candidate_output, reference_output
-                ),
+                "passes": passes,
                 "timing_ms": {
                     "candidate_first_observed": candidate_ms,
                     "reference_after_candidate": reference_ms,
                     "note": (
-                        "debug-route-trace diagnostic timings include launch/cache effects "
+                        "debug-route-trace timings include compile/cache effects "
                         "and are not production performance evidence"
                     ),
                 },
@@ -472,6 +358,61 @@ def _run_block(
             if metadata.get(key) is not None
         },
         "cases": cases,
+        "all_cases_pass": all(bool(case["passes"]["all"]) for case in cases),
+    }
+
+
+def _extrema(blocks: list[dict[str, object]]) -> dict[str, object]:
+    flat = [
+        {"block_index": int(block["block_index"]), **case}
+        for block in blocks
+        for case in block["cases"]
+    ]
+    if not flat:
+        raise RuntimeError("K3 holdout produced no cases")
+
+    def maximum(metric: str, field: str) -> dict[str, object]:
+        row = max(flat, key=lambda item: float(item[metric][field]))
+        return {
+            "value": float(row[metric][field]),
+            "block_index": int(row["block_index"]),
+            "case": str(row["name"]),
+        }
+
+    trace_row = max(
+        flat,
+        key=lambda item: int(item["route_trace"]["differing_bits"]),
+    )
+    return {
+        "case_count": len(flat),
+        "all_route_centroids_exact": all(
+            bool(item["passes"]["route_centroid"]) for item in flat
+        ),
+        "all_raw_value_sums_exact": all(
+            bool(item["passes"]["raw_value_sum"]) for item in flat
+        ),
+        "all_thresholds_exact": all(
+            bool(item["passes"]["threshold"]) for item in flat
+        ),
+        "all_route_traces_equal": all(
+            bool(item["passes"]["route_trace"]) for item in flat
+        ),
+        "all_outputs_exact": all(
+            bool(item["passes"]["output"]) for item in flat
+        ),
+        "maximum_route_trace_differing_bits": {
+            "value": int(trace_row["route_trace"]["differing_bits"]),
+            "block_index": int(trace_row["block_index"]),
+            "case": str(trace_row["name"]),
+        },
+        "route_centroid_max_abs": maximum("route_centroid", "max_abs"),
+        "raw_value_sum_max_abs": maximum("raw_value_sum", "max_abs"),
+        "threshold_max_abs": maximum("threshold", "max_abs"),
+        "output_max_abs": maximum("output", "max_abs"),
+        "k1_route_vs_comfy_route": {
+            "rel_l2": maximum("k1_route_vs_comfy_route", "rel_l2"),
+            "max_abs": maximum("k1_route_vs_comfy_route", "max_abs"),
+        },
     }
 
 
@@ -489,50 +430,49 @@ def main() -> None:
     parser.add_argument("--expected-probe-contract")
     parser.add_argument("--output-json")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--tau", type=float, default=FROZEN_TAU)
     parser.add_argument("--blocks", type=int, nargs="*", default=(0, 25, 49))
     args = parser.parse_args()
 
-    probe_source = replay_fixture._probe_source_identity(_REPO_ROOT)
-    probe_source["probe_contract"] = PROBE_CONTRACT
-    probe_source["critical_source_sha256"] = {
+    source = replay_fixture._probe_source_identity(_REPO_ROOT)
+    source["probe_contract"] = PROBE_CONTRACT
+    source["critical_source_sha256"] = {
         rel: replay_fixture._sha256_file(_REPO_ROOT / rel)
         for rel in (
+            "tools/keyless_k3_selector_holdout.py",
             "tools/keyless_k3_selector_probe.py",
             "tools/keyless_real_h3_replay_probe.py",
             "sol_h3/keyless_selector.py",
             "sol_h3/keyless_route_summary.py",
         )
     }
+
     if args.expected_probe_contract:
         expected = args.expected_probe_contract.strip()
         if expected != PROBE_CONTRACT:
             parser.error(
-                "stale Sol-H3 K3 probe: expected "
+                "stale Sol-H3 K3 holdout probe: expected "
                 f"{expected!r}, local probe implements {PROBE_CONTRACT!r}; "
-                "refresh the complete Patcher stack through the K3-v2 PR"
+                "refresh the complete Patcher stack through PR #25"
             )
-    if probe_source["tracked_worktree_dirty"]:
-        parser.error("K3 calibration requires a clean tracked Sol-H3 worktree")
+    if source["tracked_worktree_dirty"]:
+        parser.error("K3-v2 holdout requires a clean tracked Sol-H3 worktree")
     if K1_CONTRACT != REQUIRED_K1_CONTRACT:
-        parser.error(
-            f"K3-v2 calibration requires proven K1-v6, got {K1_CONTRACT!r}; "
-            "refresh the complete Patcher stack through the K3-v2 PR"
-        )
+        parser.error(f"unexpected K1 contract {K1_CONTRACT!r}")
     if K3_CONTRACT != REQUIRED_K3_CONTRACT:
-        parser.error(f"unexpected K3 selector contract {K3_CONTRACT!r}")
-    if not 0.0 <= args.tau <= 3.0:
-        parser.error("--tau must be in [0,3]")
+        parser.error(f"unexpected K3 contract {K3_CONTRACT!r}")
+    if float(args.tau) != FROZEN_TAU:
+        parser.error(f"K3-v2 exact holdout requires frozen tau={FROZEN_TAU}")
 
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
-        parser.error("K3 calibration requires CUDA")
+        parser.error("K3-v2 holdout requires CUDA")
     if tuple(torch.cuda.get_device_capability(device)) != (12, 0):
         parser.error(
-            "K3 calibration requires SM120, got "
+            "K3-v2 holdout requires SM120, got "
             f"{torch.cuda.get_device_capability(device)}"
         )
-    selector_provenance = _native_selector_provenance(device)
+    selector_provenance = calibration_probe._native_selector_provenance(device)
 
     capture_path = Path(args.capture_bundle).resolve()
     checkpoint = Path(args.checkpoint).resolve()
@@ -587,17 +527,20 @@ def main() -> None:
                     checkpoint_kind=args.checkpoint_kind,
                     checkpoint_sha256=checkpoint_sha256,
                     device=device,
-                    tau=float(args.tau),
                 )
             )
 
+    all_holdout_cases_pass = all(
+        bool(block["all_cases_pass"]) for block in blocks
+    )
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     result = {
         "contract": EVIDENCE_CONTRACT,
-        "mode": "keyless-k3-selector-calibration",
+        "mode": "keyless-k3-selector-holdout",
         "promotion_evidence": False,
-        "thresholds_frozen": False,
-        "probe_source": probe_source,
+        "thresholds_frozen": True,
+        "exact_gate_frozen": True,
+        "probe_source": source,
         "source_contracts": {
             "k1": K1_CONTRACT,
             "k3": K3_CONTRACT,
@@ -605,10 +548,12 @@ def main() -> None:
         "evidence_lineage": {
             "k1_v9_sha256": K1_V9_EVIDENCE_SHA256,
             "k2_v3_holdout_sha256": K2_V3_HOLDOUT_SHA256,
+            "k3_v2_calibration_sha256": CALIBRATION_EVIDENCE_SHA256,
             "historical_k3_v1_sha256": HISTORICAL_K3_V1_SHA256,
         },
-        "tau": float(args.tau),
-        "attention_scale": SCALE,
+        "k3_v2_exact_gate": dict(K3_V2_EXACT_GATE),
+        "tau": FROZEN_TAU,
+        "attention_scale": calibration_probe.SCALE,
         "selector_provenance": selector_provenance,
         "checkpoint_kind": args.checkpoint_kind,
         "checkpoint_path": str(checkpoint),
@@ -625,39 +570,59 @@ def main() -> None:
             "teacher_model_revision": provenance.teacher_model_revision,
             "teacher_model_sha256": provenance.teacher_model_sha256,
         },
-        "calibration_case_definitions": [
+        "case_definitions": [
             {
                 "name": name,
-                "anchor": anchor,
+                "fraction": {
+                    "numerator": numerator,
+                    "denominator": denominator,
+                },
                 "q_rows": q_rows,
                 "v_rows": v_rows,
                 "sink_start": sink_start,
                 "sink_tokens": sink_tokens,
             }
-            for name, anchor, q_rows, v_rows, sink_start, sink_tokens
-            in K3_CALIBRATION_CASES
+            for (
+                name,
+                numerator,
+                denominator,
+                q_rows,
+                v_rows,
+                sink_start,
+                sink_tokens,
+            ) in K3_V2_HOLDOUT_CASES
         ],
         "blocks": blocks,
-        "observed_extrema": _case_extrema(blocks),
+        "observed_extrema": _extrema(blocks),
+        "all_holdout_cases_pass": all_holdout_cases_pass,
         "memory_strategy": {
             "capture_deserialize_device": str(device),
             "checkpoint_tensor_device": str(device),
             "capture_bundle_rehash_after_validated_load": False,
-            "large_file_hash_page_cache_policy": "posix_fadvise_dontneed_when_available",
-            "cuda_free_bytes_after_calibration": int(free_bytes),
+            "large_file_hash_page_cache_policy": (
+                "posix_fadvise_dontneed_when_available"
+            ),
+            "cuda_free_bytes_after_evidence": int(free_bytes),
             "cuda_total_bytes": int(total_bytes),
         },
         "limitations": [
-            "threshold-free K3 calibration only; no K3 acceptance threshold is frozen",
+            "frozen exact K3-v2 holdout only; no provider promotion",
             (
                 "exact-block K remains the globally materialized exact K1 row route "
                 "to isolate selector behavior"
             ),
-            "candidate K1-v6 RC/VC come from raw V through bounded-b8 route scratch",
+            "candidate K1-v6 RC/VC use bounded-b8 route scratch",
             "the full exact K1 route exists only on the diagnostic/reference side",
             "the released SM120 selector/approximate mainloop is reused unchanged",
             "one sigma-1 real-H3 capture and blocks 0/25/49 only",
-            "no production provider promotion, fused selected-route CuTe transform, decoded-media, sampler, or end-to-end performance evidence",
+            (
+                "holdout windows are disjoint from the frozen K3-v2 calibration "
+                "windows for this pinned capture"
+            ),
+            (
+                "no K4 fused selected-route CuTe transform, decoded-media, sampler, "
+                "or end-to-end performance evidence"
+            ),
         ],
     }
 
@@ -667,18 +632,23 @@ def main() -> None:
         print(
             json.dumps(
                 {
-                    "calibration_complete": True,
+                    "all_holdout_cases_pass": all_holdout_cases_pass,
                     "diagnostic_report": str(output_path.expanduser().resolve()),
+                    "evidence_complete": True,
+                    "exact_gate_frozen": True,
                     "probe_contract": PROBE_CONTRACT,
-                    "probe_git_commit": probe_source["git_commit"],
+                    "probe_git_commit": source["git_commit"],
                     "promotion_evidence": False,
-                    "thresholds_frozen": False,
+                    "thresholds_frozen": True,
                 },
                 sort_keys=True,
             )
         )
     else:
         print(json.dumps(result, indent=2, sort_keys=True))
+
+    if not all_holdout_cases_pass:
+        raise RuntimeError("real-H3 K3-v2 holdout violated the frozen exact gate")
 
 
 if __name__ == "__main__":
