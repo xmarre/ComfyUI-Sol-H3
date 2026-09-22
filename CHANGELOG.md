@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.6 — 2026-09-22
+
+- Completes the production Sol-H3 side of the heterogeneous exact-prefix progressive stack.
+- Preserves provider-v4 mapped physical query positions and VDN restricted-domain ownership through the real SM120 CuTe path.
+- Keeps VDN's learned gate/projection/complement and restricted K/V domain unchanged; no square-Q expansion or full-K/V reconstruction is introduced.
+- Preserves fail-closed backend-history semantics for Spectrum and does not add an H3 transformer NFE.
+- Coordinates the release with VDN-H3-Plus v1.5.6, Flow v0.3.6 and H3 Continuum v3.4.4.
+- Excludes Keyless and historical diagnostic/A-B PR families from the production merge.
+
 ## v0.1.4 — 2026-09-09
 
 Coordinated companion release for Flow v0.3.3's Mixed-Grid Continuum framing-seam fix.

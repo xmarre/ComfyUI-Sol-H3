@@ -1,3 +1,40 @@
+# ComfyUI-Sol-H3 v0.1.6
+
+Coordinated production release with [ComfyUI-VDN-H3-Plus v1.5.6](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.6), [MiniMax H3 Flow-Aligned Regenerate v0.3.6](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.6), and [H3 Continuum v3.4.4](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.4). [Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28) remains the unchanged Spectrum companion.
+
+Production consolidation PRs: [Sol-H3 #15](https://github.com/xmarre/ComfyUI-Sol-H3/pull/15), [VDN-H3-Plus #32](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/32), [Flow #73](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/73), and [Continuum #34](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/34). The validated source lines consolidated by those PRs are Sol #15, VDN #30, Flow #70 and Continuum #33.
+
+## Exact-prefix partitioned SOL execution
+
+v0.1.6 completes Sol-H3's production side of the newer exact-prefix progressive stack. The partitioned route accepts the heterogeneous prefix/suffix execution contract produced by Flow and VDN while preserving the existing mapped-neighbor provider-v4 ownership model and the real packaged Sana Sol-Attn SM120 CuTe backend.
+
+The production contract keeps VDN's restricted K/V support, mapped physical query positions, learned softmax gate, output projection and learned linear complement intact. It does not reconstruct full K/V, expand Q to a square domain, or move VDN-owned semantics into Sol. Unsupported or stale contracts continue to fail closed to the supplied native path rather than silently changing attention arithmetic.
+
+The release also keeps backend-history ownership explicit so Spectrum can distinguish real numerical-route transitions from stable partitioned execution. No additional H3 transformer NFE is introduced by the partitioned SOL routing itself.
+
+## Coordinated stack
+
+The paired releases finish the surrounding path:
+
+- **VDN-H3-Plus v1.5.6** carries the heterogeneous exact-prefix VDN contract and adds sampler-admission VRAM eviction for retained-buffer runs without changing VDN arithmetic.
+- **Flow v0.3.6** promotes the hardware-validated fast source-uniform exact-prefix continuation path with the 16-tick sampler-owned audio overlap and no duplicate shadow low/probe lifetimes.
+- **H3 Continuum v3.4.4** adds exact carried-audio phase transport, structural terminal lead-out/padding, and a dedicated fresh post-prefix prompt bridge so prior speech and terminal control prose do not leak into newly generated audio.
+
+## Production validation
+
+Sol #15's exact head passed the CPU-contract workflow before release consolidation. The coordinated components were then exercised on RTX PRO 6000 Blackwell / SM120 hardware through the same development stack.
+
+Flow run 00575 validated the production #70 path at three continuation sampler lifetimes / two history boundaries with six source-uniform transformer calls, zero exact-partitioned duplicate calls, repaired boundary audio and decoded-media parity with the accepted width-16 run. VDN's final sampler-admission fix restored healthy high-stage allocator behavior without changing arithmetic. Continuum's final prompt/audio-boundary fix was confirmed by two clean 00603/00604 renders: no reference-image restage, no chunk-2 speech/gibberish bleed, and no vocalized terminal-control prose.
+
+Important scope note: the later 00603/00604 Continuum confirmation runs also carried a separate Flow diagnostic overlay. That diagnostic remains unreleased. Flow v0.3.6 is the independently hardware-validated #70 production path.
+
+## Release scope
+
+This release intentionally does **not** merge or promote the Keyless research PR family, historical selector/arithmetic diagnostics, duplicated shadow-path experiments, or other superseded A/B branches. Those branches remain evidence only. v0.1.6 is the consolidated production tree from Sol #15 plus release metadata.
+
+
+---
+
 # ComfyUI-Sol-H3 v0.1.5
 
 Coordinated production release with [ComfyUI-VDN-H3-Plus v1.5.5](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.5) and [MiniMax H3 Flow-Aligned Regenerate v0.3.5](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.5).
