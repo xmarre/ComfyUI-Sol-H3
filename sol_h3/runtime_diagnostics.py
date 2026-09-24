@@ -19,7 +19,7 @@ import os
 import torch
 
 
-SCHEMA = "sol_h3_00625_runtime_state_v4"
+SCHEMA = "sol_h3_00625_first_global_repeatability_v1"
 _SAMPLE_COUNT = 256
 _DEFERRED = "_sol_h3_deferred_tensor_receipt"
 log = logging.getLogger("comfy.sol_h3")
@@ -133,6 +133,32 @@ def deferred_tensor_receipt(tensor, *, sample_count=_SAMPLE_COUNT):
         "sample": sample,
     }
 
+
+def deferred_tensor_delta_receipt(lhs, rhs, *, sample_count=_SAMPLE_COUNT):
+    """Queue a bounded sample of lhs-rhs without materializing a full delta tensor."""
+    if not isinstance(lhs, torch.Tensor) or not isinstance(rhs, torch.Tensor):
+        return None
+    if lhs.shape != rhs.shape or lhs.device != rhs.device:
+        raise ValueError("repeatability delta requires matching tensor shape/device")
+    left = lhs.detach()
+    right = rhs.detach()
+    metadata, count = _metadata(left, sample_count)
+    metadata = {
+        **metadata,
+        "lhs_dtype": str(left.dtype),
+        "rhs_dtype": str(right.dtype),
+        "receipt_kind": "bounded_pair_delta",
+    }
+    if count == 0:
+        sample = torch.empty(0, dtype=torch.float32, device=left.device)
+    else:
+        indices = _sample_indices(left.numel(), count, left.device)
+        sample = torch.take(left, indices).float() - torch.take(right, indices).float()
+    return {
+        _DEFERRED: True,
+        "metadata": metadata,
+        "sample": sample,
+    }
 
 def _finalize_value(value):
     if isinstance(value, dict):
@@ -351,13 +377,15 @@ def observe_native_once(
     sink_rows,
     scale,
 ):
-    """Observe each eval-0/block-0 VDN native route once, without replay.
+    """Replay only the first global native SDPA after its production result exists.
 
-    The production native attention call executes first and its result is always
-    returned. Only after that call completes are bounded Q/K/V/output samples and
-    dispatch metadata collected.
+    The first production global attention call remains observer-clean: no
+    diagnostic CUDA work is launched before it, and the returned production
+    tensor remains authoritative. One output-neutral shadow call then executes
+    with the exact same Q/K/V and native closure. All downstream model execution
+    is intentionally considered observer-perturbed in this diagnostic.
     """
-    if kind not in {"global", "local", "anchor"}:
+    if kind != "global":
         return native()
     key = f"eval0_block0_vdn_native_{kind}"
     pending = getattr(state, "runtime_diagnostic_pending", None)
@@ -378,6 +406,8 @@ def observe_native_once(
         return native()
 
     result = native()
+    shadow_result = native()
+    state.runtime_diagnostic_downstream_perturbed = True
     payload = {
         "evaluation": int(evaluation),
         "block_index": int(block_index),
@@ -393,9 +423,15 @@ def observe_native_once(
         "k": deferred_tensor_receipt(k),
         "v": deferred_tensor_receipt(v),
         "output": deferred_tensor_receipt(result),
+        "shadow_output": deferred_tensor_receipt(shadow_result),
+        "shadow_minus_production": deferred_tensor_delta_receipt(shadow_result, result),
         "sdpa_dispatch": sdpa_capability_receipt(q, k, v, scale),
         "production_call_completed_before_diagnostic_cuda_work": True,
-        "extra_attention_shadow_calls": 0,
+        "shadow_call_completed_before_diagnostic_cuda_work": True,
+        "production_result_substituted": False,
+        "downstream_execution_perturbed_after_shadow": True,
+        "repeatability_scope": "eval0_block0_first_global_native_sdpa",
+        "extra_attention_shadow_calls": 1,
         "extra_transformer_nfe": 0,
     }
     _store_pending_once(state, key, payload)
