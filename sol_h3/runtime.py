@@ -595,6 +595,8 @@ class BlockPatch:
                         kind=kind,
                         route="legacy",
                         sink_rows=sink_rows,
+                        scale=scale,
+                        shadow_replay=False,
                     )
                 from .sparse import attention, KernelUnavailable
                 try:
@@ -716,6 +718,8 @@ class BlockPatch:
                         kind=kind,
                         route="v4_mapped",
                         sink_rows=sink_rows,
+                        scale=scale,
+                        shadow_replay=False,
                     )
                 try:
                     mapped_tensor = device_descriptor(state, descriptor, qc.device)
