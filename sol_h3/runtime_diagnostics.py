@@ -318,9 +318,11 @@ def replay_native_once(
     sink_rows,
     scale,
 ):
-    """Run one bounded first-low native grouped-SDPA shadow replay.
+    """Run one bounded replay of the earliest eval-0/block-0 native VDN SDPA call.
 
-    The production native call executes first and its result is always returned.
+    The first eligible VDN warmup call wins regardless of global/local/anchor kind,
+    so this brackets the earliest attention operation that can change block-0
+    numerics. The production native call executes first and its result is always returned.
     Q/K/V and production-output sampling is queued only after that result exists,
     so the production native call itself is not preceded by diagnostic CUDA work.
     The second native call is a deliberate shadow replay on the same Q/K/V; only
@@ -337,7 +339,6 @@ def replay_native_once(
         and key not in completed
         and evaluation == 0
         and block_index == 0
-        and kind == "local"
         and _sm120_tensor(q)
         and _sm120_tensor(k)
         and _sm120_tensor(v)
