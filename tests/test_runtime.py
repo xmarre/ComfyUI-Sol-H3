@@ -211,3 +211,64 @@ def test_dense_provider_compute_errors_are_not_swallowed(monkeypatch):
 
     assert not state.disabled_dense_providers
     assert not state.dense_provider_failures
+
+
+
+def test_first_flow_low_warmup_bypasses_inherited_dense_provider(monkeypatch):
+    cfg = Config(exact=False, backend="sol", dense_evaluations=99, dense_layers=0)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(forward=None))])
+    q = torch.zeros(1, 1, 7, 128, dtype=torch.bfloat16)
+    provider_calls = []
+    original_calls = []
+
+    def provider(original, q, k, v, heads, **kw):
+        provider_calls.append(True)
+        return q.transpose(1, 2).reshape(1, q.shape[2], -1)
+
+    def original(q, k, v, heads, **kw):
+        original_calls.append(True)
+        return q.transpose(1, 2).reshape(1, q.shape[2], -1)
+
+    monkeypatch.setattr(runtime, "_shape_reason", lambda *a, **k: None)
+
+    def execute(stage):
+        state = Request(cfg)
+        opts = {"optimized_attention_override": provider, "h3_flow_stage": stage}
+
+        def block(args):
+            to = args["transformer_options"]
+            return {
+                "img": to["optimized_attention_override"](
+                    original,
+                    q,
+                    q,
+                    q,
+                    1,
+                    skip_reshape=True,
+                    transformer_options=to,
+                )
+            }
+
+        token = _FORWARD.set((model, state, 0, set(), []))
+        try:
+            BlockPatch(0, cfg)(
+                {
+                    "img": torch.zeros(7, 128),
+                    "layout": SimpleNamespace(seq_len=7, segments=[(0, 3, "text"), (3, 7, "video")]),
+                    "transformer_options": opts,
+                },
+                {"original_block": block},
+            )
+        finally:
+            _FORWARD.reset(token)
+        return state
+
+    low = execute("low")
+    assert low.diagnostic_first_low_native_dense_calls == 1
+    assert len(original_calls) == 1
+    assert len(provider_calls) == 0
+
+    high = execute("high")
+    assert high.diagnostic_first_low_native_dense_calls == 0
+    assert len(original_calls) == 1
+    assert len(provider_calls) == 1

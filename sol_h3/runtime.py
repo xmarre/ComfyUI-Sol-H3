@@ -8,6 +8,7 @@ from .contracts import KEY, Config, adaln_status, prefix_length
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from . import weighted_measure
 from .interop import (
+    FLOW_STAGE_KEY,
     HISTORY_KEY,
     VDN_KEY,
     VDN_KEY_V2,
@@ -69,6 +70,7 @@ class Request:
     native_reason: str | None = None
     last_routes: tuple | None = None
     backend_transitions: int = 0
+    diagnostic_first_low_native_dense_calls: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,7 @@ class SamplingWrapper:
                         "sol_source_tree_verified": getattr(state.kernel, "source_tree_verified", False),
                         "sparse_calls": state.sparse_calls,
                         "dense_warmup": state.dense_calls,
+                        "diagnostic_first_low_native_dense_calls": state.diagnostic_first_low_native_dense_calls,
                         "external_mixed_sol_calls": state.external_mixed_sol_calls,
                         "external_mixed_q_rows": state.external_mixed_q_rows,
                         "external_mixed_kernel_q_rows": state.external_mixed_kernel_q_rows,
@@ -321,6 +324,15 @@ class BlockPatch:
                         )
                         provider = leaf
                     if leaf is not None and id(leaf) in state.disabled_dense_providers:
+                        provider = None
+
+                    if (
+                        provider is not None
+                        and warmup
+                        and evaluation == 0
+                        and options.get(FLOW_STAGE_KEY) == "low"
+                    ):
+                        state.diagnostic_first_low_native_dense_calls += 1
                         provider = None
 
                     if provider is not None:
