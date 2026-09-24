@@ -87,3 +87,22 @@ def test_tensor_metadata_receipt_is_value_free_and_layout_bound():
     assert got["data_ptr_mod_256"] == x.data_ptr() % 256
     assert got["data_ptr_mod_4096"] == x.data_ptr() % 4096
     assert "sample_sha256" not in got
+
+
+def test_finalize_first_vdn_warmup_key_is_kind_agnostic():
+    x = torch.arange(32, dtype=torch.float32)
+    state = SimpleNamespace(
+        runtime_diagnostic={},
+        runtime_diagnostic_pending={
+            "eval0_block0_first_vdn_dense_warmup": {
+                "schema": "test",
+                "kind": "global",
+                "output": deferred_tensor_receipt(x),
+                "shadow_replay_output": deferred_tensor_receipt(x.clone()),
+            }
+        },
+    )
+    finalize(state)
+    got = state.runtime_diagnostic["eval0_block0_first_vdn_dense_warmup"]
+    assert got["kind"] == "global"
+    assert got["shadow_replay_sample_equal"] is True
