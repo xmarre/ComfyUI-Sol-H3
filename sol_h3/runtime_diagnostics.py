@@ -140,13 +140,12 @@ def finalize(state):
         return
     for key, payload in list(pending.items()):
         entry = _finalize_value(payload)
-        if key == "eval0_block0_first_vdn_dense_warmup":
-            first = entry.get("output") or {}
-            replay = entry.get("shadow_replay_output") or {}
-            if first.get("sample_sha256") and replay.get("sample_sha256"):
-                entry["shadow_replay_sample_equal"] = (
-                    first["sample_sha256"] == replay["sample_sha256"]
-                )
+        first = entry.get("output") or {}
+        replay = entry.get("shadow_replay_output") or {}
+        if first.get("sample_sha256") and replay.get("sample_sha256"):
+            entry["shadow_replay_sample_equal"] = (
+                first["sample_sha256"] == replay["sample_sha256"]
+            )
         completed[key] = entry
         log.warning(
             "Sol-H3 runtime-state diagnostic %s",
@@ -183,11 +182,24 @@ def capture_stage(state, key, tensor, **metadata):
 
 
 
-def sdpa_capability_receipt(q, k, v):
-    """Describe PyTorch SDPA eligibility for VDN's exact [1,H,Q,D] views.
+def _sdpa_backend_name(value):
+    try:
+        from torch.nn.attention import SDPBackend
+    except (ImportError, AttributeError):
+        return None
+    for name in ("FLASH_ATTENTION", "CUDNN_ATTENTION", "EFFICIENT_ATTENTION", "MATH"):
+        backend = getattr(SDPBackend, name, None)
+        if backend is not None and getattr(backend, "value", None) == value:
+            return name.lower()
+    return None
 
-    This only asks backend capability predicates; it does not execute an
-    additional attention kernel.
+
+def sdpa_capability_receipt(q, k, v, *, scale=None):
+    """Describe and resolve the backend for VDN's exact [1,H,Q,D] views.
+
+    The choice query is executed under the same priority order used by ComfyUI's
+    comfy.ops.scaled_dot_product_attention on current Torch. It does not execute
+    an attention kernel.
     """
     if not all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v)):
         return None
@@ -201,6 +213,10 @@ def sdpa_capability_receipt(q, k, v):
         "deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
         "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "float32_matmul_precision": str(torch.get_float32_matmul_precision()),
+        "scale": None if scale is None else float(scale),
     }
     try:
         params = torch.backends.cuda.SDPAParams(qh, kh, vh, None, 0.0, False, False)
@@ -220,9 +236,30 @@ def sdpa_capability_receipt(q, k, v):
             receipt[name] = bool(predicate(params))
         except Exception as exc:
             receipt[name] = f"{type(exc).__name__}: {exc}"
+
+    choice = getattr(torch, "_fused_sdp_choice", None)
+    if callable(choice):
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            priority = [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+            with sdpa_kernel(priority, set_priority=True):
+                value = int(choice(qh, kh, vh, scale=scale))
+            receipt["selected_backend_value"] = value
+            receipt["selected_backend"] = _sdpa_backend_name(value)
+            receipt["priority"] = [
+                "flash_attention", "cudnn_attention", "efficient_attention", "math"
+            ]
+        except Exception as exc:
+            receipt["selected_backend_error"] = f"{type(exc).__name__}: {exc}"
     return receipt
 
-def replay_native_once(
+
+def observe_native_once(
     state,
     native,
     q,
@@ -234,16 +271,16 @@ def replay_native_once(
     kind,
     route,
     sink_rows,
+    scale,
+    shadow_replay=False,
 ):
-    """Run one bounded first-low native grouped-SDPA shadow replay.
+    """Observe one eval0/block0 VDN native route after its production result exists.
 
-    The production native call executes first and its result is always returned.
-    Q/K/V and production-output sampling is queued only after that result exists,
-    so the production native call itself is not preceded by diagnostic CUDA work.
-    The second native call is a deliberate shadow replay on the same Q/K/V; only
-    its bounded receipt is retained.
+    Global/local/anchor each get one production Q/K/V/output receipt. Only the
+    first global route gets an immediate same-QKV shadow replay; the production
+    result is always returned and the replay is never substituted.
     """
-    key = "eval0_block0_first_vdn_dense_warmup"
+    key = f"eval0_block0_vdn_{kind}_native"
     pending = getattr(state, "runtime_diagnostic_pending", None)
     completed = getattr(state, "runtime_diagnostic", None)
     eligible = (
@@ -254,7 +291,7 @@ def replay_native_once(
         and key not in completed
         and evaluation == 0
         and block_index == 0
-        and kind == "local"
+        and kind in {"global", "local", "anchor"}
         and _sm120_tensor(q)
         and _sm120_tensor(k)
         and _sm120_tensor(v)
@@ -262,7 +299,7 @@ def replay_native_once(
     if not eligible:
         return native()
 
-    # Compute the production result before any diagnostic gather/replay.
+    # Production executes before any diagnostic CUDA gather or replay.
     result = native()
     payload = {
         "evaluation": int(evaluation),
@@ -274,21 +311,22 @@ def replay_native_once(
         "k": deferred_tensor_receipt(k),
         "v": deferred_tensor_receipt(v),
         "output": deferred_tensor_receipt(result),
-        "sdpa_capabilities": sdpa_capability_receipt(q, k, v),
-        "shadow_replay_calls": 1,
+        "sdpa_capabilities": sdpa_capability_receipt(q, k, v, scale=scale),
+        "shadow_replay_calls": 0,
         "shadow_replay_substituted": False,
         "extra_transformer_nfe": 0,
     }
-    try:
-        replay = native()
-    except Exception as exc:
-        payload["shadow_replay_error"] = f"{type(exc).__name__}: {exc}"
-    else:
-        payload["shadow_replay_output"] = deferred_tensor_receipt(replay)
-        del replay
+    if shadow_replay:
+        payload["shadow_replay_calls"] = 1
+        try:
+            replay = native()
+        except Exception as exc:
+            payload["shadow_replay_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            payload["shadow_replay_output"] = deferred_tensor_receipt(replay)
+            del replay
     _store_pending_once(state, key, payload)
     return result
-
 
 
 def capture_sparse_runtime(state, q, k, v, output, *, context, gate=None):
