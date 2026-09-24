@@ -561,6 +561,21 @@ class BlockPatch:
                 # consumers; v4 is the only rectangular mapped-neighbor contract.
                 if kind != "local":
                     record("vdn_" + kind + "_native", True)
+                    if diagnostic_low_stage:
+                        from .runtime_diagnostics import replay_native_once
+                        return replay_native_once(
+                            state,
+                            native,
+                            q,
+                            k,
+                            v,
+                            evaluation=evaluation,
+                            block_index=self.index,
+                            kind=kind,
+                            route="legacy_" + kind + "_native",
+                            sink_rows=sink_rows,
+                            scale=scale,
+                        )
                     return native()
                 if not square_aligned or q.shape != k.shape or q.shape != v.shape:
                     record("vdn_local_native", True)
@@ -637,6 +652,21 @@ class BlockPatch:
             ):
                 if kind != "local":
                     record("vdn_" + kind + "_native", True)
+                    if diagnostic_low_stage:
+                        from .runtime_diagnostics import replay_native_once
+                        return replay_native_once(
+                            state,
+                            native,
+                            q,
+                            k,
+                            v,
+                            evaluation=evaluation,
+                            block_index=self.index,
+                            kind=kind,
+                            route="v4_" + kind + "_native",
+                            sink_rows=sink_rows,
+                            scale=scale,
+                        )
                     return native()
                 if any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape or q.shape[1:] != k.shape[1:]:
                     record("vdn_local_native_mapping:domain", True)
