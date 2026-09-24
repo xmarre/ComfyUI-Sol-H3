@@ -1,0 +1,108 @@
+from types import SimpleNamespace
+
+import torch
+
+from sol_h3.runtime_diagnostics import (
+    deferred_tensor_receipt,
+    finalize,
+    tensor_metadata_receipt,
+    tensor_receipt,
+)
+
+
+def test_tensor_receipt_is_stable_and_layout_bound():
+    x = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    first = tensor_receipt(x)
+    second = tensor_receipt(x.clone())
+    assert first == second
+
+    transposed = tensor_receipt(x.t())
+    assert transposed["sample_sha256"] != first["sample_sha256"]
+    assert transposed["stride"] != first["stride"]
+
+
+def test_tensor_receipt_detects_sampled_value_change():
+    x = torch.arange(64, dtype=torch.float32)
+    before = tensor_receipt(x)
+    x[0] += 1
+    after = tensor_receipt(x)
+    assert before["sample_sha256"] != after["sample_sha256"]
+
+
+def test_tensor_receipt_handles_empty_tensor():
+    got = tensor_receipt(torch.empty(0, 3))
+    assert got["numel"] == 0
+    assert got["sample_count"] == 0
+    assert got["sample_finite"] is True
+
+
+def test_deferred_receipt_matches_immediate_receipt_after_finalize():
+    x = torch.arange(96, dtype=torch.float32).reshape(12, 8)
+    expected = tensor_receipt(x)
+    state = SimpleNamespace(
+        runtime_diagnostic={},
+        runtime_diagnostic_pending={
+            "sample": {
+                "schema": "test",
+                "tensor": deferred_tensor_receipt(x),
+            }
+        },
+    )
+
+    finalize(state)
+
+    assert state.runtime_diagnostic_pending == {}
+    assert state.runtime_diagnostic["sample"]["tensor"] == expected
+
+
+def test_finalize_compares_bounded_shadow_replay_receipts():
+    x = torch.arange(64, dtype=torch.float32)
+    state = SimpleNamespace(
+        runtime_diagnostic={},
+        runtime_diagnostic_pending={
+            "eval0_block0_first_vdn_native_attention": {
+                "schema": "test",
+                "output": deferred_tensor_receipt(x),
+                "shadow_replay_output": deferred_tensor_receipt(x.clone()),
+            }
+        },
+    )
+
+    finalize(state)
+
+    got = state.runtime_diagnostic["eval0_block0_first_vdn_native_attention"]
+    assert got["shadow_replay_sample_equal"] is True
+
+
+def test_tensor_metadata_receipt_is_value_free_and_layout_bound():
+    x = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    got = tensor_metadata_receipt(x)
+    assert got["shape"] == [3, 8]
+    assert got["stride"] == [8, 1]
+    assert got["dtype"] == "torch.float32"
+    assert got["device"] == "cpu"
+    assert got["numel"] == 24
+    assert got["storage_offset"] == 0
+    assert got["data_ptr"] == x.data_ptr()
+    assert got["data_ptr_mod_256"] == x.data_ptr() % 256
+    assert got["data_ptr_mod_4096"] == x.data_ptr() % 4096
+    assert "sample_sha256" not in got
+
+
+def test_finalize_first_vdn_native_key_is_kind_agnostic():
+    x = torch.arange(32, dtype=torch.float32)
+    state = SimpleNamespace(
+        runtime_diagnostic={},
+        runtime_diagnostic_pending={
+            "eval0_block0_first_vdn_native_attention": {
+                "schema": "test",
+                "kind": "global",
+                "output": deferred_tensor_receipt(x),
+                "shadow_replay_output": deferred_tensor_receipt(x.clone()),
+            }
+        },
+    )
+    finalize(state)
+    got = state.runtime_diagnostic["eval0_block0_first_vdn_native_attention"]
+    assert got["kind"] == "global"
+    assert got["shadow_replay_sample_equal"] is True

@@ -69,6 +69,10 @@ class Request:
     native_reason: str | None = None
     last_routes: tuple | None = None
     backend_transitions: int = 0
+    runtime_diagnostic: dict = field(default_factory=dict)
+    runtime_diagnostic_pending: dict = field(default_factory=dict)
+    runtime_diagnostic_sparse_context: dict | None = None
+    runtime_diagnostic_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,15 @@ class SamplingWrapper:
             return result
         finally:
             _REQUEST.reset(token)
+            try:
+                from .runtime_diagnostics import finalize
+                finalize(state)
+            except Exception as exc:
+                state.runtime_diagnostic["finalize_error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                log.exception("Sol-H3 runtime-state diagnostic finalization failed")
             log.info(
                 "Sol-H3 %s",
                 json.dumps(
@@ -124,6 +137,7 @@ class SamplingWrapper:
                         "exact_blocks": state.exact_blocks,
                         "inherited_dense_backends": sorted(state.dense_attention_backends),
                         "arithmetic_gates": state.gates,
+                        "runtime_state_diagnostic": state.runtime_diagnostic,
                     }
                 ),
             )
@@ -289,6 +303,20 @@ class BlockPatch:
         options = dict(args["transformer_options"])
         forwarded = {**args, "transformer_options": options}
         route_start = len(routes)
+
+        diagnostic_low_stage = options.get("h3_flow_stage") == "low"
+        if diagnostic_low_stage:
+            state.runtime_diagnostic_enabled = True
+        diagnostic_block0 = diagnostic_low_stage and evaluation == 0 and self.index == 0
+        if diagnostic_block0:
+            from .runtime_diagnostics import capture_metadata
+            capture_metadata(
+                state,
+                "eval0_block0_input",
+                args.get("img"),
+                evaluation=evaluation,
+                block_index=self.index,
+            )
 
         def record(route, fallback=False, measure_plan=None, fields=None):
             routes.append((self.index, route))
@@ -533,6 +561,21 @@ class BlockPatch:
                 # consumers; v4 is the only rectangular mapped-neighbor contract.
                 if kind != "local":
                     record("vdn_" + kind + "_native", True)
+                    if diagnostic_low_stage:
+                        from .runtime_diagnostics import replay_native_once
+                        return replay_native_once(
+                            state,
+                            native,
+                            q,
+                            k,
+                            v,
+                            evaluation=evaluation,
+                            block_index=self.index,
+                            kind=kind,
+                            route="legacy_" + kind + "_native",
+                            sink_rows=sink_rows,
+                            scale=scale,
+                        )
                     return native()
                 if not square_aligned or q.shape != k.shape or q.shape != v.shape:
                     record("vdn_local_native", True)
@@ -553,7 +596,22 @@ class BlockPatch:
                 if warmup:
                     state.dense_calls += 1
                     record("vdn_dense_warmup")
-                    return native()
+                    if not diagnostic_low_stage:
+                        return native()
+                    from .runtime_diagnostics import replay_native_once
+                    return replay_native_once(
+                        state,
+                        native,
+                        q,
+                        k,
+                        v,
+                        evaluation=evaluation,
+                        block_index=self.index,
+                        kind=kind,
+                        route="legacy",
+                        sink_rows=sink_rows,
+                        scale=scale,
+                    )
                 from .sparse import attention, KernelUnavailable
                 try:
                     result = attention(qc, kc, vc, sink_rows, config, state, recompute_prefix_queries=False)
@@ -594,6 +652,21 @@ class BlockPatch:
             ):
                 if kind != "local":
                     record("vdn_" + kind + "_native", True)
+                    if diagnostic_low_stage:
+                        from .runtime_diagnostics import replay_native_once
+                        return replay_native_once(
+                            state,
+                            native,
+                            q,
+                            k,
+                            v,
+                            evaluation=evaluation,
+                            block_index=self.index,
+                            kind=kind,
+                            route="v4_" + kind + "_native",
+                            sink_rows=sink_rows,
+                            scale=scale,
+                        )
                     return native()
                 if any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape or q.shape[1:] != k.shape[1:]:
                     record("vdn_local_native_mapping:domain", True)
@@ -660,7 +733,22 @@ class BlockPatch:
                 if warmup:
                     state.dense_calls += 1
                     record("vdn_dense_warmup")
-                    return native()
+                    if not diagnostic_low_stage:
+                        return native()
+                    from .runtime_diagnostics import replay_native_once
+                    return replay_native_once(
+                        state,
+                        native,
+                        q,
+                        k,
+                        v,
+                        evaluation=evaluation,
+                        block_index=self.index,
+                        kind=kind,
+                        route="v4_mapped",
+                        sink_rows=sink_rows,
+                        scale=scale,
+                    )
                 try:
                     mapped_tensor = device_descriptor(state, descriptor, qc.device)
                 except MappingUnavailable as exc:
@@ -668,6 +756,18 @@ class BlockPatch:
                     return native()
 
                 from .sparse import attention, KernelUnavailable
+                previous_diagnostic_context = state.runtime_diagnostic_sparse_context
+                diagnostic_context = {
+                    "evaluation": int(evaluation),
+                    "block_index": int(self.index),
+                    "kind": kind,
+                    "route": "vdn_local_sol_mapped_v1",
+                    "sink_rows": int(sink_rows),
+                    "q_rows": int(q.shape[0]),
+                    "kv_rows": int(k.shape[0]),
+                }
+                state.runtime_diagnostic_sparse_context = diagnostic_context
+                gate_count_before = len(state.gates)
                 try:
                     result = attention(
                         qc, kc, vc, sink_rows, config, state,
@@ -675,9 +775,23 @@ class BlockPatch:
                         mapped_neighbor_intervals=mapped_tensor,
                         mapped_calibration_identity=descriptor.descriptor_digest,
                     )
+                    if state.runtime_diagnostic_enabled:
+                        from .runtime_diagnostics import capture_sparse_runtime
+                        gate = state.gates[gate_count_before] if len(state.gates) > gate_count_before else None
+                        capture_sparse_runtime(
+                            state,
+                            qc,
+                            kc,
+                            vc,
+                            result,
+                            context=diagnostic_context,
+                            gate=gate,
+                        )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     return native()
+                finally:
+                    state.runtime_diagnostic_sparse_context = previous_diagnostic_context
                 result = result.reshape(q.shape[0], q.shape[1], q.shape[2])
                 state.vdn_requested_q_rows += q.shape[0]
                 state.vdn_kernel_q_rows += qc.shape[2]
@@ -732,6 +846,16 @@ class BlockPatch:
             if self.previous is None
             else self.previous(forwarded, {**extra, "original_block": original_block})
         )
+        if diagnostic_block0:
+            from .runtime_diagnostics import capture_stage
+            output_img = result.get("img") if isinstance(result, dict) else None
+            capture_stage(
+                state,
+                "eval0_block0_return",
+                output_img,
+                evaluation=evaluation,
+                block_index=self.index,
+            )
         if config.backend == "sol" and len(routes) == route_start:
             attn_forward = getattr(getattr(model.blocks[self.index], "attn", None), "forward", None)
             if getattr(attn_forward, "_vdn_forward", False):
