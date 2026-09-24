@@ -583,8 +583,8 @@ class BlockPatch:
                     record("vdn_dense_warmup")
                     if not diagnostic_low_stage:
                         return native()
-                    from .runtime_diagnostics import replay_native_once
-                    return replay_native_once(
+                    from .runtime_diagnostics import observe_native_once
+                    return observe_native_once(
                         state,
                         native,
                         q,
@@ -704,8 +704,8 @@ class BlockPatch:
                     record("vdn_dense_warmup")
                     if not diagnostic_low_stage:
                         return native()
-                    from .runtime_diagnostics import replay_native_once
-                    return replay_native_once(
+                    from .runtime_diagnostics import observe_native_once
+                    return observe_native_once(
                         state,
                         native,
                         q,
