@@ -60,7 +60,7 @@ def test_finalize_compares_bounded_shadow_replay_receipts():
     state = SimpleNamespace(
         runtime_diagnostic={},
         runtime_diagnostic_pending={
-            "eval0_block0_first_vdn_dense_warmup": {
+            "eval0_block0_first_vdn_native_attention": {
                 "schema": "test",
                 "output": deferred_tensor_receipt(x),
                 "shadow_replay_output": deferred_tensor_receipt(x.clone()),
@@ -70,7 +70,7 @@ def test_finalize_compares_bounded_shadow_replay_receipts():
 
     finalize(state)
 
-    got = state.runtime_diagnostic["eval0_block0_first_vdn_dense_warmup"]
+    got = state.runtime_diagnostic["eval0_block0_first_vdn_native_attention"]
     assert got["shadow_replay_sample_equal"] is True
 
 
@@ -89,12 +89,12 @@ def test_tensor_metadata_receipt_is_value_free_and_layout_bound():
     assert "sample_sha256" not in got
 
 
-def test_finalize_first_vdn_warmup_key_is_kind_agnostic():
+def test_finalize_first_vdn_native_key_is_kind_agnostic():
     x = torch.arange(32, dtype=torch.float32)
     state = SimpleNamespace(
         runtime_diagnostic={},
         runtime_diagnostic_pending={
-            "eval0_block0_first_vdn_dense_warmup": {
+            "eval0_block0_first_vdn_native_attention": {
                 "schema": "test",
                 "kind": "global",
                 "output": deferred_tensor_receipt(x),
@@ -103,6 +103,6 @@ def test_finalize_first_vdn_warmup_key_is_kind_agnostic():
         },
     )
     finalize(state)
-    got = state.runtime_diagnostic["eval0_block0_first_vdn_dense_warmup"]
+    got = state.runtime_diagnostic["eval0_block0_first_vdn_native_attention"]
     assert got["kind"] == "global"
     assert got["shadow_replay_sample_equal"] is True
