@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import torch
 
-from sol_h3.runtime_diagnostics import deferred_tensor_receipt, finalize, tensor_receipt
+from sol_h3.runtime_diagnostics import (
+    deferred_tensor_receipt,
+    finalize,
+    tensor_metadata_receipt,
+    tensor_receipt,
+)
 
 
 def test_tensor_receipt_is_stable_and_layout_bound():
@@ -67,3 +72,18 @@ def test_finalize_compares_bounded_shadow_replay_receipts():
 
     got = state.runtime_diagnostic["eval0_block0_first_vdn_dense_warmup"]
     assert got["shadow_replay_sample_equal"] is True
+
+
+def test_tensor_metadata_receipt_is_value_free_and_layout_bound():
+    x = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    got = tensor_metadata_receipt(x)
+    assert got["shape"] == [3, 8]
+    assert got["stride"] == [8, 1]
+    assert got["dtype"] == "torch.float32"
+    assert got["device"] == "cpu"
+    assert got["numel"] == 24
+    assert got["storage_offset"] == 0
+    assert got["data_ptr"] == x.data_ptr()
+    assert got["data_ptr_mod_256"] == x.data_ptr() % 256
+    assert got["data_ptr_mod_4096"] == x.data_ptr() % 4096
+    assert "sample_sha256" not in got
