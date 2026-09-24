@@ -225,6 +225,16 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         )
         want = _dense_reference(q, k, v, None, key_bias=key_bias)
         metrics = error_metrics(got, want)
+        from .runtime_diagnostics import capture_sparse_gate
+        capture_sparse_gate(
+            state,
+            q,
+            k,
+            v,
+            got,
+            want,
+            metrics=metrics,
+        )
         gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(metrics):
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
@@ -255,6 +265,8 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias,
         mapped_neighbor_intervals=mapped_neighbor_intervals,
     )
+    from .runtime_diagnostics import capture_sparse_output
+    capture_sparse_output(state, out)
     if prefix and recompute_prefix_queries:
         out[:, :prefix] = _dense_reference(
             q[:, :, :prefix], k, v, dense_attention, key_bias=key_bias
