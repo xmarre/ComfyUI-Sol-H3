@@ -321,7 +321,14 @@ def sdpa_capability_receipt(q, k, v, scale):
         try:
             with sdpa_kernel(priority, set_priority=True):
                 selected = int(torch._fused_sdp_choice(
-                    qh, kh, vh, None, 0.0, False, float(scale), False
+                    qh,
+                    kh,
+                    vh,
+                    None,
+                    0.0,
+                    False,
+                    scale=float(scale),
+                    enable_gqa=False,
                 ))
             receipt["selected_backend_value"] = selected
             receipt["selected_backend"] = _sdpa_backend_name(selected, SDPBackend)
