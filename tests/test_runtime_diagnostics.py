@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from sol_h3.runtime_diagnostics import (
+    deferred_tensor_delta_receipt,
     deferred_tensor_receipt,
     finalize,
     tensor_metadata_receipt,
@@ -107,3 +108,36 @@ def test_finalize_keeps_route_specific_native_keys():
     finalize(state)
     got = state.runtime_diagnostic["eval0_block0_vdn_native_anchor"]
     assert got["kind"] == "anchor"
+
+
+def test_deferred_pair_delta_receipt_is_bounded_and_detects_change():
+    left = torch.arange(64, dtype=torch.float32)
+    right = left.clone()
+    state = SimpleNamespace(
+        runtime_diagnostic={},
+        runtime_diagnostic_pending={
+            "same": {
+                "schema": "test",
+                "delta": deferred_tensor_delta_receipt(left, right),
+            },
+        },
+    )
+    finalize(state)
+    same = state.runtime_diagnostic["same"]["delta"]
+    assert same["receipt_kind"] == "bounded_pair_delta"
+    assert same["sample_abs_max"] == 0.0
+
+    changed = right.clone()
+    changed[0] += 1.0
+    state = SimpleNamespace(
+        runtime_diagnostic={},
+        runtime_diagnostic_pending={
+            "changed": {
+                "schema": "test",
+                "delta": deferred_tensor_delta_receipt(changed, left),
+            },
+        },
+    )
+    finalize(state)
+    got = state.runtime_diagnostic["changed"]["delta"]
+    assert got["sample_abs_max"] == 1.0
