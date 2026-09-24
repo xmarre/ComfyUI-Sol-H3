@@ -55,23 +55,26 @@ def test_deferred_receipt_matches_immediate_receipt_after_finalize():
     assert state.runtime_diagnostic["sample"]["tensor"] == expected
 
 
-def test_finalize_compares_bounded_shadow_replay_receipts():
+def test_finalize_materializes_native_attention_receipt():
     x = torch.arange(64, dtype=torch.float32)
     state = SimpleNamespace(
         runtime_diagnostic={},
         runtime_diagnostic_pending={
-            "eval0_block0_first_vdn_native_attention": {
+            "eval0_block0_vdn_native_global": {
                 "schema": "test",
+                "kind": "global",
                 "output": deferred_tensor_receipt(x),
-                "shadow_replay_output": deferred_tensor_receipt(x.clone()),
+                "extra_attention_shadow_calls": 0,
             }
         },
     )
 
     finalize(state)
 
-    got = state.runtime_diagnostic["eval0_block0_first_vdn_native_attention"]
-    assert got["shadow_replay_sample_equal"] is True
+    got = state.runtime_diagnostic["eval0_block0_vdn_native_global"]
+    assert got["kind"] == "global"
+    assert got["output"]["sample_sha256"]
+    assert got["extra_attention_shadow_calls"] == 0
 
 
 def test_tensor_metadata_receipt_is_value_free_and_layout_bound():
@@ -89,20 +92,18 @@ def test_tensor_metadata_receipt_is_value_free_and_layout_bound():
     assert "sample_sha256" not in got
 
 
-def test_finalize_first_vdn_native_key_is_kind_agnostic():
+def test_finalize_keeps_route_specific_native_keys():
     x = torch.arange(32, dtype=torch.float32)
     state = SimpleNamespace(
         runtime_diagnostic={},
         runtime_diagnostic_pending={
-            "eval0_block0_first_vdn_native_attention": {
+            "eval0_block0_vdn_native_anchor": {
                 "schema": "test",
-                "kind": "global",
+                "kind": "anchor",
                 "output": deferred_tensor_receipt(x),
-                "shadow_replay_output": deferred_tensor_receipt(x.clone()),
             }
         },
     )
     finalize(state)
-    got = state.runtime_diagnostic["eval0_block0_first_vdn_native_attention"]
-    assert got["kind"] == "global"
-    assert got["shadow_replay_sample_equal"] is True
+    got = state.runtime_diagnostic["eval0_block0_vdn_native_anchor"]
+    assert got["kind"] == "anchor"
