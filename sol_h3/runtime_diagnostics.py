@@ -160,7 +160,7 @@ def finalize(state):
         return
     for key, payload in list(pending.items()):
         entry = _finalize_value(payload)
-        if key == "eval0_block0_first_vdn_dense_warmup":
+        if key == "eval0_block0_first_vdn_native_attention":
             first = entry.get("output") or {}
             replay = entry.get("shadow_replay_output") or {}
             if first.get("sample_sha256") and replay.get("sample_sha256"):
@@ -318,7 +318,7 @@ def replay_native_once(
     sink_rows,
     scale,
 ):
-    """Run one bounded replay of the earliest eval-0/block-0 native VDN SDPA call.
+    """Run one bounded replay of the earliest eval-0/block-0 native VDN attention call.
 
     The first eligible VDN warmup call wins regardless of global/local/anchor kind,
     so this brackets the earliest attention operation that can change block-0
@@ -328,7 +328,7 @@ def replay_native_once(
     The second native call is a deliberate shadow replay on the same Q/K/V; only
     its bounded receipt is retained.
     """
-    key = "eval0_block0_first_vdn_dense_warmup"
+    key = "eval0_block0_first_vdn_native_attention"
     pending = getattr(state, "runtime_diagnostic_pending", None)
     completed = getattr(state, "runtime_diagnostic", None)
     eligible = (
