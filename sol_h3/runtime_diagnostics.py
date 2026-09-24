@@ -3,17 +3,11 @@
 This module is diagnostic-only. Production results are never replaced by a
 shadow result and no RNG state is consumed.
 
-CUDA capture deliberately does *not* copy samples to the host at the numerical
-boundary being observed. A tiny deterministic gather is queued on the current
-stream and the sampled CUDA tensors are retained in a private pending structure.
-Host transfer, hashing, reductions, and JSON materialization happen only when the
-outer sampling request has completed. This avoids inserting a device
-synchronization into the first-low model path.
-
-One first-low grouped-SDPA shadow replay is still executed intentionally. It is
-never substituted into production output and it is not an extra transformer NFE,
-but it can affect timing/cache state after the production attention result has
-already been computed. The receipt reports that fact explicitly.
+Each observed production attention call executes before any diagnostic CUDA
+gather. Bounded samples are then gathered on-device and retained privately;
+host transfer, hashing, reductions, and JSON serialization are deferred until the
+outer sampling request has completed. No attention call is replayed and no
+diagnostic result is substituted into production output.
 """
 from __future__ import annotations
 
@@ -25,7 +19,7 @@ import os
 import torch
 
 
-SCHEMA = "sol_h3_00625_runtime_state_v3"
+SCHEMA = "sol_h3_00625_runtime_state_v4"
 _SAMPLE_COUNT = 256
 _DEFERRED = "_sol_h3_deferred_tensor_receipt"
 log = logging.getLogger("comfy.sol_h3")
@@ -160,13 +154,6 @@ def finalize(state):
         return
     for key, payload in list(pending.items()):
         entry = _finalize_value(payload)
-        if key == "eval0_block0_first_vdn_native_attention":
-            first = entry.get("output") or {}
-            replay = entry.get("shadow_replay_output") or {}
-            if first.get("sample_sha256") and replay.get("sample_sha256"):
-                entry["shadow_replay_sample_equal"] = (
-                    first["sample_sha256"] == replay["sample_sha256"]
-                )
         completed[key] = entry
         log.warning(
             "Sol-H3 runtime-state diagnostic %s",
@@ -218,11 +205,26 @@ def capture_stage(state, key, tensor, **metadata):
 
 
 
-def sdpa_capability_receipt(q, k, v):
-    """Describe PyTorch SDPA eligibility for VDN's exact [1,H,Q,D] views.
+def _sdpa_backend_name(value, backend_type):
+    for name in (
+        "FLASH_ATTENTION",
+        "CUDNN_ATTENTION",
+        "EFFICIENT_ATTENTION",
+        "MATH",
+        "OVERRIDEABLE",
+        "ERROR",
+    ):
+        member = getattr(backend_type, name, None)
+        if member is not None and int(member.value) == int(value):
+            return name
+    return f"UNKNOWN_{int(value)}"
 
-    This only asks backend capability predicates; it does not execute an
-    additional attention kernel.
+
+def sdpa_capability_receipt(q, k, v, scale):
+    """Describe the exact native SDPA dispatch after production attention returned.
+
+    The fused-choice query runs the dispatcher selector only; it does not execute
+    another attention kernel.
     """
     if not all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v)):
         return None
@@ -231,17 +233,33 @@ def sdpa_capability_receipt(q, k, v):
     vh = v.permute(1, 0, 2).unsqueeze(0)
     receipt = {
         "torch_version": str(torch.__version__),
+        "torch_git_version": str(getattr(torch.version, "git_version", None)),
         "cuda_version": str(torch.version.cuda),
         "cudnn_version": torch.backends.cudnn.version(),
+        "device_name": torch.cuda.get_device_name(q.device),
+        "device_capability": list(torch.cuda.get_device_capability(q.device)),
         "deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
         "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "float32_matmul_precision": str(torch.get_float32_matmul_precision()),
         "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING"),
         "pytorch_cuda_alloc_conf": (
             os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
             or os.environ.get("PYTORCH_ALLOC_CONF")
         ),
     }
+    matmul = torch.backends.cuda.matmul
+    for name in (
+        "allow_tf32",
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+        "allow_fp16_accumulation",
+    ):
+        if hasattr(matmul, name):
+            try:
+                receipt["matmul_" + name] = bool(getattr(matmul, name))
+            except Exception as exc:
+                receipt["matmul_" + name] = f"{type(exc).__name__}: {exc}"
     for name in (
         "flash_sdp_enabled",
         "mem_efficient_sdp_enabled",
@@ -261,6 +279,7 @@ def sdpa_capability_receipt(q, k, v):
 
     try:
         import comfy.ops as comfy_ops
+        from torch.nn.attention import SDPBackend, sdpa_kernel
         priority = getattr(comfy_ops, "SDPA_BACKEND_PRIORITY", None)
         if priority is None:
             receipt["comfy_ops_priority"] = None
@@ -270,11 +289,15 @@ def sdpa_capability_receipt(q, k, v):
             ]
     except Exception as exc:
         receipt["comfy_ops_priority"] = f"{type(exc).__name__}: {exc}"
+        receipt["selector_error"] = f"{type(exc).__name__}: {exc}"
+        return receipt
+
     try:
         params = torch.backends.cuda.SDPAParams(qh, kh, vh, None, 0.0, False, False)
     except Exception as exc:
         receipt["params_error"] = f"{type(exc).__name__}: {exc}"
         return receipt
+
     eligibility = {}
     for name, attribute in (
         ("FLASH_ATTENTION", "can_use_flash_attention"),
@@ -291,20 +314,20 @@ def sdpa_capability_receipt(q, k, v):
             eligibility[name] = f"{type(exc).__name__}: {exc}"
     receipt["eligibility"] = eligibility
 
-    priority = receipt.get("comfy_ops_priority")
-    if isinstance(priority, list):
-        first = None
-        for backend in priority:
-            if backend == "MATH":
-                first = "MATH"
-                break
-            if eligibility.get(backend) is True:
-                first = backend
-                break
-        receipt["priority_first_eligible"] = first
+    if priority is not None:
+        try:
+            with sdpa_kernel(priority, set_priority=True):
+                selected = int(torch._fused_sdp_choice(
+                    qh, kh, vh, None, 0.0, False, float(scale), False
+                ))
+            receipt["selected_backend_value"] = selected
+            receipt["selected_backend"] = _sdpa_backend_name(selected, SDPBackend)
+        except Exception as exc:
+            receipt["selector_error"] = f"{type(exc).__name__}: {exc}"
     return receipt
 
-def replay_native_once(
+
+def observe_native_once(
     state,
     native,
     q,
@@ -318,17 +341,15 @@ def replay_native_once(
     sink_rows,
     scale,
 ):
-    """Run one bounded replay of the earliest eval-0/block-0 native VDN attention call.
+    """Observe each eval-0/block-0 VDN native route once, without replay.
 
-    The first eligible VDN warmup call wins regardless of global/local/anchor kind,
-    so this brackets the earliest attention operation that can change block-0
-    numerics. The production native call executes first and its result is always returned.
-    Q/K/V and production-output sampling is queued only after that result exists,
-    so the production native call itself is not preceded by diagnostic CUDA work.
-    The second native call is a deliberate shadow replay on the same Q/K/V; only
-    its bounded receipt is retained.
+    The production native attention call executes first and its result is always
+    returned. Only after that call completes are bounded Q/K/V/output samples and
+    dispatch metadata collected.
     """
-    key = "eval0_block0_first_vdn_native_attention"
+    if kind not in {"global", "local", "anchor"}:
+        return native()
+    key = f"eval0_block0_vdn_native_{kind}"
     pending = getattr(state, "runtime_diagnostic_pending", None)
     completed = getattr(state, "runtime_diagnostic", None)
     eligible = (
@@ -346,7 +367,6 @@ def replay_native_once(
     if not eligible:
         return native()
 
-    # Compute the production result before any diagnostic gather/replay.
     result = native()
     payload = {
         "evaluation": int(evaluation),
@@ -363,22 +383,13 @@ def replay_native_once(
         "k": deferred_tensor_receipt(k),
         "v": deferred_tensor_receipt(v),
         "output": deferred_tensor_receipt(result),
-        "sdpa_capabilities": sdpa_capability_receipt(q, k, v),
+        "sdpa_dispatch": sdpa_capability_receipt(q, k, v, scale),
         "production_call_completed_before_diagnostic_cuda_work": True,
-        "shadow_replay_calls": 1,
-        "shadow_replay_substituted": False,
+        "extra_attention_shadow_calls": 0,
         "extra_transformer_nfe": 0,
     }
-    try:
-        replay = native()
-    except Exception as exc:
-        payload["shadow_replay_error"] = f"{type(exc).__name__}: {exc}"
-    else:
-        payload["shadow_replay_output"] = deferred_tensor_receipt(replay)
-        del replay
     _store_pending_once(state, key, payload)
     return result
-
 
 
 def capture_sparse_runtime(state, q, k, v, output, *, context, gate=None):
