@@ -69,6 +69,7 @@ class Request:
     native_reason: str | None = None
     last_routes: tuple | None = None
     backend_transitions: int = 0
+    runtime_diagnostic: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,7 @@ class SamplingWrapper:
                         "exact_blocks": state.exact_blocks,
                         "inherited_dense_backends": sorted(state.dense_attention_backends),
                         "arithmetic_gates": state.gates,
+                        "runtime_state_diagnostic": state.runtime_diagnostic,
                     }
                 ),
             )
@@ -289,6 +291,17 @@ class BlockPatch:
         options = dict(args["transformer_options"])
         forwarded = {**args, "transformer_options": options}
         route_start = len(routes)
+
+        diagnostic_block0 = evaluation == 0 and self.index == 0
+        if diagnostic_block0:
+            from .runtime_diagnostics import capture_stage
+            capture_stage(
+                state,
+                "eval0_block0_input",
+                args.get("img"),
+                evaluation=evaluation,
+                block_index=self.index,
+            )
 
         def record(route, fallback=False, measure_plan=None, fields=None):
             routes.append((self.index, route))
@@ -553,7 +566,19 @@ class BlockPatch:
                 if warmup:
                     state.dense_calls += 1
                     record("vdn_dense_warmup")
-                    return native()
+                    from .runtime_diagnostics import replay_native_once
+                    return replay_native_once(
+                        state,
+                        native,
+                        q,
+                        k,
+                        v,
+                        evaluation=evaluation,
+                        block_index=self.index,
+                        kind=kind,
+                        route="legacy",
+                        sink_rows=sink_rows,
+                    )
                 from .sparse import attention, KernelUnavailable
                 try:
                     result = attention(qc, kc, vc, sink_rows, config, state, recompute_prefix_queries=False)
@@ -660,7 +685,19 @@ class BlockPatch:
                 if warmup:
                     state.dense_calls += 1
                     record("vdn_dense_warmup")
-                    return native()
+                    from .runtime_diagnostics import replay_native_once
+                    return replay_native_once(
+                        state,
+                        native,
+                        q,
+                        k,
+                        v,
+                        evaluation=evaluation,
+                        block_index=self.index,
+                        kind=kind,
+                        route="v4_mapped",
+                        sink_rows=sink_rows,
+                    )
                 try:
                     mapped_tensor = device_descriptor(state, descriptor, qc.device)
                 except MappingUnavailable as exc:
@@ -721,7 +758,25 @@ class BlockPatch:
                         state.native_reason = str(exc)
                 reason = reason or state.native_reason
                 if reason is None:
-                    result = execute_block(block, call_args, state.exact_verified)
+                    diagnostic = None
+                    if diagnostic_block0:
+                        from .runtime_diagnostics import capture_stage
+
+                        def diagnostic(stage, tensor):
+                            capture_stage(
+                                state,
+                                f"eval0_block0_{stage}",
+                                tensor,
+                                evaluation=evaluation,
+                                block_index=self.index,
+                            )
+
+                    result = execute_block(
+                        block,
+                        call_args,
+                        state.exact_verified,
+                        diagnostic=diagnostic,
+                    )
                     state.exact_blocks += 1
                     return result
                 state.fallbacks["exact:" + reason] += 1
@@ -732,6 +787,16 @@ class BlockPatch:
             if self.previous is None
             else self.previous(forwarded, {**extra, "original_block": original_block})
         )
+        if diagnostic_block0:
+            from .runtime_diagnostics import capture_stage
+            output_img = result.get("img") if isinstance(result, dict) else None
+            capture_stage(
+                state,
+                "eval0_block0_return",
+                output_img,
+                evaluation=evaluation,
+                block_index=self.index,
+            )
         if config.backend == "sol" and len(routes) == route_start:
             attn_forward = getattr(getattr(model.blocks[self.index], "attn", None), "forward", None)
             if getattr(attn_forward, "_vdn_forward", False):
