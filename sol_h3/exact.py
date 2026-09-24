@@ -74,7 +74,7 @@ def ineligible_reason(block, args):
     return None
 
 
-def execute_block(block, args, verified, diagnostic=None):
+def execute_block(block, args, verified):
     # Keep native RMSNorm, AdaLN, attention, MLP and addcmul_ gate operations.
     if sys.platform == "win32":
         raise RuntimeError("Exact fusion is not validated on native Windows; use native H3 execution")
@@ -91,28 +91,10 @@ def execute_block(block, args, verified, diagnostic=None):
     x, segments = args["img"], args["mod_segments"]
     sm, cm, gm, sf, cf, gf = block.adaln_proj(args["t_emb"])
     h = affine(block.norm1(x), sm, cm, segments, verified)
-    if diagnostic is not None:
-        diagnostic("attention_input", h)
     attention = args.get("attention")
     if attention is None:
         attention = block.attn
-    attention_output = attention(
-        h,
-        rope_freqs=args["rope_freqs"],
-        transformer_options=args["transformer_options"],
-    )
-    if diagnostic is not None:
-        diagnostic("attention_output", attention_output)
-    x = _mod_gate(x, gm, attention_output, segments)
-    del attention_output
+    x = _mod_gate(x, gm, attention(h, rope_freqs=args["rope_freqs"],
+                                  transformer_options=args["transformer_options"]), segments)
     h = affine(block.norm2(x), sf, cf, segments, verified)
-    if diagnostic is not None:
-        diagnostic("mlp_input", h)
-    mlp_output = block.mlp(h)
-    if diagnostic is not None:
-        diagnostic("mlp_output", mlp_output)
-    x = _mod_gate(x, gf, mlp_output, segments)
-    del mlp_output
-    if diagnostic is not None:
-        diagnostic("block_output", x)
-    return {"img": x}
+    return {"img": _mod_gate(x, gf, block.mlp(h), segments)}
