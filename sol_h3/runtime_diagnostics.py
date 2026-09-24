@@ -1,13 +1,14 @@
-"""Bounded one-shot receipts for the 00625 same-input runtime divergence.
+"""Bounded receipts for the 00625 same-input runtime divergence.
 
-This module is diagnostic-only. Production results are never replaced by a
-shadow result and no RNG state is consumed.
+This branch is diagnostic-only. The first eval-0/block-0 global production SDPA
+call executes before any diagnostic CUDA work and its result is never replaced.
+Immediately afterward, one shadow call re-executes the exact same native closure
+with the same Q/K/V to test local repeatability. Downstream execution after that
+shadow call is intentionally considered observer-perturbed.
 
-Each observed production attention call executes before any diagnostic CUDA
-gather. Bounded samples are then gathered on-device and retained privately;
-host transfer, hashing, reductions, and JSON serialization are deferred until the
-outer sampling request has completed. No attention call is replayed and no
-diagnostic result is substituted into production output.
+Bounded samples remain on-device until the outer sampling request completes;
+host transfer, hashing, reductions, and JSON serialization are deferred. No RNG
+state is consumed and the diagnostic adds zero transformer NFE.
 """
 from __future__ import annotations
 
