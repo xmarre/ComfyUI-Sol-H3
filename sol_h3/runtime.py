@@ -561,7 +561,23 @@ class BlockPatch:
                 # consumers; v4 is the only rectangular mapped-neighbor contract.
                 if kind != "local":
                     record("vdn_" + kind + "_native", True)
-                    return native()
+                    if not diagnostic_low_stage:
+                        return native()
+                    from .runtime_diagnostics import observe_native_once
+                    return observe_native_once(
+                        state,
+                        native,
+                        q,
+                        k,
+                        v,
+                        evaluation=evaluation,
+                        block_index=self.index,
+                        kind=kind,
+                        route="native",
+                        sink_rows=sink_rows,
+                        scale=scale,
+                        shadow_replay=(kind == "global"),
+                    )
                 if not square_aligned or q.shape != k.shape or q.shape != v.shape:
                     record("vdn_local_native", True)
                     return native()
@@ -638,7 +654,23 @@ class BlockPatch:
             ):
                 if kind != "local":
                     record("vdn_" + kind + "_native", True)
-                    return native()
+                    if not diagnostic_low_stage:
+                        return native()
+                    from .runtime_diagnostics import observe_native_once
+                    return observe_native_once(
+                        state,
+                        native,
+                        q,
+                        k,
+                        v,
+                        evaluation=evaluation,
+                        block_index=self.index,
+                        kind=kind,
+                        route="native",
+                        sink_rows=sink_rows,
+                        scale=scale,
+                        shadow_replay=(kind == "global"),
+                    )
                 if any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape or q.shape[1:] != k.shape[1:]:
                     record("vdn_local_native_mapping:domain", True)
                     return native()
