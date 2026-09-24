@@ -20,11 +20,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 
 import torch
 
 
-SCHEMA = "sol_h3_00625_runtime_state_v2"
+SCHEMA = "sol_h3_00625_runtime_state_v3"
 _SAMPLE_COUNT = 256
 _DEFERRED = "_sol_h3_deferred_tensor_receipt"
 log = logging.getLogger("comfy.sol_h3")
@@ -49,6 +50,25 @@ def _metadata(tensor: torch.Tensor, sample_count: int) -> tuple[dict, int]:
         "numel": int(detached.numel()),
         "sample_count": int(count),
     }, count
+
+
+def tensor_metadata_receipt(tensor):
+    """Host-only tensor metadata. This launches no CUDA work and performs no sync."""
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    detached = tensor.detach()
+    pointer = int(detached.data_ptr())
+    return {
+        "shape": list(detached.shape),
+        "stride": list(detached.stride()),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "numel": int(detached.numel()),
+        "storage_offset": int(detached.storage_offset()),
+        "data_ptr": pointer,
+        "data_ptr_mod_256": pointer % 256,
+        "data_ptr_mod_4096": pointer % 4096,
+    }
 
 
 def _sample_indices(numel: int, count: int, device) -> torch.Tensor:
@@ -169,6 +189,21 @@ def _store_pending_once(state, key, payload) -> bool:
     return True
 
 
+def capture_metadata(state, key, tensor, **metadata):
+    receipt = tensor_metadata_receipt(tensor)
+    if receipt is None:
+        return False
+    return _store_pending_once(
+        state,
+        key,
+        {
+            **metadata,
+            "tensor_metadata": receipt,
+            "cuda_work_before_observed_boundary": False,
+        },
+    )
+
+
 def capture_stage(state, key, tensor, **metadata):
     if not _sm120_tensor(tensor):
         return False
@@ -201,25 +236,72 @@ def sdpa_capability_receipt(q, k, v):
         "deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
         "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING"),
+        "pytorch_cuda_alloc_conf": (
+            os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+            or os.environ.get("PYTORCH_ALLOC_CONF")
+        ),
     }
+    for name in (
+        "flash_sdp_enabled",
+        "mem_efficient_sdp_enabled",
+        "math_sdp_enabled",
+        "cudnn_sdp_enabled",
+    ):
+        getter = getattr(torch.backends.cuda, name, None)
+        if callable(getter):
+            try:
+                receipt[name] = bool(getter())
+            except Exception as exc:
+                receipt[name] = f"{type(exc).__name__}: {exc}"
+    try:
+        receipt["current_stream"] = int(torch.cuda.current_stream(q.device).cuda_stream)
+    except Exception as exc:
+        receipt["current_stream"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        import comfy.ops as comfy_ops
+        priority = getattr(comfy_ops, "SDPA_BACKEND_PRIORITY", None)
+        if priority is None:
+            receipt["comfy_ops_priority"] = None
+        else:
+            receipt["comfy_ops_priority"] = [
+                getattr(item, "name", str(item)) for item in priority
+            ]
+    except Exception as exc:
+        receipt["comfy_ops_priority"] = f"{type(exc).__name__}: {exc}"
     try:
         params = torch.backends.cuda.SDPAParams(qh, kh, vh, None, 0.0, False, False)
     except Exception as exc:
         receipt["params_error"] = f"{type(exc).__name__}: {exc}"
         return receipt
+    eligibility = {}
     for name, attribute in (
-        ("flash", "can_use_flash_attention"),
-        ("cudnn", "can_use_cudnn_attention"),
-        ("efficient", "can_use_efficient_attention"),
+        ("FLASH_ATTENTION", "can_use_flash_attention"),
+        ("CUDNN_ATTENTION", "can_use_cudnn_attention"),
+        ("EFFICIENT_ATTENTION", "can_use_efficient_attention"),
     ):
         predicate = getattr(torch.backends.cuda, attribute, None)
         if not callable(predicate):
-            receipt[name] = None
+            eligibility[name] = None
             continue
         try:
-            receipt[name] = bool(predicate(params))
+            eligibility[name] = bool(predicate(params))
         except Exception as exc:
-            receipt[name] = f"{type(exc).__name__}: {exc}"
+            eligibility[name] = f"{type(exc).__name__}: {exc}"
+    receipt["eligibility"] = eligibility
+
+    priority = receipt.get("comfy_ops_priority")
+    if isinstance(priority, list):
+        first = None
+        for backend in priority:
+            if backend == "MATH":
+                first = "MATH"
+                break
+            if eligibility.get(backend) is True:
+                first = backend
+                break
+        receipt["priority_first_eligible"] = first
     return receipt
 
 def replay_native_once(
@@ -234,6 +316,7 @@ def replay_native_once(
     kind,
     route,
     sink_rows,
+    scale,
 ):
     """Run one bounded first-low native grouped-SDPA shadow replay.
 
@@ -270,11 +353,17 @@ def replay_native_once(
         "kind": kind,
         "route": route,
         "sink_rows": int(sink_rows),
+        "scale": float(scale),
+        "q_runtime": tensor_metadata_receipt(q),
+        "k_runtime": tensor_metadata_receipt(k),
+        "v_runtime": tensor_metadata_receipt(v),
+        "output_runtime": tensor_metadata_receipt(result),
         "q": deferred_tensor_receipt(q),
         "k": deferred_tensor_receipt(k),
         "v": deferred_tensor_receipt(v),
         "output": deferred_tensor_receipt(result),
         "sdpa_capabilities": sdpa_capability_receipt(q, k, v),
+        "production_call_completed_before_diagnostic_cuda_work": True,
         "shadow_replay_calls": 1,
         "shadow_replay_substituted": False,
         "extra_transformer_nfe": 0,
