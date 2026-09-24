@@ -1,6 +1,7 @@
 from collections import Counter, OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import logging
 
@@ -23,6 +24,7 @@ from .interop import (
 log = logging.getLogger("comfy.sol_h3")
 _REQUEST = ContextVar("sol_h3_request", default=None)
 _FORWARD = ContextVar("sol_h3_forward", default=None)
+FLOW_STAGE_KEY = "h3_flow_stage"
 
 
 @dataclass
@@ -69,6 +71,38 @@ class Request:
     native_reason: str | None = None
     last_routes: tuple | None = None
     backend_transitions: int = 0
+    diagnostic_first_low_weighted_dense: dict | None = None
+
+
+def _bounded_tensor_diagnostic(tensor, *, max_samples=32):
+    """Return a bounded deterministic sample receipt without changing model state."""
+    import torch
+
+    if not torch.is_tensor(tensor):
+        return None
+    detached = tensor.detach()
+    flat = detached.reshape(-1)
+    numel = int(flat.numel())
+    if numel == 0:
+        indices = []
+        sampled = flat.to(device="cpu", dtype=torch.float32)
+    else:
+        sample_count = min(int(max_samples), numel)
+        if sample_count == 1:
+            indices = [0]
+        else:
+            indices = [(index * (numel - 1)) // (sample_count - 1) for index in range(sample_count)]
+        index_tensor = torch.tensor(indices, device=flat.device, dtype=torch.long)
+        sampled = flat.index_select(0, index_tensor).to(device="cpu", dtype=torch.float32)
+    payload = bytes(sampled.contiguous().view(torch.uint8).tolist())
+    return {
+        "shape": tuple(int(value) for value in detached.shape),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "numel": numel,
+        "sample_count": len(indices),
+        "sample_sha256": hashlib.sha256(payload).hexdigest(),
+    }
 
 
 @dataclass(frozen=True)
@@ -123,6 +157,7 @@ class SamplingWrapper:
                         "numerical_backend_transitions": state.backend_transitions,
                         "exact_blocks": state.exact_blocks,
                         "inherited_dense_backends": sorted(state.dense_attention_backends),
+                        "diagnostic_first_low_weighted_dense": state.diagnostic_first_low_weighted_dense,
                         "arithmetic_gates": state.gates,
                     }
                 ),
@@ -394,6 +429,9 @@ class BlockPatch:
 
                 if generic_measure_contract is not None:
                     state.eligible_calls += 1
+                    diagnostic_input_q = q
+                    diagnostic_input_k = k
+                    diagnostic_input_v = v
                     preprocess_identity = weighted_measure.preprocess_digest(dense_provider)
                     existing_sink = (0, (int(prefix) + 63) // 64)
                     bind_kwargs = {
@@ -421,6 +459,36 @@ class BlockPatch:
                             numerical_route=weighted_measure.SPARSE_NUMERICAL_ROUTE,
                         )
                     q, k, v, dense_provider = _preprocess_chain(dense_provider, q, k, v, heads, kw)
+                    capture_first_low_weighted_dense = bool(
+                        state.diagnostic_first_low_weighted_dense is None
+                        and warmup
+                        and evaluation == 0
+                        and current_options.get(FLOW_STAGE_KEY) == "low"
+                    )
+                    diagnostic_weighted_dense = None
+                    if capture_first_low_weighted_dense:
+                        diagnostic_weighted_dense = {
+                            "schema": 1,
+                            "stage": "low",
+                            "evaluation": int(evaluation),
+                            "block_index": int(self.index),
+                            "layout_rows": int(getattr(layout, "seq_len", q.shape[2])),
+                            "q_input": _bounded_tensor_diagnostic(diagnostic_input_q),
+                            "k_input": _bounded_tensor_diagnostic(diagnostic_input_k),
+                            "v_input": _bounded_tensor_diagnostic(diagnostic_input_v),
+                            "q_effective": _bounded_tensor_diagnostic(q),
+                            "k_effective": _bounded_tensor_diagnostic(k),
+                            "v_effective": _bounded_tensor_diagnostic(v),
+                            "key_log_measure": _bounded_tensor_diagnostic(measure_plan.key_log_measure),
+                            "semantic_digest": str(measure_plan.semantic_digest),
+                            "owner_generation": str(measure_plan.owner_generation),
+                            "implementation_profile": str(measure_plan.implementation_profile),
+                            "numerical_route": str(measure_plan.numerical_route),
+                            "q_rows": int(measure_plan.q_rows),
+                            "kv_rows": int(measure_plan.kv_rows),
+                            "exact_range_digest": str(measure_plan.exact_range_digest),
+                            "preprocess_digest": str(measure_plan.preprocess_digest),
+                        }
 
                     def weighted_dense_result(plan, *, output_heads=False, qd=q, kd=k, vd=v):
                         return weighted_measure.dense(
@@ -429,6 +497,9 @@ class BlockPatch:
 
                     if warmup:
                         result = weighted_dense_result(measure_plan)
+                        if diagnostic_weighted_dense is not None:
+                            diagnostic_weighted_dense["output"] = _bounded_tensor_diagnostic(result)
+                            state.diagnostic_first_low_weighted_dense = diagnostic_weighted_dense
                         state.dense_calls += 1
                         state.external_mixed_weighted_measure_calls += 1
                         state.external_mixed_weighted_measure_q_rows += q.shape[2]

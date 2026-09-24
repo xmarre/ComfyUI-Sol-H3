@@ -48,7 +48,7 @@ def _plan(profile, route):
     )
 
 
-def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=True):
+def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=True, flow_stage=None):
     state = Request(cfg)
     layout, external, measure = _contracts()
     q, k, v = (
@@ -111,6 +111,8 @@ def _run_block(monkeypatch, cfg, *, sparse_impl, dense_impl, include_external=Tr
     }
     if include_external:
         options["vdn_h3_external_sequence_v1"] = external
+    if flow_stage is not None:
+        options["h3_flow_stage"] = flow_stage
     try:
         result = BlockPatch(0, cfg)(
             {"transformer_options": options, "layout": layout},
@@ -260,3 +262,65 @@ def test_generic_weighted_measure_does_not_require_vdn_external_sequence(monkeyp
     assert calls == [(10, ROWS, (0, 3))]
     assert plans[0].numerical_route == weighted_measure.SPARSE_NUMERICAL_ROUTE
     assert state.external_mixed_weighted_measure_calls == 1
+
+def test_first_low_weighted_dense_provenance_is_bounded_and_output_neutral(monkeypatch):
+    dense_calls = []
+
+    def sparse_impl(*args, **kwargs):
+        raise AssertionError("dense warmup must not dispatch sparse attention")
+
+    def dense_impl(q, k, v, heads, plan, *, scale=None, output_heads=False):
+        dense_calls.append(True)
+        return torch.zeros(1, ROWS, HEADS * DIM, dtype=q.dtype)
+
+    result, state, plans, _, _ = _run_block(
+        monkeypatch,
+        Config(exact=False, backend="sol", dense_evaluations=1, dense_layers=0),
+        sparse_impl=sparse_impl,
+        dense_impl=dense_impl,
+        flow_stage="low",
+    )
+
+    assert result.shape == (1, ROWS, HEADS * DIM)
+    assert dense_calls == [True]
+    receipt = state.diagnostic_first_low_weighted_dense
+    assert receipt is not None
+    assert receipt["schema"] == 1
+    assert receipt["stage"] == "low"
+    assert receipt["evaluation"] == 0
+    assert receipt["block_index"] == 0
+    assert receipt["implementation_profile"] == weighted_measure.DENSE_IMPLEMENTATION_PROFILE
+    assert receipt["numerical_route"] == weighted_measure.DENSE_NUMERICAL_ROUTE
+    for key in (
+        "q_input",
+        "k_input",
+        "v_input",
+        "q_effective",
+        "k_effective",
+        "v_effective",
+        "key_log_measure",
+        "output",
+    ):
+        assert receipt[key]["sample_count"] <= 32
+        assert len(receipt[key]["sample_sha256"]) == 64
+    assert receipt["q_input"]["sample_sha256"] == receipt["q_effective"]["sample_sha256"]
+    assert receipt["k_input"]["sample_sha256"] == receipt["k_effective"]["sample_sha256"]
+    assert receipt["v_input"]["sample_sha256"] == receipt["v_effective"]["sample_sha256"]
+    assert plans[0].numerical_route == weighted_measure.DENSE_NUMERICAL_ROUTE
+
+
+def test_weighted_dense_provenance_is_low_stage_only(monkeypatch):
+    def sparse_impl(*args, **kwargs):
+        raise AssertionError("dense warmup must not dispatch sparse attention")
+
+    def dense_impl(q, k, v, heads, plan, *, scale=None, output_heads=False):
+        return torch.zeros(1, ROWS, HEADS * DIM, dtype=q.dtype)
+
+    _, state, _, _, _ = _run_block(
+        monkeypatch,
+        Config(exact=False, backend="sol", dense_evaluations=1, dense_layers=0),
+        sparse_impl=sparse_impl,
+        dense_impl=dense_impl,
+        flow_stage="high",
+    )
+    assert state.diagnostic_first_low_weighted_dense is None
