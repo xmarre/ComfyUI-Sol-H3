@@ -309,8 +309,8 @@ class BlockPatch:
             state.runtime_diagnostic_enabled = True
         diagnostic_block0 = diagnostic_low_stage and evaluation == 0 and self.index == 0
         if diagnostic_block0:
-            from .runtime_diagnostics import capture_stage
-            capture_stage(
+            from .runtime_diagnostics import capture_metadata
+            capture_metadata(
                 state,
                 "eval0_block0_input",
                 args.get("img"),
@@ -595,6 +595,7 @@ class BlockPatch:
                         kind=kind,
                         route="legacy",
                         sink_rows=sink_rows,
+                        scale=scale,
                     )
                 from .sparse import attention, KernelUnavailable
                 try:
@@ -716,6 +717,7 @@ class BlockPatch:
                         kind=kind,
                         route="v4_mapped",
                         sink_rows=sink_rows,
+                        scale=scale,
                     )
                 try:
                     mapped_tensor = device_descriptor(state, descriptor, qc.device)
@@ -803,25 +805,7 @@ class BlockPatch:
                         state.native_reason = str(exc)
                 reason = reason or state.native_reason
                 if reason is None:
-                    diagnostic = None
-                    if diagnostic_block0:
-                        from .runtime_diagnostics import capture_stage
-
-                        def diagnostic(stage, tensor):
-                            capture_stage(
-                                state,
-                                f"eval0_block0_{stage}",
-                                tensor,
-                                evaluation=evaluation,
-                                block_index=self.index,
-                            )
-
-                    result = execute_block(
-                        block,
-                        call_args,
-                        state.exact_verified,
-                        diagnostic=diagnostic,
-                    )
+                    result = execute_block(block, call_args, state.exact_verified)
                     state.exact_blocks += 1
                     return result
                 state.fallbacks["exact:" + reason] += 1
