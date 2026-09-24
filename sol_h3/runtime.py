@@ -576,7 +576,6 @@ class BlockPatch:
                         route="native",
                         sink_rows=sink_rows,
                         scale=scale,
-                        shadow_replay=(kind == "global"),
                     )
                 if not square_aligned or q.shape != k.shape or q.shape != v.shape:
                     record("vdn_local_native", True)
@@ -612,7 +611,6 @@ class BlockPatch:
                         route="legacy",
                         sink_rows=sink_rows,
                         scale=scale,
-                        shadow_replay=False,
                     )
                 from .sparse import attention, KernelUnavailable
                 try:
@@ -669,7 +667,6 @@ class BlockPatch:
                         route="native",
                         sink_rows=sink_rows,
                         scale=scale,
-                        shadow_replay=(kind == "global"),
                     )
                 if any(t.ndim != 3 for t in (q, k, v)) or k.shape != v.shape or q.shape[1:] != k.shape[1:]:
                     record("vdn_local_native_mapping:domain", True)
@@ -751,7 +748,6 @@ class BlockPatch:
                         route="v4_mapped",
                         sink_rows=sink_rows,
                         scale=scale,
-                        shadow_replay=False,
                     )
                 try:
                     mapped_tensor = device_descriptor(state, descriptor, qc.device)

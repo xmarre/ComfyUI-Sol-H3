@@ -1,7 +1,7 @@
 """Bounded one-shot receipts for the 00625 same-input runtime divergence.
 
-This module is diagnostic-only. Production results are never replaced by a
-shadow result and no RNG state is consumed.
+This module is diagnostic-only. Production results are never replaced and no
+RNG state is consumed. It launches no diagnostic attention/model computation.
 
 CUDA capture deliberately does *not* copy samples to the host at the numerical
 boundary being observed. A tiny deterministic gather is queued on the current
@@ -9,11 +9,6 @@ stream and the sampled CUDA tensors are retained in a private pending structure.
 Host transfer, hashing, reductions, and JSON materialization happen only when the
 outer sampling request has completed. This avoids inserting a device
 synchronization into the first-low model path.
-
-One first-low grouped-SDPA shadow replay is still executed intentionally. It is
-never substituted into production output and it is not an extra transformer NFE,
-but it can affect timing/cache state after the production attention result has
-already been computed. The receipt reports that fact explicitly.
 """
 from __future__ import annotations
 
@@ -140,12 +135,6 @@ def finalize(state):
         return
     for key, payload in list(pending.items()):
         entry = _finalize_value(payload)
-        first = entry.get("output") or {}
-        replay = entry.get("shadow_replay_output") or {}
-        if first.get("sample_sha256") and replay.get("sample_sha256"):
-            entry["shadow_replay_sample_equal"] = (
-                first["sample_sha256"] == replay["sample_sha256"]
-            )
         completed[key] = entry
         log.warning(
             "Sol-H3 runtime-state diagnostic %s",
@@ -318,13 +307,11 @@ def observe_native_once(
     route,
     sink_rows,
     scale,
-    shadow_replay=False,
 ):
     """Observe one eval0/block0 VDN native route after its production result exists.
 
-    Global/local/anchor each get one production Q/K/V/output receipt. Only the
-    first global route gets an immediate same-QKV shadow replay; the production
-    result is always returned and the replay is never substituted.
+    Global/local/anchor each get one production Q/K/V/output receipt. The
+    diagnostic performs no replay and never substitutes production output.
     """
     key = f"eval0_block0_vdn_{kind}_native"
     pending = getattr(state, "runtime_diagnostic_pending", None)
@@ -345,7 +332,7 @@ def observe_native_once(
     if not eligible:
         return native()
 
-    # Production executes before any diagnostic CUDA gather or replay.
+    # Production executes before any diagnostic CUDA gather.
     result = native()
     payload = {
         "evaluation": int(evaluation),
@@ -358,19 +345,9 @@ def observe_native_once(
         "v": deferred_tensor_receipt(v),
         "output": deferred_tensor_receipt(result),
         "sdpa_capabilities": sdpa_capability_receipt(q, k, v, scale=scale),
-        "shadow_replay_calls": 0,
-        "shadow_replay_substituted": False,
+        "extra_attention_calls": 0,
         "extra_transformer_nfe": 0,
     }
-    if shadow_replay:
-        payload["shadow_replay_calls"] = 1
-        try:
-            replay = native()
-        except Exception as exc:
-            payload["shadow_replay_error"] = f"{type(exc).__name__}: {exc}"
-        else:
-            payload["shadow_replay_output"] = deferred_tensor_receipt(replay)
-            del replay
     _store_pending_once(state, key, payload)
     return result
 

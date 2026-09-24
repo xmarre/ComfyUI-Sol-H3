@@ -48,22 +48,3 @@ def test_deferred_receipt_matches_immediate_receipt_after_finalize():
 
     assert state.runtime_diagnostic_pending == {}
     assert state.runtime_diagnostic["sample"]["tensor"] == expected
-
-
-def test_finalize_compares_bounded_shadow_replay_receipts():
-    x = torch.arange(64, dtype=torch.float32)
-    state = SimpleNamespace(
-        runtime_diagnostic={},
-        runtime_diagnostic_pending={
-            "eval0_block0_first_vdn_dense_warmup": {
-                "schema": "test",
-                "output": deferred_tensor_receipt(x),
-                "shadow_replay_output": deferred_tensor_receipt(x.clone()),
-            }
-        },
-    )
-
-    finalize(state)
-
-    got = state.runtime_diagnostic["eval0_block0_first_vdn_dense_warmup"]
-    assert got["shadow_replay_sample_equal"] is True
