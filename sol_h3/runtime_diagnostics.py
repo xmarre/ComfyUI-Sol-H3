@@ -197,9 +197,11 @@ def _sdpa_backend_name(value):
 def sdpa_capability_receipt(q, k, v, *, scale=None):
     """Describe and resolve the backend for VDN's exact [1,H,Q,D] views.
 
-    The choice query is executed under the same priority order used by ComfyUI's
-    comfy.ops.scaled_dot_product_attention on current Torch. It does not execute
-    an attention kernel.
+    The choice query is executed under the exact priority object exposed by the
+    installed ComfyUI runtime when available. It does not execute an attention
+    kernel. Global SDPA/matmul flags are recorded because they are process state,
+    not workflow state, and can otherwise make a same-workflow replay select a
+    different numerical path.
     """
     if not all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v)):
         return None
@@ -218,6 +220,35 @@ def sdpa_capability_receipt(q, k, v, *, scale=None):
         "float32_matmul_precision": str(torch.get_float32_matmul_precision()),
         "scale": None if scale is None else float(scale),
     }
+
+    for key, attribute in (
+        ("flash_sdp_enabled", "flash_sdp_enabled"),
+        ("cudnn_sdp_enabled", "cudnn_sdp_enabled"),
+        ("efficient_sdp_enabled", "mem_efficient_sdp_enabled"),
+        ("math_sdp_enabled", "math_sdp_enabled"),
+        ("math_sdp_low_precision_reduction", "fp16_bf16_reduction_math_sdp_allowed"),
+    ):
+        getter = getattr(torch.backends.cuda, attribute, None)
+        if not callable(getter):
+            receipt[key] = None
+            continue
+        try:
+            receipt[key] = bool(getter())
+        except Exception as exc:
+            receipt[key] = f"{type(exc).__name__}: {exc}"
+
+    matmul = getattr(torch.backends.cuda, "matmul", None)
+    if matmul is not None:
+        for key, attribute in (
+            ("matmul_allow_fp16_reduced_precision_reduction", "allow_fp16_reduced_precision_reduction"),
+            ("matmul_allow_bf16_reduced_precision_reduction", "allow_bf16_reduced_precision_reduction"),
+            ("matmul_allow_fp16_accumulation", "allow_fp16_accumulation"),
+        ):
+            try:
+                receipt[key] = bool(getattr(matmul, attribute))
+            except Exception as exc:
+                receipt[key] = f"{type(exc).__name__}: {exc}"
+
     try:
         params = torch.backends.cuda.SDPAParams(qh, kh, vh, None, 0.0, False, False)
     except Exception as exc:
@@ -241,23 +272,38 @@ def sdpa_capability_receipt(q, k, v, *, scale=None):
     if callable(choice):
         try:
             from torch.nn.attention import SDPBackend, sdpa_kernel
-            priority = [
+
+            fallback_priority = [
                 SDPBackend.FLASH_ATTENTION,
                 SDPBackend.CUDNN_ATTENTION,
                 SDPBackend.EFFICIENT_ATTENTION,
                 SDPBackend.MATH,
             ]
+            try:
+                import comfy.ops as comfy_ops
+                runtime_priority = getattr(comfy_ops, "SDPA_BACKEND_PRIORITY", None)
+            except Exception as exc:
+                runtime_priority = None
+                receipt["comfy_priority_import_error"] = f"{type(exc).__name__}: {exc}"
+
+            if isinstance(runtime_priority, (list, tuple)) and runtime_priority:
+                priority = list(runtime_priority)
+                receipt["priority_source"] = "comfy.ops.SDPA_BACKEND_PRIORITY"
+            else:
+                priority = fallback_priority
+                receipt["priority_source"] = "diagnostic_fallback_matches_comfy_v0.37.0"
+
+            receipt["priority"] = [
+                _sdpa_backend_name(int(getattr(item, "value", -1))) or str(item)
+                for item in priority
+            ]
             with sdpa_kernel(priority, set_priority=True):
                 value = int(choice(qh, kh, vh, scale=scale))
             receipt["selected_backend_value"] = value
             receipt["selected_backend"] = _sdpa_backend_name(value)
-            receipt["priority"] = [
-                "flash_attention", "cudnn_attention", "efficient_attention", "math"
-            ]
         except Exception as exc:
             receipt["selected_backend_error"] = f"{type(exc).__name__}: {exc}"
     return receipt
-
 
 def observe_native_once(
     state,
