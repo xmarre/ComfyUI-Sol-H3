@@ -247,6 +247,9 @@ def sdpa_capability_receipt(q, k, v, scale):
             os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
             or os.environ.get("PYTORCH_ALLOC_CONF")
         ),
+        "torch_cudnn_sdpa_deprioritized": os.environ.get("TORCH_CUDNN_SDPA_DEPRIORITIZED"),
+        "cudnn_rescale_threshold": os.environ.get("CUDNN_RESCALE_THRESHOLD"),
+        "cudnn_use_ex2_emulation": os.environ.get("CUDNN_USE_EX2_EMULATION"),
     }
     matmul = torch.backends.cuda.matmul
     for name in (
