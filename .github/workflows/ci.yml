@@ -92,6 +92,12 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: 4d721496effc91e2934cdf8863ecb2216accfadc
+          path: _deps/FlowPartitioned
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
           repository: xmarre/ComfyUI-VDN-H3-Plus
           ref: 333d63f81d33fe29dc1f1f637c5f4a4396880f99
           path: _deps/VDN
@@ -111,3 +117,8 @@ jobs:
           DIFFAID_PATH: ${{ github.workspace }}/_deps/DiffAid
           FLOW_PATH: ${{ github.workspace }}/_deps/Flow
           VDN_PATH: ${{ github.workspace }}/_deps/VDN
+      - name: Validate current partitioned Flow history
+        run: python -m pytest -q tests/test_real_partitioned_history.py
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
+          FLOW_PATH: ${{ github.workspace }}/_deps/FlowPartitioned

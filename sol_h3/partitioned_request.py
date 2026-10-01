@@ -138,6 +138,13 @@ def _key_bias(
     if not _digest(semantic_digest):
         raise RuntimeError("partitioned Sol semantic digest is invalid")
 
+    # Unit measure adds zero to every score. A non-null zero mask would still
+    # exclude PyTorch's CUDA FlashAttention route; preserve the validated
+    # prefix metadata in the receipt without allocating or passing that mask.
+    if log_measure == 0.0:
+        state.partitioned_unit_measure_calls = getattr(state, "partitioned_unit_measure_calls", 0) + 1
+        return None
+
     cache = _bias_cache(state)
     key = (
         PARTITIONED_REQUEST_ABI,
