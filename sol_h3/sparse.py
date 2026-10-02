@@ -76,9 +76,16 @@ def error_metrics(got, want):
     want_f = want.float()
     delta = got_f - want_f
     abs_delta = delta.abs()
-    finite = bool(torch.isfinite(got_f).all().item() and
-                  torch.isfinite(want_f).all().item() and
-                  torch.isfinite(delta).all().item())
+    # Queue the same reductions before one small host transfer. Reading each
+    # scalar separately drains the CUDA stream repeatedly during qualification.
+    statistics = torch.stack((
+        torch.isfinite(got_f).all() & torch.isfinite(want_f).all() & torch.isfinite(delta).all(),
+        want_f.abs().max(),
+        abs_delta.max(),
+        abs_delta.mean(),
+        torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(want_f).clamp_min(1e-12),
+    )).tolist()
+    finite = bool(statistics[0])
     if not finite:
         return {
             "finite": False,
@@ -89,11 +96,7 @@ def error_metrics(got, want):
             "catastrophic_max_abs_limit": math.nan,
         }
 
-    reference_peak_abs = float(want_f.abs().max().item())
-    max_abs = float(abs_delta.max().item())
-    mean_abs = float(abs_delta.mean().item())
-    rel_l2 = float((torch.linalg.vector_norm(delta) /
-                    torch.linalg.vector_norm(want_f).clamp_min(1e-12)).item())
+    _, reference_peak_abs, max_abs, mean_abs, rel_l2 = statistics
     catastrophic_limit = max(
         ARITH_CATASTROPHIC_MAX_FLOOR,
         ARITH_CATASTROPHIC_REFERENCE_PEAK_MULTIPLIER * reference_peak_abs,
@@ -125,7 +128,21 @@ def _dense_reference(q, k, v, dense_attention, key_bias=None):
             raise RuntimeError(f"Dense SOL reference returned {tuple(out.shape)}, expected {expected}")
         return out
     bias = None if key_bias is None else key_bias.to(dtype=q.dtype).view(1, 1, 1, -1)
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=bias).transpose(1, 2)
+    try:
+        from comfy.ops import scaled_dot_product_attention as dense_sdpa
+        dispatcher = "core"
+    except ImportError:
+        dense_sdpa = F.scaled_dot_product_attention
+        dispatcher = "torch"
+    # Keep an independent all-selected reference while using native VDN's
+    # backend policy. Execution failures must propagate without a second try.
+    result = dense_sdpa(q, k, v, attn_mask=bias).transpose(1, 2)
+    from .runtime import _REQUEST
+    state = _REQUEST.get()
+    if state is not None:
+        counter = f"native_{dispatcher}_reference_calls"
+        setattr(state, counter, getattr(state, counter, 0) + 1)
+    return result
 
 
 def _bthd_layout_key(*tensors):

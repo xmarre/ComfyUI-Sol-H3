@@ -37,7 +37,9 @@ EXPECTED_RUNTIME = {
 }
 EXPECTED_SOL_BLOBS = {
     "sol_h3/mapped_neighbors.py": "834323e2bbafa5f39467b82327e344cf3368a21e",
-    "sol_h3/sparse.py": "4d8ad1779130c62f577e709352e8c019acea7aca",
+    # Reference dispatch/host statistics changed; preserved GPU captures still
+    # qualify their original source and do not establish this candidate's speed.
+    "sol_h3/sparse.py": "d064af65fd5ada82d24ffd90aabfa630185bfc76",
     "sol_h3/provenance.py": "e3d0e3341d18e21080c33bf0f6fae4b8ebe0e237",
     "sol_h3/sol_manifest.json": "1dfd622bd102aa9f66db00f5dc49aa627560173e",
     "tools/mapped_neighbor_probe.py": "445055a66699e66d33da52242749248b2abcae4d",
