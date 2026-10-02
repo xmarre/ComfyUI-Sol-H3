@@ -274,7 +274,7 @@ def _accept_partitioned_receipt(item) -> bool:
         PARTITIONED_REQUEST_ABI,
         PARTITIONED_SOL_ROUTE,
     )
-    from .runtime import _REQUEST
+    from .runtime import _FORWARD, _REQUEST
 
     if not isinstance(item, tuple) or len(item) != 4 or item[0] != "sol_h3":
         return False
@@ -285,11 +285,10 @@ def _accept_partitioned_receipt(item) -> bool:
         return False
     if route not in {PARTITIONED_DENSE_ROUTE, PARTITIONED_SOL_ROUTE, PARTITIONED_MAPPED_ROUTE}:
         return False
-    if not isinstance(fields, tuple) or len(fields) != 16:
+    if not isinstance(fields, tuple) or len(fields) != 15:
         return False
     (
         tag,
-        call_token,
         abi,
         semantic_digest,
         kind,
@@ -307,11 +306,6 @@ def _accept_partitioned_receipt(item) -> bool:
     ) = fields
     if (
         tag != PARTITIONED_RECEIPT_TAG
-        or not isinstance(call_token, tuple)
-        or len(call_token) != 2
-        or call_token[0] != "sol_h3_evaluation"
-        or type(call_token[1]) is not int
-        or call_token[1] < 0
         or abi != PARTITIONED_REQUEST_ABI
         or not _digest(semantic_digest)
         or kind not in {"global", "local", "anchor", "full"}
@@ -375,6 +369,17 @@ def _accept_partitioned_receipt(item) -> bool:
             return False
 
     state = _REQUEST.get()
+    active = _FORWARD.get()
+    if (
+        state is None
+        or not isinstance(active, tuple)
+        or len(active) != 5
+        or active[1] is not state
+        or type(active[2]) is not int
+        or active[2] < 0
+        or getattr(state, "partitioned_receipt_evaluation", None) != active[2]
+    ):
+        return False
     owned = getattr(state, "partitioned_validated_receipts", set()) if state is not None else set()
     return (block, fields) in owned
 

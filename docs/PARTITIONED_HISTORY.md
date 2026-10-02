@@ -19,6 +19,13 @@ inherited attention providers, dense warmup and backend transitions retain their
 existing identity boundaries. Attention completion receipts must still belong
 to the active Sol request; the control does not qualify unknown routes.
 
+Partitioned v2 completion receipts contain stable numerical fields. Evaluation
+numbers belong to request-owned completion proof, checked against the active
+forward before Spectrum accepts an anchor. Repeating the same route preserves
+history; changes to geometry, measure, mapping, kernel or execution mode still
+invalidate it. Proof is cleared on the next actual evaluation, so an earlier
+completion cannot authorize an unexecuted attention call in the current forward.
+
 The classifier reads scalar metadata without modifying the Flow plan, layout,
 options, model or tensors. It adds no transformer evaluations, attention shadows,
 sampler lifetimes or GPU synchronization. Histories remain run-scoped. The actual

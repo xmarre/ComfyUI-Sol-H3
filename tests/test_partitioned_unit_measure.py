@@ -51,7 +51,7 @@ def test_unit_measure_dense_request_uses_unmasked_sdpa_and_preserves_receipt(mon
     torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
     _provider, block, route, fields = options[RECEIPTS_KEY][0]
     assert route == request.PARTITIONED_DENSE_ROUTE
-    assert fields[9:11] == ((3, 7), 0.0)
+    assert fields[8:10] == ((3, 7), 0.0)
     assert (block, fields) in state.partitioned_validated_receipts
 
 

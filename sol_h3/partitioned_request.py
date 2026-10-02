@@ -33,7 +33,7 @@ from .mapped_neighbors import (
 from .sparse import arithmetic_gate_passes, error_metrics
 
 PARTITIONED_REQUEST_ABI = "sol-h3-partitioned-single-union-v1"
-PARTITIONED_RECEIPT_TAG = "sol_h3_partitioned_exact_prefix_v1"
+PARTITIONED_RECEIPT_TAG = "sol_h3_partitioned_exact_prefix_v2"
 PARTITIONED_DENSE_ROUTE = "partitioned_dense"
 PARTITIONED_SOL_ROUTE = "partitioned_sol"
 PARTITIONED_MAPPED_ROUTE = "partitioned_sol_mapped"
@@ -327,7 +327,6 @@ def _descriptor_for_wire(
 
 def _completion_fields(
     *,
-    evaluation: int,
     semantic_digest: str,
     kind: str,
     execution_mode: str,
@@ -342,7 +341,6 @@ def _completion_fields(
 ):
     return (
         PARTITIONED_RECEIPT_TAG,
-        ("sol_h3_evaluation", int(evaluation)),
         PARTITIONED_REQUEST_ABI,
         semantic_digest,
         kind,
@@ -373,6 +371,11 @@ def _record_completion(
         raise RuntimeError("partitioned Sol request ownership changed during an H3 block")
     routes = active[4]
     routes.append((block_index, route))
+    # Spectrum compares receipts as numerical identities. Keep per-evaluation
+    # completion proof on the request, outside the stable published fields.
+    if getattr(state, "partitioned_receipt_evaluation", None) != active[2]:
+        state.partitioned_validated_receipts = set()
+        state.partitioned_receipt_evaluation = active[2]
     owned = getattr(state, "partitioned_validated_receipts", None)
     if owned is None:
         owned = set()
@@ -459,7 +462,6 @@ def partitioned_request_attention(
             state.dense_calls += 1
         mode = "dense_forced" if force_dense else "dense_warmup"
         fields = _completion_fields(
-            evaluation=evaluation,
             semantic_digest=semantic_digest,
             kind=kind,
             execution_mode=mode,
@@ -567,7 +569,6 @@ def partitioned_request_attention(
     route = PARTITIONED_MAPPED_ROUTE if mapped is not None else PARTITIONED_SOL_ROUTE
     mode = "sm120_mapped" if mapped is not None else "sm120_union"
     fields = _completion_fields(
-        evaluation=evaluation,
         semantic_digest=semantic_digest,
         kind=kind,
         execution_mode=mode,

@@ -20,7 +20,7 @@ from sol_h3.partitioned_request import (
     PARTITIONED_REQUEST_ABI,
     PARTITIONED_SOL_ROUTE,
 )
-from sol_h3.runtime import _REQUEST
+from sol_h3.runtime import _FORWARD, _REQUEST
 
 
 DIGEST = "a" * 64
@@ -43,7 +43,6 @@ def _fields(
 ):
     return (
         PARTITIONED_RECEIPT_TAG,
-        ("sol_h3_evaluation", 2),
         PARTITIONED_REQUEST_ABI,
         DIGEST,
         "local",
@@ -62,11 +61,15 @@ def _fields(
 
 
 def _owned(item):
-    state = SimpleNamespace(partitioned_validated_receipts={(item[1], item[3])})
+    state = SimpleNamespace(
+        partitioned_validated_receipts={(item[1], item[3])}, partitioned_receipt_evaluation=2,
+    )
     token = _REQUEST.set(state)
+    forward = _FORWARD.set((None, state, 2, None, []))
     try:
         return _accept_partitioned_receipt(item)
     finally:
+        _FORWARD.reset(forward)
         _REQUEST.reset(token)
 
 
@@ -167,6 +170,40 @@ def test_partitioned_receipt_requires_request_owned_completion():
         _REQUEST.reset(token)
 
 
+def test_partitioned_receipt_requires_completion_in_the_current_forward():
+    from sol_h3.partitioned_request import _record_completion
+
+    fields = _fields()
+    item = ("sol_h3", 3, PARTITIONED_DENSE_ROUTE, fields)
+    state = SimpleNamespace()
+    options = {"attention_backend_receipts_v1": []}
+    token = _REQUEST.set(state)
+    forward = _FORWARD.set((None, state, 2, None, []))
+    try:
+        assert not _accept_partitioned_receipt(item)
+        _record_completion(state, options, block_index=3, route=PARTITIONED_DENSE_ROUTE, fields=fields)
+        assert _accept_partitioned_receipt(item)
+        next_forward = _FORWARD.set((None, state, 3, None, []))
+        try:
+            assert not _accept_partitioned_receipt(item)
+            _record_completion(state, options, block_index=4, route=PARTITIONED_DENSE_ROUTE, fields=fields)
+            assert not _accept_partitioned_receipt(item)
+            assert state.partitioned_validated_receipts == {(4, fields)}
+            _record_completion(state, options, block_index=3, route=PARTITIONED_DENSE_ROUTE, fields=fields)
+            assert _accept_partitioned_receipt(item)
+            other_request = _REQUEST.set(SimpleNamespace())
+            try:
+                assert not _accept_partitioned_receipt(item)
+            finally:
+                _REQUEST.reset(other_request)
+        finally:
+            _FORWARD.reset(next_forward)
+    finally:
+        _FORWARD.reset(forward)
+        _REQUEST.reset(token)
+    assert not _accept_partitioned_receipt(item)
+
+
 def test_partitioned_sparse_receipt_rejects_measure_gap_after_sink():
     fields = _fields(
         route=PARTITIONED_SOL_ROUTE,
@@ -175,12 +212,7 @@ def test_partitioned_sparse_receipt_rejects_measure_gap_after_sink():
         kernel_contract="test-sm120-contract",
     )
     item = ("sol_h3", 3, PARTITIONED_SOL_ROUTE, fields)
-    state = SimpleNamespace(partitioned_validated_receipts={(3, fields)})
-    token = _REQUEST.set(state)
-    try:
-        assert not _accept_partitioned_receipt(item)
-    finally:
-        _REQUEST.reset(token)
+    assert not _owned(item)
 
 
 def test_owned_partitioned_mapped_receipt_requires_exact_map_proof():
@@ -196,14 +228,9 @@ def test_owned_partitioned_mapped_receipt_requires_exact_map_proof():
     assert _owned(item)
 
     tampered = list(fields)
-    tampered[12] = None
+    tampered[11] = None
     bad = ("sol_h3", 3, PARTITIONED_MAPPED_ROUTE, tuple(tampered))
-    state = SimpleNamespace(partitioned_validated_receipts={(3, tuple(tampered))})
-    token = _REQUEST.set(state)
-    try:
-        assert not _accept_partitioned_receipt(bad)
-    finally:
-        _REQUEST.reset(token)
+    assert not _owned(bad)
 
 
 def test_partitioned_history_requires_current_partitioned_layout_and_vdn_binding():
