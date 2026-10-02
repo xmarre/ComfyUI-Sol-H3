@@ -196,7 +196,15 @@ def _weighted_dense(
     kh = k.transpose(0, 1).unsqueeze(0)
     vh = v.transpose(0, 1).unsqueeze(0)
     mask = None if key_bias is None else key_bias.to(q.dtype).view(1, 1, 1, -1)
-    out = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask, scale=float(scale))
+    # Match VDN's native dense route. Raw F.sdpa ignores Core's explicit
+    # Flash/cuDNN/efficient priority, so continuation's dense prefix queries
+    # and its all-dense endpoint probe could select a different backend.
+    # Keep the restricted K/V union and any real measure bias unchanged.
+    try:
+        from comfy.ops import scaled_dot_product_attention as dense_attention
+    except ImportError:  # Standalone host oracles do not require ComfyUI.
+        dense_attention = F.scaled_dot_product_attention
+    out = dense_attention(qh, kh, vh, attn_mask=mask, scale=float(scale))
     return out.squeeze(0).transpose(0, 1).contiguous()
 
 
