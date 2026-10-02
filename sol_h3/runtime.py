@@ -108,6 +108,7 @@ class SamplingWrapper:
                         "external_mixed_weighted_measure_calls": state.external_mixed_weighted_measure_calls,
                         "external_mixed_weighted_measure_q_rows": state.external_mixed_weighted_measure_q_rows,
                         "external_mixed_weighted_measure_kv_rows": state.external_mixed_weighted_measure_kv_rows,
+                        "partitioned_unit_measure_calls": getattr(state, "partitioned_unit_measure_calls", 0),
                         "compatibility_fallbacks": dict(state.fallbacks),
                         "dense_provider_failures": dict(state.dense_provider_failures),
                         "vdn_local_sol_calls": state.vdn_local_sol_calls,
