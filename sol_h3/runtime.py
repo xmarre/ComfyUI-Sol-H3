@@ -181,7 +181,7 @@ def _shape_reason(q, k, v, heads, mask, kw, *, rectangular=False):
         return "head_geometry"
     if any(t.dtype != torch.bfloat16 or t.device != q.device for t in (q, k, v)):
         return "qkv_dtype_device"
-    if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) != (12, 0):
+    if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) not in ((12, 0), (12, 1)):
         return "device_not_sm120"
     if torch.is_grad_enabled() or torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         return "autograd_or_graph_capture"

@@ -91,8 +91,8 @@ def _validate_thd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         raise RuntimeError("partitioned Sol requires Q [Tq,H,128] and KV [Tkv,H,128]")
     if any(t.dtype != torch.bfloat16 or t.device != q.device for t in (q, k, v)):
         raise RuntimeError("partitioned Sol requires BF16 QKV on one device")
-    if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) != (12, 0):
-        raise RuntimeError("partitioned Sol currently requires SM120")
+    if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) not in ((12, 0), (12, 1)):
+        raise RuntimeError("partitioned Sol currently requires SM120/SM121")
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         raise RuntimeError("partitioned Sol requires a contiguous head dimension")
     if torch.is_grad_enabled() or torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
