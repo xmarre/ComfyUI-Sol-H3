@@ -1,4 +1,9 @@
+import copy
+import hashlib
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from sol_h3 import interop
 from sol_h3.partitioned_history import (
@@ -15,7 +20,7 @@ from sol_h3.partitioned_request import (
     PARTITIONED_REQUEST_ABI,
     PARTITIONED_SOL_ROUTE,
 )
-from sol_h3.runtime import _REQUEST
+from sol_h3.runtime import _FORWARD, _REQUEST
 
 
 DIGEST = "a" * 64
@@ -38,7 +43,6 @@ def _fields(
 ):
     return (
         PARTITIONED_RECEIPT_TAG,
-        ("sol_h3_evaluation", 2),
         PARTITIONED_REQUEST_ABI,
         DIGEST,
         "local",
@@ -57,11 +61,15 @@ def _fields(
 
 
 def _owned(item):
-    state = SimpleNamespace(partitioned_validated_receipts={(item[1], item[3])})
+    state = SimpleNamespace(
+        partitioned_validated_receipts={(item[1], item[3])}, partitioned_receipt_evaluation=2,
+    )
     token = _REQUEST.set(state)
+    forward = _FORWARD.set((None, state, 2, None, []))
     try:
         return _accept_partitioned_receipt(item)
     finally:
+        _FORWARD.reset(forward)
         _REQUEST.reset(token)
 
 
@@ -162,6 +170,40 @@ def test_partitioned_receipt_requires_request_owned_completion():
         _REQUEST.reset(token)
 
 
+def test_partitioned_receipt_requires_completion_in_the_current_forward():
+    from sol_h3.partitioned_request import _record_completion
+
+    fields = _fields()
+    item = ("sol_h3", 3, PARTITIONED_DENSE_ROUTE, fields)
+    state = SimpleNamespace()
+    options = {"attention_backend_receipts_v1": []}
+    token = _REQUEST.set(state)
+    forward = _FORWARD.set((None, state, 2, None, []))
+    try:
+        assert not _accept_partitioned_receipt(item)
+        _record_completion(state, options, block_index=3, route=PARTITIONED_DENSE_ROUTE, fields=fields)
+        assert _accept_partitioned_receipt(item)
+        next_forward = _FORWARD.set((None, state, 3, None, []))
+        try:
+            assert not _accept_partitioned_receipt(item)
+            _record_completion(state, options, block_index=4, route=PARTITIONED_DENSE_ROUTE, fields=fields)
+            assert not _accept_partitioned_receipt(item)
+            assert state.partitioned_validated_receipts == {(4, fields)}
+            _record_completion(state, options, block_index=3, route=PARTITIONED_DENSE_ROUTE, fields=fields)
+            assert _accept_partitioned_receipt(item)
+            other_request = _REQUEST.set(SimpleNamespace())
+            try:
+                assert not _accept_partitioned_receipt(item)
+            finally:
+                _REQUEST.reset(other_request)
+        finally:
+            _FORWARD.reset(next_forward)
+    finally:
+        _FORWARD.reset(forward)
+        _REQUEST.reset(token)
+    assert not _accept_partitioned_receipt(item)
+
+
 def test_partitioned_sparse_receipt_rejects_measure_gap_after_sink():
     fields = _fields(
         route=PARTITIONED_SOL_ROUTE,
@@ -170,12 +212,7 @@ def test_partitioned_sparse_receipt_rejects_measure_gap_after_sink():
         kernel_contract="test-sm120-contract",
     )
     item = ("sol_h3", 3, PARTITIONED_SOL_ROUTE, fields)
-    state = SimpleNamespace(partitioned_validated_receipts={(3, fields)})
-    token = _REQUEST.set(state)
-    try:
-        assert not _accept_partitioned_receipt(item)
-    finally:
-        _REQUEST.reset(token)
+    assert not _owned(item)
 
 
 def test_owned_partitioned_mapped_receipt_requires_exact_map_proof():
@@ -191,14 +228,9 @@ def test_owned_partitioned_mapped_receipt_requires_exact_map_proof():
     assert _owned(item)
 
     tampered = list(fields)
-    tampered[12] = None
+    tampered[11] = None
     bad = ("sol_h3", 3, PARTITIONED_MAPPED_ROUTE, tuple(tampered))
-    state = SimpleNamespace(partitioned_validated_receipts={(3, tuple(tampered))})
-    token = _REQUEST.set(state)
-    try:
-        assert not _accept_partitioned_receipt(bad)
-    finally:
-        _REQUEST.reset(token)
+    assert not _owned(bad)
 
 
 def test_partitioned_history_requires_current_partitioned_layout_and_vdn_binding():
@@ -234,3 +266,130 @@ def test_partitioned_history_recognizes_dedicated_flow_transformer_closure():
 
     patch.__module__ = "h3_flow_regenerate.partitioned_mixed"
     assert _partitioned_flow_replacement_identity(interop, patch, 0) is None
+
+
+def _same_grid_history_fixture():
+    # Canonical Flow v1 control: patch grid 4x6, latent grid 8x12.
+    contract = {
+        "api": 1,
+        "topology": "target_prefix_source_suffix",
+        "sequence_rows": 127,
+        "video_start": 7,
+        "temporal": 5,
+        "prefix_t": 2,
+        "source_grid_h": 4,
+        "source_grid_w": 6,
+        "target_grid_h": 4,
+        "target_grid_w": 6,
+        "source_rows_per_frame": 24,
+        "target_rows_per_frame": 24,
+        "prefix_range": [7, 55],
+        "suffix_range": [55, 127],
+        "prefix_log_key_measure": 0.0,
+        "nonvideo_log_key_measure": 0.0,
+        "suffix_log_key_measure": 0.0,
+        "exact_prefix_queries_preserved": True,
+        "generated_suffix_queries_preserved": True,
+        "heterogeneous_spatial_domains": False,
+    }
+    contract["semantic_digest"] = hashlib.sha256(
+        json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    options, layout = _partitioned_history_fixture()
+    options[PARTITIONED_FLOW_IDENTITY] = contract
+    external = options[VDN_EXTERNAL_SEQUENCE_KEY]
+    for name in ("sequence_rows", "source_rows_per_frame", "target_rows_per_frame"):
+        external[name] = contract[name]
+    external["flow_semantic_digest"] = contract["semantic_digest"]
+    layout.seq_len = 127
+    layout.segments[-1] = (7, 127, "video")
+    patch, previous = _flow_replacement_fixture()
+    values = interop._closure_values(patch)
+    plan = values["plan"]
+    plan.source_h, plan.source_w = 8, 12
+    plan.source_rows = plan.target_rows = 24
+    plan.prefix_rows, plan.partitioned_rows = 48, 120
+    plan.target_hw = (8, 12)
+    values["layout"].seq_len = 127
+    values["layout"].segments[-1] = (7, 127, "video")
+    values["partitioned_layout"].seq_len = 127
+    values["partitioned_layout"].segments[-1] = (7, 127, "video")
+    values["partition_contract"].clear()
+    values["partition_contract"].update(contract)
+    # The fixture closure has integer cells; the real Flow closure computes these.
+    values.update(video_end=127, carrier_prefix_rows=48)
+    return options, layout, patch, previous, values
+
+
+def test_same_grid_control_has_a_current_layout_history_identity():
+    options, layout, _patch, _previous, _values = _same_grid_history_fixture()
+    before = copy.deepcopy(options)
+    assert _partitioned_history_layout_valid(options, layout)
+    assert options == before
+
+
+def test_same_grid_control_replacement_identity_retains_geometry_and_inherited_owner():
+    options, _layout, patch, previous, values = _same_grid_history_fixture()
+    classifier = SimpleNamespace(_closure_values=lambda _patch: values)
+    resolved = _partitioned_flow_replacement_identity(classifier, patch, 0)
+    assert resolved is not None
+    identity, inherited = resolved
+    assert identity[1] == options[PARTITIONED_FLOW_IDENTITY]["semantic_digest"]
+    assert identity[2:10] == (127, 127, 7, 5, 2, 24, 24, (8, 12))
+    assert inherited is previous
+
+
+@pytest.mark.parametrize("name,value", [
+    ("api", 2),
+    ("topology", "foreign"),
+    ("source_grid_h", 3),
+    ("source_grid_w", 8),
+    ("target_grid_h", 6),
+    ("target_grid_w", 4),
+    ("source_grid_h", True),
+    ("source_grid_h", 4.0),
+    ("prefix_range", [7, 54]),
+    ("suffix_range", [54, 127]),
+    ("prefix_log_key_measure", -0.5),
+    ("nonvideo_log_key_measure", 1.0),
+    ("suffix_log_key_measure", 1.0),
+    ("exact_prefix_queries_preserved", False),
+    ("generated_suffix_queries_preserved", False),
+    ("heterogeneous_spatial_domains", True),
+    ("heterogeneous_spatial_domains", 0),
+    ("semantic_digest", "d" * 64),
+])
+def test_same_grid_control_rejects_noncanonical_geometry_measure_or_digest(name, value):
+    options, layout, patch, _previous, values = _same_grid_history_fixture()
+    options[PARTITIONED_FLOW_IDENTITY][name] = value
+    values["partition_contract"][name] = value
+    classifier = SimpleNamespace(_closure_values=lambda _patch: values)
+    assert not _partitioned_history_layout_valid(options, layout)
+    assert _partitioned_flow_replacement_identity(classifier, patch, 0) is None
+
+
+def test_same_grid_control_rejects_stale_layout_external_binding_and_closure_geometry():
+    options, layout, patch, _previous, values = _same_grid_history_fixture()
+    layout.seq_len -= 1
+    assert not _partitioned_history_layout_valid(options, layout)
+    layout.seq_len += 1
+    options[VDN_EXTERNAL_SEQUENCE_KEY]["flow_semantic_digest"] = "d" * 64
+    assert not _partitioned_history_layout_valid(options, layout)
+    values["plan"].source_h, values["plan"].source_w = 12, 8
+    classifier = SimpleNamespace(_closure_values=lambda _patch: values)
+    assert _partitioned_flow_replacement_identity(classifier, patch, 0) is None
+
+
+def test_equal_row_products_on_different_grids_remain_opaque_with_a_recomputed_digest():
+    options, layout, patch, _previous, values = _same_grid_history_fixture()
+    contract = options[PARTITIONED_FLOW_IDENTITY]
+    contract["target_grid_h"], contract["target_grid_w"] = 6, 4
+    payload = {name: value for name, value in contract.items() if name != "semantic_digest"}
+    contract["semantic_digest"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    options[VDN_EXTERNAL_SEQUENCE_KEY]["flow_semantic_digest"] = contract["semantic_digest"]
+    values["partition_contract"].update(contract)
+    classifier = SimpleNamespace(_closure_values=lambda _patch: values)
+    assert not _partitioned_history_layout_valid(options, layout)
+    assert _partitioned_flow_replacement_identity(classifier, patch, 0) is None
