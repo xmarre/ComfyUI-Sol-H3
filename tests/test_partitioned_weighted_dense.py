@@ -104,8 +104,8 @@ def test_weighted_dense_rechecks_requests_measure_range_and_layout(monkeypatch):
             _call(q, k, v, measure=-1.2)
             _call(q, k, v, prefix_range=(11, 80))
             # Preserve shape while changing projection strides.
-            padded = torch.empty((*q.shape[:-1], 256), dtype=q.dtype)
-            strided = padded[..., ::2]
+            padded = torch.empty((len(q), 4, 128), dtype=q.dtype)
+            strided = padded[:, ::2, :]
             strided.copy_(q)
             _call(strided, k, v)
         finally:
