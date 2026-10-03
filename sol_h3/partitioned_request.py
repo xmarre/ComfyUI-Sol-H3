@@ -38,6 +38,8 @@ PARTITIONED_RECEIPT_TAG = "sol_h3_partitioned_exact_prefix_v2"
 PARTITIONED_DENSE_ROUTE = "partitioned_dense"
 PARTITIONED_SOL_ROUTE = "partitioned_sol"
 PARTITIONED_MAPPED_ROUTE = "partitioned_sol_mapped"
+PARTITIONED_WEIGHTED_DENSE_CONTRACT = "sm120-weighted-all-selected-v1"
+MAX_WEIGHTED_DENSE_GATE_ENTRIES = 64
 MAX_BIAS_CACHE_ENTRIES = 64
 MAX_BIAS_CACHE_BYTES = 4 * 1024 * 1024
 BLOCK_SIZE = 64
@@ -318,6 +320,61 @@ def _sm120_union(
     return output[0]
 
 
+def _checked_weighted_dense(q, k, v, key_bias, *, state, scale, kind, numerical_identity):
+    """Execute weighted dense attention with every physical K/V block exact.
+
+    Nonzero key measure excludes SDPA FlashAttention. The existing weighted
+    SM120 union can select every key without changing the grouped domain or
+    splitting softmax normalization. Keep native SDPA as an independent oracle
+    once per request/layout/measure before publishing the new dense receipt.
+    """
+    # Native SDPA casts its FP32 metadata to the query dtype. Preserve that
+    # rounding in the kernel's FP32 bias input; sparse calls keep their original
+    # FP32 key measure. This small temporary belongs to the current CUDA stream.
+    dense_bias = key_bias.to(q.dtype).float()
+    layout_key = (
+        PARTITIONED_WEIGHTED_DENSE_CONTRACT,
+        numerical_identity,
+        str(q.device),
+        q.dtype,
+        tuple((tuple(t.shape), tuple(t.stride())) for t in (q, k, v)),
+        float(scale),
+    )
+    verified = getattr(state, "partitioned_weighted_dense_verified", None)
+    if verified is None:
+        verified = OrderedDict()
+        state.partitioned_weighted_dense_verified = verified
+    gate_started = time.perf_counter() if layout_key not in verified else None
+    result = _sm120_union(
+        q, k, v, tau=state.config.tau, scale=scale, sink_rows=int(k.shape[0]),
+        key_bias=dense_bias, mapped_neighbor_intervals=None,
+    )
+    if gate_started is not None:
+        reference = _weighted_dense(q, k, v, key_bias, scale=scale)
+        gate = error_metrics(result.transpose(0, 1).unsqueeze(0), reference.transpose(0, 1).unsqueeze(0))
+        gate_wall_s = time.perf_counter() - gate_started
+        if not arithmetic_gate_passes(gate):
+            raise RuntimeError(f"partitioned Sol weighted dense arithmetic gate failed: {gate}")
+        verified[layout_key] = None
+        if len(verified) > MAX_WEIGHTED_DENSE_GATE_ENTRIES:
+            verified.popitem(last=False)
+        state.gates.append({
+            "route": PARTITIONED_WEIGHTED_DENSE_CONTRACT,
+            "kind": kind,
+            "shape": [1, q.shape[1], q.shape[0], q.shape[2]],
+            "kv_shape": [1, k.shape[1], k.shape[0], k.shape[2]],
+            "all_keys_selected": True,
+            "key_measure_bias": True,
+            "bias_rounding": "native_query_dtype",
+            "gate_wall_s": gate_wall_s,
+            **gate,
+        })
+    verified.move_to_end(layout_key)
+    state.partitioned_weighted_dense_calls = getattr(state, "partitioned_weighted_dense_calls", 0) + 1
+    state.partitioned_weighted_dense_q_rows = getattr(state, "partitioned_weighted_dense_q_rows", 0) + int(q.shape[0])
+    return result
+
+
 def _descriptor_for_wire(
     state,
     wire,
@@ -472,11 +529,20 @@ def partitioned_request_attention(
     state.eligible_calls += 1
 
     if dense_execution:
-        result = _weighted_dense(q, k, v, key_bias, scale=scale)
+        kernel_contract = None
+        mode = "dense_forced" if force_dense else "dense_warmup"
+        if key_bias is None:
+            result = _weighted_dense(q, k, v, key_bias, scale=scale)
+        else:
+            result = _checked_weighted_dense(
+                q, k, v, key_bias, state=state, scale=scale, kind=kind,
+                numerical_identity=(semantic_digest, prefix_k_range, float(prefix_log_key_measure)),
+            )
+            kernel_contract = PARTITIONED_WEIGHTED_DENSE_CONTRACT
+            mode = "dense_sm120_forced" if force_dense else "dense_sm120_warmup"
         state.partitioned_dense_calls = getattr(state, "partitioned_dense_calls", 0) + 1
         if warmup:
             state.dense_calls += 1
-        mode = "dense_forced" if force_dense else "dense_warmup"
         fields = _completion_fields(
             semantic_digest=semantic_digest,
             kind=kind,
@@ -488,7 +554,7 @@ def partitioned_request_attention(
             prefix_log_key_measure=float(prefix_log_key_measure),
             validated=validated,
             descriptor=descriptor,
-            kernel_contract=None,
+            kernel_contract=kernel_contract,
         )
         _record_completion(
             state,

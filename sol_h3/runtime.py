@@ -111,6 +111,11 @@ class SamplingWrapper:
                         "partitioned_unit_measure_calls": getattr(state, "partitioned_unit_measure_calls", 0),
                         "partitioned_core_dense_calls": getattr(state, "partitioned_core_dense_calls", 0),
                         "partitioned_torch_dense_calls": getattr(state, "partitioned_torch_dense_calls", 0),
+                        "partitioned_weighted_dense_calls": getattr(state, "partitioned_weighted_dense_calls", 0),
+                        "partitioned_weighted_dense_q_rows": getattr(state, "partitioned_weighted_dense_q_rows", 0),
+                        "partitioned_weighted_dense_gate_entries": len(
+                            getattr(state, "partitioned_weighted_dense_verified", {})
+                        ),
                         "native_core_reference_calls": getattr(state, "native_core_reference_calls", 0),
                         "native_torch_reference_calls": getattr(state, "native_torch_reference_calls", 0),
                         "arithmetic_gate_wall_s": sum(gate.get("gate_wall_s", 0.0) for gate in state.gates),

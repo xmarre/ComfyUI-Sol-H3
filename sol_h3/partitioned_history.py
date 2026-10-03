@@ -273,6 +273,7 @@ def _accept_partitioned_receipt(item) -> bool:
         PARTITIONED_RECEIPT_TAG,
         PARTITIONED_REQUEST_ABI,
         PARTITIONED_SOL_ROUTE,
+        PARTITIONED_WEIGHTED_DENSE_CONTRACT,
     )
     from .runtime import _FORWARD, _REQUEST
 
@@ -348,7 +349,14 @@ def _accept_partitioned_receipt(item) -> bool:
             return False
 
     if route == PARTITIONED_DENSE_ROUTE:
-        if execution_mode not in {"dense_forced", "dense_warmup"} or kernel_contract is not None:
+        native_dense = execution_mode in {"dense_forced", "dense_warmup"} and kernel_contract is None
+        weighted_dense = (
+            execution_mode in {"dense_sm120_forced", "dense_sm120_warmup"}
+            and kernel_contract == PARTITIONED_WEIGHTED_DENSE_CONTRACT
+            and prefix_k_range is not None
+            and prefix_log_key_measure < 0.0
+        )
+        if not (native_dense or weighted_dense):
             return False
     elif route == PARTITIONED_MAPPED_ROUTE:
         if (
