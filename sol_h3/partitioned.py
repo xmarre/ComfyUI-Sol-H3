@@ -66,8 +66,8 @@ def _validate_partition_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
         raise TypeError("partitioned Sol requires BF16 QKV")
     if q.device.type != "cuda" or k.device != q.device or v.device != q.device:
         raise ValueError("partitioned Sol requires QKV on the same CUDA device")
-    if torch.cuda.get_device_capability(q.device) != (12, 0):
-        raise RuntimeError("partitioned Sol currently requires SM120")
+    if torch.cuda.get_device_capability(q.device) not in ((12, 0), (12, 1)):
+        raise RuntimeError("partitioned Sol currently requires SM120/SM121")
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         raise ValueError("partitioned Sol requires a contiguous head dimension")
     if torch.is_grad_enabled() or torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():

@@ -277,7 +277,7 @@ python -m pip install -r requirements.txt
 
 On Linux/WSL2, dependencies include PyTorch, Triton `>=3.6,<4`, NVIDIA CUTLASS DSL with the CUDA 13 extra, CUDA Python and Apache TVM FFI. No Sana checkout, `SOL_ROOT`, special `PYTHONPATH`, runtime source download or linker override is required. The custom-kernel runtime dependencies are intentionally not installed on native Windows.
 
-The validated and supported SOL/Exact custom-kernel target is **Linux/WSL2 on SM120**. Native Windows cannot currently execute the required NVIDIA CuTe DSL backend; SOL falls back locally to inherited dense attention and Exact Runtime delegates to native H3. See [Native Windows status](docs/WINDOWS.md).
+The validated and supported SOL/Exact custom-kernel target is **Linux/WSL2 on SM120 and SM121** (SM121 selects the `cute_sm120` kernel). Native Windows cannot currently execute the required NVIDIA CuTe DSL backend; SOL falls back locally to inherited dense attention and Exact Runtime delegates to native H3. See [Native Windows status](docs/WINDOWS.md).
 
 ## SageAttention on Blackwell
 

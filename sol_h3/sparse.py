@@ -33,8 +33,9 @@ def _sink_blocks(start, tokens, rows):
 def load_kernel(device):
     """Load the verified node-local public API; SM120 requires its CuTe backend."""
     from .provenance import verify_source
-    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 0):
-        raise RuntimeError("This experimental SOL integration currently targets single-GPU SM120 only")
+    cap = torch.cuda.get_device_capability(device) if device.type == "cuda" else None
+    if cap not in ((12, 0), (12, 1)):
+        raise RuntimeError("This experimental SOL integration currently targets single-GPU SM120/SM121 only")
     try:
         verify_source()
         from ._vendor.sol_attn import get_sol_attn_backend, sol_attn

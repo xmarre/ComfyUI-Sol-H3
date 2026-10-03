@@ -1,0 +1,22 @@
+diff --git a/sol_h3/_vendor/sol_attn/interface.py b/sol_h3/_vendor/sol_attn/interface.py
+index e63156d..7b54046 100644
+--- a/sol_h3/_vendor/sol_attn/interface.py
++++ b/sol_h3/_vendor/sol_attn/interface.py
+@@ -20,6 +20,8 @@ _CUTE_BACKENDS = {
+     # this table silently selected the much slower Triton reference backend.
+     (10, 3): "cute_sm100",
+     (12, 0): "cute_sm120",
++    # GB10 / DGX Spark reports SM121. Same Blackwell tcgen05 path as SM120.
++    (12, 1): "cute_sm120",
+ }
+ _compiled = {}
+ _compile_lock = threading.Lock()
+@@ -249,7 +251,7 @@ def _sol_attn_cute(
+ 
+     batch, capacity_tokens, heads, _ = q.shape
+     tokens = capacity_tokens if valid_tokens is None else int(valid_tokens)
+-    kv_tokens = k.shape[1] if arch == (12, 0) else tokens
++    kv_tokens = k.shape[1] if arch in ((12, 0), (12, 1)) else tokens
+     valid_blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+ 
+     with torch.cuda.device(q.device):
