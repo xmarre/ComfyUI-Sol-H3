@@ -66,7 +66,9 @@ def test_public_api():
         'sink_tokens', 'sink_start', 'compile_bucket_size', 'key_bias',
         'mapped_neighbor_intervals')
     assert interface._backend_for_arch((12, 0), cute_available=True) == 'cute_sm120'
+    assert interface._backend_for_arch((12, 1), cute_available=True) == 'cute_sm120'
     assert interface._backend_for_arch((12, 0), cute_available=False) == 'triton'
+    assert interface._backend_for_arch((12, 1), cute_available=False) == 'triton'
     assert interface._backend_for_arch((10, 3), cute_available=True) == 'cute_sm100'
 
 
