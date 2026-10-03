@@ -66,6 +66,9 @@ class Request:
     gates: list = field(default_factory=list)
     kernel: object = None
     kernel_device: object = None
+    partitioned_kernel_compile_calls: int = 0
+    partitioned_kernel_compile_cache_hits: int = 0
+    partitioned_kernel_compile_wall_s: float = 0.0
     partitioned_source_verification_calls: int = 0
     partitioned_source_verification_wall_s: float = 0.0
     _partitioned_source_identity: tuple | None = field(default=None, repr=False, compare=False)
@@ -124,6 +127,9 @@ class SamplingWrapper:
                         "partitioned_source_tree_verified": state._partitioned_source_identity is not None,
                         "partitioned_source_verification_calls": state.partitioned_source_verification_calls,
                         "partitioned_source_verification_wall_s": state.partitioned_source_verification_wall_s,
+                        "partitioned_kernel_compile_calls": state.partitioned_kernel_compile_calls,
+                        "partitioned_kernel_compile_cache_hits": state.partitioned_kernel_compile_cache_hits,
+                        "partitioned_kernel_compile_wall_s": state.partitioned_kernel_compile_wall_s,
                         "native_core_reference_calls": getattr(state, "native_core_reference_calls", 0),
                         "native_torch_reference_calls": getattr(state, "native_torch_reference_calls", 0),
                         "arithmetic_gate_wall_s": sum(gate.get("gate_wall_s", 0.0) for gate in state.gates),

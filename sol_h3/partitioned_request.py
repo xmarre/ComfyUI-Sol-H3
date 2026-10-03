@@ -248,6 +248,20 @@ def _verify_partitioned_source() -> None:
         state._partitioned_source_identity = identity
 
 
+def _dynamic_tensor_abi(tensor: torch.Tensor) -> tuple:
+    """Static parts of the packaged leading-last dynamic CuTe tensor type.
+
+    mark_layout_dynamic makes all extents and positive non-leading strides
+    runtime values. Rank, element type, leading unit stride and broadcast
+    strides remain part of the compiled type. Keep every argument's ABI, not
+    only Q/K/V, and leave physical-layout arithmetic qualification separate.
+    """
+    strides = tuple(int(value) for value in tensor.stride())
+    if not strides or strides[-1] != 1:
+        raise RuntimeError("partitioned Sol CuTe arguments require a leading-last unit stride")
+    return (tensor.ndim, tensor.dtype, tuple(value == 0 for value in strides))
+
+
 def _sm120_union(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -313,38 +327,54 @@ def _sm120_union(
         key_bias_arg = key_bias if key_bias is not None else threshold
         mapped_arg = mapped_neighbor_intervals if mapped_neighbor_intervals is not None else threshold
         tensors = [qb, kb, vb, output, kc, vc, threshold, key_bias_arg, mapped_arg, lse]
-        layout_key = tuple(tuple(int(value) for value in tensor.stride()) for tensor in (qb, kb, vb))
+        # The packaged converter marks all argument shapes/positive strides
+        # dynamic. Keying their concrete values recompiles the same machine
+        # function for every rectangular VDN subcall and new chunk length.
+        # Arithmetic gates still key the full physical geometry and measure.
         key = (
             PARTITIONED_REQUEST_ABI,
+            "dynamic_layout_v1",
             q.device.index,
             arch,
             batch,
-            q_rows,
-            kv_rows,
             heads,
-            layout_key,
+            tuple(_dynamic_tensor_abi(tensor) for tensor in tensors),
             key_bias is not None,
             mapped_neighbor_intervals is not None,
         )
+        from .runtime import _REQUEST
+
+        state = _REQUEST.get()
         compiled = interface._compiled.get(key)
         if compiled is None:
             with interface._compile_lock:
                 compiled = interface._compiled.get(key)
                 if compiled is None:
-                    compiled, args = interface._compile_sm120(
-                        key,
-                        tensors,
-                        float(scale),
-                        sink_start_block,
-                        sink_end_block,
-                        stream,
-                        key_bias is not None,
-                        mapped_neighbor_intervals is not None,
-                    )
+                    started = time.perf_counter()
+                    if state is not None:
+                        state.partitioned_kernel_compile_calls += 1
+                    try:
+                        compiled, args = interface._compile_sm120(
+                            key,
+                            tensors,
+                            float(scale),
+                            sink_start_block,
+                            sink_end_block,
+                            stream,
+                            key_bias is not None,
+                            mapped_neighbor_intervals is not None,
+                        )
+                    finally:
+                        if state is not None:
+                            state.partitioned_kernel_compile_wall_s += time.perf_counter() - started
                 else:
                     args = interface._to_cute_tensors(tensors)
+                    if state is not None:
+                        state.partitioned_kernel_compile_cache_hits += 1
         else:
             args = interface._to_cute_tensors(tensors)
+            if state is not None:
+                state.partitioned_kernel_compile_cache_hits += 1
         compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
     return output[0]
 
