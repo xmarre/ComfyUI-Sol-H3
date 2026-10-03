@@ -38,3 +38,8 @@ These source receipts do not qualify GPU output or speed. Device, shape,
 strides, key measure and numerical ownership retain their independent checks.
 Weighted dense and sparse arithmetic gates, completion receipts, attention
 operations and numerical forecasting identities are unchanged.
+
+Independent diagnostic PR overlays may add their own request fields and final
+receipts. Source trust remains a separate owner in the composed runtime. CI
+checks both Patcher's sequential merge preflight and declared-base delta
+application, then runs source ownership and runtime tests on the combined tree.

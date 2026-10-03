@@ -8,6 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
@@ -26,6 +27,15 @@ jobs:
       - run: python -m pytest -q
         env:
           SANA_PATH: ${{ github.workspace }}/_deps/Sana
+      - name: Validate optional runtime-diagnostic overlay composition
+        run: |
+          python tools/check_overlay_compatibility.py \
+            --base bef9b300275a89290ca2d53eafff79af06f5e0ef \
+            --overlay b699b68044268c071369fe1078d8a5607177c3d0 \
+            --tests tests/test_runtime_diagnostics.py \
+              tests/test_partitioned_source_verification.py \
+              tests/test_partitioned_dense_dispatch.py \
+              tests/test_weighted_runtime.py tests/test_runtime.py
   windows-provenance:
     runs-on: windows-latest
     steps:

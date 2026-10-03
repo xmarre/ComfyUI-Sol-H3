@@ -66,14 +66,14 @@ class Request:
     gates: list = field(default_factory=list)
     kernel: object = None
     kernel_device: object = None
-    native_verified: bool = False
-    native_reason: str | None = None
-    last_routes: tuple | None = None
-    backend_transitions: int = 0
     partitioned_source_verification_calls: int = 0
     partitioned_source_verification_wall_s: float = 0.0
     _partitioned_source_identity: tuple | None = field(default=None, repr=False, compare=False)
     _partitioned_source_verification_lock: object = field(default_factory=Lock, repr=False, compare=False)
+    native_verified: bool = False
+    native_reason: str | None = None
+    last_routes: tuple | None = None
+    backend_transitions: int = 0
 
 
 @dataclass(frozen=True)

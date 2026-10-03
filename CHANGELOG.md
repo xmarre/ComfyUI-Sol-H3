@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Preserves source-validation ownership when composed with an earlier runtime-diagnostic PR overlay. CI checks both sequential merge preflight and declared-base delta application, then exercises the composed runtime.
 - Shares packaged-source verification within each partitioned sampling request instead of scanning the source tree on every attention invocation. New requests and changed source identities require a fresh successful check; standalone checks remain uncached.
 - Reports partitioned source-verification calls, wall time and verified status separately from kernel arithmetic gates. Kernel arithmetic, bias, dispatch, completion and forecasting identities remain unchanged.
 - Recognizes Flow's canonical equal-grid exact-prefix control in Spectrum backend history, with geometry, zero-measure, semantic-digest and inherited-owner validation.
