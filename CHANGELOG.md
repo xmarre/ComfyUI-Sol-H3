@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Preserves source-validation ownership when composed with an earlier runtime-diagnostic PR overlay. CI checks both sequential merge preflight and declared-base delta application, then exercises the composed runtime.
+- Shares packaged-source verification within each partitioned sampling request instead of scanning the source tree on every attention invocation. New requests and changed source identities require a fresh successful check; standalone checks remain uncached.
+- Reports partitioned source-verification calls, wall time and verified status separately from kernel arithmetic gates. Kernel arithmetic, bias, dispatch, completion and forecasting identities remain unchanged.
+- Recognizes Flow's canonical equal-grid exact-prefix control in Spectrum backend history, with geometry, zero-measure, semantic-digest and inherited-owner validation.
+- Keeps stale or malformed contracts opaque and preserves request-owned attention completion receipts, dense warmup and numerical-backend transitions.
+- Restores forecast eligibility for that control; GPU timing and rendered audiovisual quality require runtime qualification.
+- Omits the attention-mask allocation for validated unit prefix measure while retaining prefix and completion metadata. Dense partitioned attention can then use PyTorch's unmasked CUDA kernels; nonzero measures retain their additive bias.
+- Reports validated `partitioned_unit_measure_calls` in sampling receipts. CPU dense-oracle equivalence does not establish identical GPU rounding, speed or generated output.
+
 ## v0.1.6 — 2026-09-22
 
 - Completes the production Sol-H3 side of the heterogeneous exact-prefix progressive stack.

@@ -8,6 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
@@ -26,6 +27,15 @@ jobs:
       - run: python -m pytest -q
         env:
           SANA_PATH: ${{ github.workspace }}/_deps/Sana
+      - name: Validate optional runtime-diagnostic overlay composition
+        run: |
+          python tools/check_overlay_compatibility.py \
+            --base bef9b300275a89290ca2d53eafff79af06f5e0ef \
+            --overlay b699b68044268c071369fe1078d8a5607177c3d0 \
+            --tests tests/test_runtime_diagnostics.py \
+              tests/test_partitioned_source_verification.py \
+              tests/test_partitioned_dense_dispatch.py \
+              tests/test_weighted_runtime.py tests/test_runtime.py
   windows-provenance:
     runs-on: windows-latest
     steps:
@@ -92,6 +102,12 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: 4d721496effc91e2934cdf8863ecb2216accfadc
+          path: _deps/FlowPartitioned
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
           repository: xmarre/ComfyUI-VDN-H3-Plus
           ref: 333d63f81d33fe29dc1f1f637c5f4a4396880f99
           path: _deps/VDN
@@ -102,7 +118,7 @@ jobs:
       - run: pip install torch==2.10.0+cpu torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
       - run: pip install -r _deps/ComfyUI/requirements.txt
       - run: pip install -e '.[test]'
-      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py tests/test_real_diffaid_stack.py tests/test_flow_mixed_history.py tests/test_flow_mixed_measure_contract.py tests/test_weighted_measure_routes.py tests/test_flow_weighted_measure_contract.py tests/test_mapped_neighbor_probe.py tests/test_mapped_neighbor_probe_runner.py
+      - run: python -m pytest -q tests/test_sana_contract.py tests/test_real_comfy_interop.py tests/test_spectrum_stack.py tests/test_partitioned_forecast_history.py tests/test_real_diffaid_stack.py tests/test_flow_mixed_history.py tests/test_flow_mixed_measure_contract.py tests/test_weighted_measure_routes.py tests/test_flow_weighted_measure_contract.py tests/test_mapped_neighbor_probe.py tests/test_mapped_neighbor_probe_runner.py
         env:
           COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
           KJNODES_PATH: ${{ github.workspace }}/_deps/KJNodes
@@ -111,3 +127,8 @@ jobs:
           DIFFAID_PATH: ${{ github.workspace }}/_deps/DiffAid
           FLOW_PATH: ${{ github.workspace }}/_deps/Flow
           VDN_PATH: ${{ github.workspace }}/_deps/VDN
+      - name: Validate current partitioned Flow history
+        run: python -m pytest -q tests/test_real_partitioned_history.py
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
+          FLOW_PATH: ${{ github.workspace }}/_deps/FlowPartitioned
