@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.7 — 2026-10-03
+
+- Adds Linux/WSL2 SM121 / GB10 support through the existing packaged `cute_sm120` CuTe backend.
+- Maps compute capability `(12, 1)` to `cute_sm120` without spoofing `torch.cuda.get_device_capability()`.
+- Opens the SOL loader, runtime and partitioned capability gates for SM121 and uses rectangular K/V sizing on both SM120 and SM121.
+- Preserves the pinned Sana vendoring and fail-closed source-provenance contract by packaging the SM121 mapping as a reviewed patch and updating the manifest identities.
+- Includes real-GB10 execution evidence from PR #38 plus green hosted dispatch/provenance/interoperability CI.
+- Does not include the still-open #35 diagnostic or #37 continuation-performance overlay; those remain separate maintainer overlays.
+
 ## v0.1.6 — 2026-09-22
 
 - Completes the production Sol-H3 side of the heterogeneous exact-prefix progressive stack.

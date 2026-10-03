@@ -1,3 +1,34 @@
+# ComfyUI-Sol-H3 v0.1.7
+
+v0.1.7 releases the SM121 / NVIDIA GB10 support implemented by [PR #38](https://github.com/xmarre/ComfyUI-Sol-H3/pull/38) and requested by [issue #10](https://github.com/xmarre/ComfyUI-Sol-H3/issues/10).
+
+## SM121 execution support
+
+Compute capability `(12, 1)` now selects the existing packaged Sana `cute_sm120` CuTe backend, matching the SM120-family implementation path without falsifying the device capability reported by PyTorch. The production gates are opened consistently in the SOL loader, ordinary runtime shape checks, partitioned execution, and rectangular K/V sizing.
+
+The change remains inside the existing vendored-source contract: the backend mapping is packaged as a reviewed Sana patch, the manifest/provenance identities are updated, and source verification continues to fail closed rather than accepting an untracked runtime substitution.
+
+## Validation
+
+PR #38 supplied direct GB10 execution evidence:
+
+- a BF16 `1×64×4×128` `load_kernel` call selected `cute_sm120` and returned finite output;
+- a 64×64 / five-frame Comfy prompt recorded `sol_backend=cute_sm120` and `sparse_calls=100`.
+
+The implementation head also passed the repository CPU/provenance/interoperability workflow before merge, including the public API contract for `(12, 1) -> cute_sm120`. The merged main commit passed the same hosted workflow before this release metadata commit.
+
+This establishes functional SM121 admission and real-GB10 execution. It does **not** establish an independent maintainer GB10 benchmark, a universal speed claim, or exact SM120/SM121 performance parity.
+
+## Scope and compatibility
+
+- Supported custom-kernel execution targets are Linux/WSL2 on SM120 and SM121.
+- Native Windows behavior is unchanged: SOL and Exact Runtime continue to fail closed to their native/inherited paths.
+- Existing SM120 behavior and the `cute_sm120` kernel contract are unchanged.
+- The still-open Sol #35 diagnostic and Sol #37 continuation-performance overlay are **not** part of v0.1.7; they remain separate maintainer overlays rebased on this release line.
+
+
+---
+
 # ComfyUI-Sol-H3 v0.1.6
 
 Coordinated production release with [ComfyUI-VDN-H3-Plus v1.5.6](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.6), [MiniMax H3 Flow-Aligned Regenerate v0.3.6](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.6), and [H3 Continuum v3.4.4](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.4). [Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28) remains the unchanged Spectrum companion.

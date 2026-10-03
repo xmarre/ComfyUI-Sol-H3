@@ -2,17 +2,25 @@
 
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
-**v0.1.3** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported SM120 Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
+**v0.1.7** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported **SM120 and SM121** Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
 
 The release has three parts:
 
 - **Exact Runtime** — exact native H3 affine/runtime optimizations.
-- **Rectangular SOL** — Sana/CuTe SM120 attention with independent query and K/V lengths.
+- **Rectangular SOL** — Sana/CuTe `cute_sm120` attention on SM120/SM121 with independent query and K/V lengths.
 - **Composable interoperability** — inherited dense providers, VDN grouped attention, Spectrum backend history, Untwist preprocessing, Diff-Aid and Flow mixed-grid routing can coexist when their ownership contracts are coherent.
 
 Unvalidated combinations are experimental telemetry rather than blanket errors. Hard failures are reserved for broken contracts, unsafe geometry/indexing, failed arithmetic verification or real execution failures.
 
 > **Native Windows:** the current custom SOL and Exact Runtime kernel paths are not supported execution targets. SOL delegates to inherited dense attention and Exact Runtime delegates to native H3, so the nodes can remain in a workflow but no Sol-H3 custom kernel executes. Use Linux/WSL2 on supported hardware for custom-kernel acceleration. See [Native Windows status](docs/WINDOWS.md).
+
+## v0.1.7: SM121 / GB10 support
+
+v0.1.7 adds Linux/WSL2 execution support for compute capability **(12, 1)** devices such as NVIDIA GB10 / DGX Spark. SM121 is mapped to the existing packaged `cute_sm120` CuTe backend; the reported CUDA capability is **not** rewritten or spoofed.
+
+The SM121 admission is applied consistently across backend selection, the SOL loader, ordinary runtime shape checks, partitioned execution, and rectangular K/V token sizing. The vendored Sana patch stack and manifest/provenance hashes include the change, so source verification remains fail-closed.
+
+PR [#38](https://github.com/xmarre/ComfyUI-Sol-H3/pull/38) supplied real-GB10 execution evidence: a BF16 `1×64×4×128` kernel call returned `cute_sm120` with finite output, and a small Comfy prompt recorded `sol_backend=cute_sm120` with `sparse_calls=100`. Hosted CI independently covers dispatch, provenance and interoperability contracts. This release does not claim an independent maintainer GB10 benchmark or SM120/SM121 performance equivalence.
 
 ## v0.1.3 default: one dense trajectory evaluation
 
@@ -69,7 +77,7 @@ Apply MODEL patches and then apply **Sol-H3 SOL Attention (Experimental)** befor
 
 The SOL node defaults to `tau=1.0`, `dense_evaluations=1`, and `dense_layers=2`. `dense_evaluations` is a trajectory-level dense warmup; `dense_layers` is a per-evaluation leading-layer dense policy. They are not interchangeable. Set `dense_evaluations=0` only when explicitly choosing the faster SOL-first trajectory and accepting the documented startup-continuity risk.
 
-On native Windows, the node can remain in the workflow but both custom-kernel paths fail closed: SOL delegates to inherited dense attention because CuTe is unavailable, and Exact Runtime records `exact:native_windows_unvalidated` then executes the untouched native H3 block. Linux/WSL2 behavior is unchanged.
+On native Windows, the node can remain in the workflow but both custom-kernel paths fail closed: SOL delegates to inherited dense attention because CuTe is unavailable, and Exact Runtime records `exact:native_windows_unvalidated` then executes the untouched native H3 block. Linux/WSL2 supports the SM120 and SM121 targets described above.
 
 Supported composition includes Exact -> SOL, SOL -> Exact and repeated identical applications. Different SOL policies on the same MODEL branch are ambiguous and require separate branches.
 
@@ -169,7 +177,7 @@ Untwist preprocessing remains exactly once. Receipt/provider transitions still r
 
 ## SOL kernel contract
 
-The packaged SM120 implementation supports rectangular BTHD attention:
+The packaged `cute_sm120` implementation is the supported SM120/SM121 path and supports rectangular BTHD attention:
 
 ```text
 Q:   [B, Tq,  H, 128]
@@ -329,7 +337,7 @@ A successful run with zero sparse calls is valid execution telemetry but is not 
 
 ## Release notes
 
-See [CHANGELOG.md](CHANGELOG.md) for the v0.1.3 release summary and validation boundaries.
+See [CHANGELOG.md](CHANGELOG.md) and [RELEASE_NOTES.md](RELEASE_NOTES.md) for the current v0.1.7 release scope, validation evidence, and historical release notes.
 
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 
