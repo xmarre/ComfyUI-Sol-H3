@@ -18,6 +18,7 @@ from collections import OrderedDict
 import hashlib
 import json
 import math
+import time
 from typing import Any
 
 import torch
@@ -33,10 +34,12 @@ from .mapped_neighbors import (
 from .sparse import arithmetic_gate_passes, error_metrics
 
 PARTITIONED_REQUEST_ABI = "sol-h3-partitioned-single-union-v1"
-PARTITIONED_RECEIPT_TAG = "sol_h3_partitioned_exact_prefix_v1"
+PARTITIONED_RECEIPT_TAG = "sol_h3_partitioned_exact_prefix_v2"
 PARTITIONED_DENSE_ROUTE = "partitioned_dense"
 PARTITIONED_SOL_ROUTE = "partitioned_sol"
 PARTITIONED_MAPPED_ROUTE = "partitioned_sol_mapped"
+PARTITIONED_WEIGHTED_DENSE_CONTRACT = "sm120-weighted-all-selected-v1"
+MAX_WEIGHTED_DENSE_GATE_ENTRIES = 64
 MAX_BIAS_CACHE_ENTRIES = 64
 MAX_BIAS_CACHE_BYTES = 4 * 1024 * 1024
 BLOCK_SIZE = 64
@@ -138,6 +141,13 @@ def _key_bias(
     if not _digest(semantic_digest):
         raise RuntimeError("partitioned Sol semantic digest is invalid")
 
+    # Unit measure adds zero to every score. A non-null zero mask would still
+    # exclude PyTorch's CUDA FlashAttention route; preserve the validated
+    # prefix metadata in the receipt without allocating or passing that mask.
+    if log_measure == 0.0:
+        state.partitioned_unit_measure_calls = getattr(state, "partitioned_unit_measure_calls", 0) + 1
+        return None
+
     cache = _bias_cache(state)
     key = (
         PARTITIONED_REQUEST_ABI,
@@ -189,8 +199,53 @@ def _weighted_dense(
     kh = k.transpose(0, 1).unsqueeze(0)
     vh = v.transpose(0, 1).unsqueeze(0)
     mask = None if key_bias is None else key_bias.to(q.dtype).view(1, 1, 1, -1)
-    out = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask, scale=float(scale))
+    # Match VDN's native dense route. Raw F.sdpa ignores Core's explicit
+    # Flash/cuDNN/efficient priority, so continuation's dense prefix queries
+    # and its all-dense endpoint probe could select a different backend.
+    # Keep the restricted K/V union and any real measure bias unchanged.
+    try:
+        from comfy.ops import scaled_dot_product_attention as dense_attention
+        counter = "partitioned_core_dense_calls"
+    except ImportError:  # Standalone host oracles do not require ComfyUI.
+        dense_attention = F.scaled_dot_product_attention
+        counter = "partitioned_torch_dense_calls"
+    out = dense_attention(qh, kh, vh, attn_mask=mask, scale=float(scale))
+    from .runtime import _REQUEST
+
+    state = _REQUEST.get()
+    if state is not None:
+        setattr(state, counter, getattr(state, counter, 0) + 1)
     return out.squeeze(0).transpose(0, 1).contiguous()
+
+
+def _verify_partitioned_source() -> None:
+    """Verify the immutable packaged source once per native sampling request.
+
+    Keep explicit standalone checks uncached. Request ownership prevents trust
+    surviving another sampler or a failed replacement of the source identity.
+    Device/layout arithmetic validation remains separate from source trust.
+    """
+    from .provenance import CONTRACT, REVISION, SOURCE, verify_source
+    from .runtime import _REQUEST
+
+    state = _REQUEST.get()
+    if state is None:
+        verify_source()
+        return
+    identity = (SOURCE, REVISION, CONTRACT, verify_source)
+    if state._partitioned_source_identity == identity:
+        return
+    with state._partitioned_source_verification_lock:
+        if state._partitioned_source_identity == identity:
+            return
+        state._partitioned_source_identity = None
+        started = time.perf_counter()
+        state.partitioned_source_verification_calls += 1
+        try:
+            verify_source()
+        finally:
+            state.partitioned_source_verification_wall_s += time.perf_counter() - started
+        state._partitioned_source_identity = identity
 
 
 def _sm120_union(
@@ -205,11 +260,10 @@ def _sm120_union(
     mapped_neighbor_intervals: torch.Tensor | None,
 ) -> torch.Tensor:
     """Execute one SM120 sparse attention union with optional bias + mapped metadata."""
-    from .provenance import verify_source
     from ._vendor.sol_attn import interface
     from ._vendor.sol_attn.preprocess import prepare
 
-    verify_source()
+    _verify_partitioned_source()
     qb = q.unsqueeze(0)
     kb = k.unsqueeze(0)
     vb = v.unsqueeze(0)
@@ -295,6 +349,61 @@ def _sm120_union(
     return output[0]
 
 
+def _checked_weighted_dense(q, k, v, key_bias, *, state, scale, kind, numerical_identity):
+    """Execute weighted dense attention with every physical K/V block exact.
+
+    Nonzero key measure excludes SDPA FlashAttention. The existing weighted
+    SM120 union can select every key without changing the grouped domain or
+    splitting softmax normalization. Keep native SDPA as an independent oracle
+    once per request/layout/measure before publishing the new dense receipt.
+    """
+    # Native SDPA casts its FP32 metadata to the query dtype. Preserve that
+    # rounding in the kernel's FP32 bias input; sparse calls keep their original
+    # FP32 key measure. This small temporary belongs to the current CUDA stream.
+    dense_bias = key_bias.to(q.dtype).float()
+    layout_key = (
+        PARTITIONED_WEIGHTED_DENSE_CONTRACT,
+        numerical_identity,
+        str(q.device),
+        q.dtype,
+        tuple((tuple(t.shape), tuple(t.stride())) for t in (q, k, v)),
+        float(scale),
+    )
+    verified = getattr(state, "partitioned_weighted_dense_verified", None)
+    if verified is None:
+        verified = OrderedDict()
+        state.partitioned_weighted_dense_verified = verified
+    gate_started = time.perf_counter() if layout_key not in verified else None
+    result = _sm120_union(
+        q, k, v, tau=state.config.tau, scale=scale, sink_rows=int(k.shape[0]),
+        key_bias=dense_bias, mapped_neighbor_intervals=None,
+    )
+    if gate_started is not None:
+        reference = _weighted_dense(q, k, v, key_bias, scale=scale)
+        gate = error_metrics(result.transpose(0, 1).unsqueeze(0), reference.transpose(0, 1).unsqueeze(0))
+        gate_wall_s = time.perf_counter() - gate_started
+        if not arithmetic_gate_passes(gate):
+            raise RuntimeError(f"partitioned Sol weighted dense arithmetic gate failed: {gate}")
+        verified[layout_key] = None
+        if len(verified) > MAX_WEIGHTED_DENSE_GATE_ENTRIES:
+            verified.popitem(last=False)
+        state.gates.append({
+            "route": PARTITIONED_WEIGHTED_DENSE_CONTRACT,
+            "kind": kind,
+            "shape": [1, q.shape[1], q.shape[0], q.shape[2]],
+            "kv_shape": [1, k.shape[1], k.shape[0], k.shape[2]],
+            "all_keys_selected": True,
+            "key_measure_bias": True,
+            "bias_rounding": "native_query_dtype",
+            "gate_wall_s": gate_wall_s,
+            **gate,
+        })
+    verified.move_to_end(layout_key)
+    state.partitioned_weighted_dense_calls = getattr(state, "partitioned_weighted_dense_calls", 0) + 1
+    state.partitioned_weighted_dense_q_rows = getattr(state, "partitioned_weighted_dense_q_rows", 0) + int(q.shape[0])
+    return result
+
+
 def _descriptor_for_wire(
     state,
     wire,
@@ -320,7 +429,6 @@ def _descriptor_for_wire(
 
 def _completion_fields(
     *,
-    evaluation: int,
     semantic_digest: str,
     kind: str,
     execution_mode: str,
@@ -335,7 +443,6 @@ def _completion_fields(
 ):
     return (
         PARTITIONED_RECEIPT_TAG,
-        ("sol_h3_evaluation", int(evaluation)),
         PARTITIONED_REQUEST_ABI,
         semantic_digest,
         kind,
@@ -366,6 +473,11 @@ def _record_completion(
         raise RuntimeError("partitioned Sol request ownership changed during an H3 block")
     routes = active[4]
     routes.append((block_index, route))
+    # Spectrum compares receipts as numerical identities. Keep per-evaluation
+    # completion proof on the request, outside the stable published fields.
+    if getattr(state, "partitioned_receipt_evaluation", None) != active[2]:
+        state.partitioned_validated_receipts = set()
+        state.partitioned_receipt_evaluation = active[2]
     owned = getattr(state, "partitioned_validated_receipts", None)
     if owned is None:
         owned = set()
@@ -446,13 +558,21 @@ def partitioned_request_attention(
     state.eligible_calls += 1
 
     if dense_execution:
-        result = _weighted_dense(q, k, v, key_bias, scale=scale)
+        kernel_contract = None
+        mode = "dense_forced" if force_dense else "dense_warmup"
+        if key_bias is None:
+            result = _weighted_dense(q, k, v, key_bias, scale=scale)
+        else:
+            result = _checked_weighted_dense(
+                q, k, v, key_bias, state=state, scale=scale, kind=kind,
+                numerical_identity=(semantic_digest, prefix_k_range, float(prefix_log_key_measure)),
+            )
+            kernel_contract = PARTITIONED_WEIGHTED_DENSE_CONTRACT
+            mode = "dense_sm120_forced" if force_dense else "dense_sm120_warmup"
         state.partitioned_dense_calls = getattr(state, "partitioned_dense_calls", 0) + 1
         if warmup:
             state.dense_calls += 1
-        mode = "dense_forced" if force_dense else "dense_warmup"
         fields = _completion_fields(
-            evaluation=evaluation,
             semantic_digest=semantic_digest,
             kind=kind,
             execution_mode=mode,
@@ -463,7 +583,7 @@ def partitioned_request_attention(
             prefix_log_key_measure=float(prefix_log_key_measure),
             validated=validated,
             descriptor=descriptor,
-            kernel_contract=None,
+            kernel_contract=kernel_contract,
         )
         _record_completion(
             state,
@@ -502,6 +622,7 @@ def partitioned_request_attention(
         calibration_identity,
     )
     if layout_key not in verified:
+        gate_started = time.perf_counter()
         got = _sm120_union(
             q,
             k,
@@ -517,6 +638,7 @@ def partitioned_request_attention(
             got.transpose(0, 1).unsqueeze(0),
             want.transpose(0, 1).unsqueeze(0),
         )
+        gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(gate):
             raise RuntimeError(f"partitioned Sol all-selected arithmetic gate failed: {gate}")
         verified.add(layout_key)
@@ -528,6 +650,7 @@ def partitioned_request_attention(
                 "kv_shape": [1, k.shape[1], k.shape[0], k.shape[2]],
                 "mapped_neighbor_abi": mapped is not None,
                 "key_measure_bias": key_bias is not None,
+                "gate_wall_s": gate_wall_s,
                 **gate,
             }
         )
@@ -560,7 +683,6 @@ def partitioned_request_attention(
     route = PARTITIONED_MAPPED_ROUTE if mapped is not None else PARTITIONED_SOL_ROUTE
     mode = "sm120_mapped" if mapped is not None else "sm120_union"
     fields = _completion_fields(
-        evaluation=evaluation,
         semantic_digest=semantic_digest,
         kind=kind,
         execution_mode=mode,
