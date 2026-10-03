@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Shares packaged-source verification within each partitioned sampling request instead of scanning the source tree on every attention invocation. New requests and changed source identities require a fresh successful check; standalone checks remain uncached.
+- Reports partitioned source-verification calls, wall time and verified status separately from kernel arithmetic gates. Kernel arithmetic, bias, dispatch, completion and forecasting identities remain unchanged.
 - Recognizes Flow's canonical equal-grid exact-prefix control in Spectrum backend history, with geometry, zero-measure, semantic-digest and inherited-owner validation.
 - Keeps stale or malformed contracts opaque and preserves request-owned attention completion receipts, dense warmup and numerical-backend transitions.
 - Restores forecast eligibility for that control; GPU timing and rendered audiovisual quality require runtime qualification.

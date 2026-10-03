@@ -218,6 +218,36 @@ def _weighted_dense(
     return out.squeeze(0).transpose(0, 1).contiguous()
 
 
+def _verify_partitioned_source() -> None:
+    """Verify the immutable packaged source once per native sampling request.
+
+    Keep explicit standalone checks uncached. Request ownership prevents trust
+    surviving another sampler or a failed replacement of the source identity.
+    Device/layout arithmetic validation remains separate from source trust.
+    """
+    from .provenance import CONTRACT, REVISION, SOURCE, verify_source
+    from .runtime import _REQUEST
+
+    state = _REQUEST.get()
+    if state is None:
+        verify_source()
+        return
+    identity = (SOURCE, REVISION, CONTRACT, verify_source)
+    if state._partitioned_source_identity == identity:
+        return
+    with state._partitioned_source_verification_lock:
+        if state._partitioned_source_identity == identity:
+            return
+        state._partitioned_source_identity = None
+        started = time.perf_counter()
+        state.partitioned_source_verification_calls += 1
+        try:
+            verify_source()
+        finally:
+            state.partitioned_source_verification_wall_s += time.perf_counter() - started
+        state._partitioned_source_identity = identity
+
+
 def _sm120_union(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -230,11 +260,10 @@ def _sm120_union(
     mapped_neighbor_intervals: torch.Tensor | None,
 ) -> torch.Tensor:
     """Execute one SM120 sparse attention union with optional bias + mapped metadata."""
-    from .provenance import verify_source
     from ._vendor.sol_attn import interface
     from ._vendor.sol_attn.preprocess import prepare
 
-    verify_source()
+    _verify_partitioned_source()
     qb = q.unsqueeze(0)
     kb = k.unsqueeze(0)
     vb = v.unsqueeze(0)

@@ -23,6 +23,10 @@ The metadata-only verification cache holds at most 64 entries per request;
 evicted identities require validation again. It retains no activation tensors
 and is discarded with the native sampling request.
 
+Partitioned dense and sparse kernel invocations also share packaged-source
+verification within that request. This source check is independent of each
+device/layout arithmetic gate. See [source ownership and receipts](REQUEST_SOURCE_VERIFICATION.md).
+
 Completion receipts use `dense_sm120_forced` or `dense_sm120_warmup` and kernel
 identity `sm120-weighted-all-selected-v1`. History validation binds the new
 identity to the active request's completed call, a real negative key measure and
