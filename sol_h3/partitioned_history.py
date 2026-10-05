@@ -8,6 +8,8 @@ implementation.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 
 PARTITIONED_FLOW_IDENTITY = "h3_flow_partitioned_exact_prefix_v1"
@@ -26,6 +28,52 @@ def _digest(value):
         and value == value.lower()
         and all(char in "0123456789abcdef" for char in value)
     )
+
+
+def _same_grid_control_contract_valid(contract) -> bool:
+    """Recognize only Flow's canonical v1 equal-grid control, including its digest."""
+    if not isinstance(contract, dict) or type(contract.get("api")) is not int:
+        return False
+    names = (
+        "video_start", "temporal", "prefix_t", "source_grid_h", "source_grid_w",
+        "target_grid_h", "target_grid_w",
+    )
+    if any(type(contract.get(name)) is not int or contract[name] <= 0 for name in names):
+        return False
+    start, temporal, prefix_t, source_h, source_w, target_h, target_w = (
+        contract[name] for name in names
+    )
+    if prefix_t >= temporal or (source_h, source_w) != (target_h, target_w):
+        return False
+    if (
+        contract.get("exact_prefix_queries_preserved") is not True
+        or contract.get("generated_suffix_queries_preserved") is not True
+        or contract.get("heterogeneous_spatial_domains") is not False
+    ):
+        return False
+    rows = source_h * source_w
+    prefix_end = start + prefix_t * rows
+    sequence_rows = start + temporal * rows
+    canonical = {
+        "api": 1,
+        "topology": "target_prefix_source_suffix",
+        "sequence_rows": sequence_rows,
+        **{name: contract[name] for name in names},
+        "source_rows_per_frame": rows,
+        "target_rows_per_frame": rows,
+        "prefix_range": [start, prefix_end],
+        "suffix_range": [prefix_end, sequence_rows],
+        "prefix_log_key_measure": 0.0,
+        "nonvideo_log_key_measure": 0.0,
+        "suffix_log_key_measure": 0.0,
+        "exact_prefix_queries_preserved": True,
+        "generated_suffix_queries_preserved": True,
+        "heterogeneous_spatial_domains": False,
+    }
+    if any(contract.get(name) != value for name, value in canonical.items()):
+        return False
+    raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return contract.get("semantic_digest") == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _partitioned_history_layout_valid(options, layout) -> bool:
@@ -57,7 +105,8 @@ def _partitioned_history_layout_valid(options, layout) -> bool:
         or temporal <= 1
         or not 0 < prefix_t < temporal
         or source_rows <= 0
-        or target_rows <= source_rows
+        or target_rows < source_rows
+        or (target_rows == source_rows and not _same_grid_control_contract_valid(contract))
         or sequence_rows
         != video_start + prefix_t * target_rows + (temporal - prefix_t) * source_rows
         or not _digest(contract.get("semantic_digest"))
@@ -153,7 +202,7 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
     if (
         not 0 < prefix_t < temporal
         or source_rows <= 0
-        or target_rows <= source_rows
+        or target_rows < source_rows
         or len(target_hw) != 2
         or any(value <= 0 or value % 2 for value in target_hw)
         or prefix_rows != prefix_t * target_rows
@@ -175,6 +224,29 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
         or block_index >= inner_blocks
     ):
         return None
+
+    if target_rows == source_rows:
+        # Equal row products alone do not establish equal physical geometry.
+        # Bind the canonical control to the actual latent-grid closure as well.
+        if not _same_grid_control_contract_valid(partition_contract):
+            return None
+        source_h = getattr(plan, "source_h", None)
+        source_w = getattr(plan, "source_w", None)
+        if (
+            type(source_h) is not int
+            or type(source_w) is not int
+            or (source_h, source_w) != target_hw
+            or target_hw != (
+                2 * partition_contract["target_grid_h"],
+                2 * partition_contract["target_grid_w"],
+            )
+            or partition_contract["video_start"] != video_start
+            or partition_contract["temporal"] != temporal
+            or partition_contract["prefix_t"] != prefix_t
+            or partition_contract["source_rows_per_frame"] != source_rows
+            or partition_contract["sequence_rows"] != partitioned_sequence_rows
+        ):
+            return None
 
     identity = (
         PARTITIONED_FLOW_IDENTITY,
@@ -201,8 +273,9 @@ def _accept_partitioned_receipt(item) -> bool:
         PARTITIONED_RECEIPT_TAG,
         PARTITIONED_REQUEST_ABI,
         PARTITIONED_SOL_ROUTE,
+        PARTITIONED_WEIGHTED_DENSE_CONTRACT,
     )
-    from .runtime import _REQUEST
+    from .runtime import _FORWARD, _REQUEST
 
     if not isinstance(item, tuple) or len(item) != 4 or item[0] != "sol_h3":
         return False
@@ -213,11 +286,10 @@ def _accept_partitioned_receipt(item) -> bool:
         return False
     if route not in {PARTITIONED_DENSE_ROUTE, PARTITIONED_SOL_ROUTE, PARTITIONED_MAPPED_ROUTE}:
         return False
-    if not isinstance(fields, tuple) or len(fields) != 16:
+    if not isinstance(fields, tuple) or len(fields) != 15:
         return False
     (
         tag,
-        call_token,
         abi,
         semantic_digest,
         kind,
@@ -235,11 +307,6 @@ def _accept_partitioned_receipt(item) -> bool:
     ) = fields
     if (
         tag != PARTITIONED_RECEIPT_TAG
-        or not isinstance(call_token, tuple)
-        or len(call_token) != 2
-        or call_token[0] != "sol_h3_evaluation"
-        or type(call_token[1]) is not int
-        or call_token[1] < 0
         or abi != PARTITIONED_REQUEST_ABI
         or not _digest(semantic_digest)
         or kind not in {"global", "local", "anchor", "full"}
@@ -282,7 +349,14 @@ def _accept_partitioned_receipt(item) -> bool:
             return False
 
     if route == PARTITIONED_DENSE_ROUTE:
-        if execution_mode not in {"dense_forced", "dense_warmup"} or kernel_contract is not None:
+        native_dense = execution_mode in {"dense_forced", "dense_warmup"} and kernel_contract is None
+        weighted_dense = (
+            execution_mode in {"dense_sm120_forced", "dense_sm120_warmup"}
+            and kernel_contract == PARTITIONED_WEIGHTED_DENSE_CONTRACT
+            and prefix_k_range is not None
+            and prefix_log_key_measure < 0.0
+        )
+        if not (native_dense or weighted_dense):
             return False
     elif route == PARTITIONED_MAPPED_ROUTE:
         if (
@@ -303,6 +377,17 @@ def _accept_partitioned_receipt(item) -> bool:
             return False
 
     state = _REQUEST.get()
+    active = _FORWARD.get()
+    if (
+        state is None
+        or not isinstance(active, tuple)
+        or len(active) != 5
+        or active[1] is not state
+        or type(active[2]) is not int
+        or active[2] < 0
+        or getattr(state, "partitioned_receipt_evaluation", None) != active[2]
+    ):
+        return False
     owned = getattr(state, "partitioned_validated_receipts", set()) if state is not None else set()
     return (block, fields) in owned
 
