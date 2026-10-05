@@ -3,6 +3,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 import json
 import logging
+from threading import Lock
 
 from .contracts import KEY, Config, adaln_status, prefix_length
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
@@ -65,6 +66,13 @@ class Request:
     gates: list = field(default_factory=list)
     kernel: object = None
     kernel_device: object = None
+    partitioned_kernel_compile_calls: int = 0
+    partitioned_kernel_compile_cache_hits: int = 0
+    partitioned_kernel_compile_wall_s: float = 0.0
+    partitioned_source_verification_calls: int = 0
+    partitioned_source_verification_wall_s: float = 0.0
+    _partitioned_source_identity: tuple | None = field(default=None, repr=False, compare=False)
+    _partitioned_source_verification_lock: object = field(default_factory=Lock, repr=False, compare=False)
     native_verified: bool = False
     native_reason: str | None = None
     last_routes: tuple | None = None
@@ -108,6 +116,23 @@ class SamplingWrapper:
                         "external_mixed_weighted_measure_calls": state.external_mixed_weighted_measure_calls,
                         "external_mixed_weighted_measure_q_rows": state.external_mixed_weighted_measure_q_rows,
                         "external_mixed_weighted_measure_kv_rows": state.external_mixed_weighted_measure_kv_rows,
+                        "partitioned_unit_measure_calls": getattr(state, "partitioned_unit_measure_calls", 0),
+                        "partitioned_core_dense_calls": getattr(state, "partitioned_core_dense_calls", 0),
+                        "partitioned_torch_dense_calls": getattr(state, "partitioned_torch_dense_calls", 0),
+                        "partitioned_weighted_dense_calls": getattr(state, "partitioned_weighted_dense_calls", 0),
+                        "partitioned_weighted_dense_q_rows": getattr(state, "partitioned_weighted_dense_q_rows", 0),
+                        "partitioned_weighted_dense_gate_entries": len(
+                            getattr(state, "partitioned_weighted_dense_verified", {})
+                        ),
+                        "partitioned_source_tree_verified": state._partitioned_source_identity is not None,
+                        "partitioned_source_verification_calls": state.partitioned_source_verification_calls,
+                        "partitioned_source_verification_wall_s": state.partitioned_source_verification_wall_s,
+                        "partitioned_kernel_compile_calls": state.partitioned_kernel_compile_calls,
+                        "partitioned_kernel_compile_cache_hits": state.partitioned_kernel_compile_cache_hits,
+                        "partitioned_kernel_compile_wall_s": state.partitioned_kernel_compile_wall_s,
+                        "native_core_reference_calls": getattr(state, "native_core_reference_calls", 0),
+                        "native_torch_reference_calls": getattr(state, "native_torch_reference_calls", 0),
+                        "arithmetic_gate_wall_s": sum(gate.get("gate_wall_s", 0.0) for gate in state.gates),
                         "compatibility_fallbacks": dict(state.fallbacks),
                         "dense_provider_failures": dict(state.dense_provider_failures),
                         "vdn_local_sol_calls": state.vdn_local_sol_calls,

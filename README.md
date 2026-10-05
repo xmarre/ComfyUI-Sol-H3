@@ -1,8 +1,33 @@
 # ComfyUI-Sol-H3
 
+## Coordinated H3 releases
+
+Update the coordinated components together. Every release links this same
+version set and identifies its implementation PRs.
+
+| Component | Release | Included PRs |
+| --- | --- | --- |
+| Flow-Aligned Regenerate | [v0.3.9](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.9) | [#89](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/89), [#93](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/93) |
+| Sol-H3 | [v0.1.8](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.8) | [#37](https://github.com/xmarre/ComfyUI-Sol-H3/pull/37) |
+| VDN-H3-Plus | [v1.5.7](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.7) | [#33](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/33), [#34](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/34), [#35](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/35), [#36](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/36), [#37](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/37) |
+| H3 Continuum-Plus | [v3.4.5](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.5) | [#37](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/37), [#38](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/38) |
+| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | [#16](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/pull/16) |
+
+[Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)
+is the unchanged companion. Separate Keyless, audio-training and rejected
+decoded-geometry experiments are outside this release set.
+
+The tested Core adapter repair is
+[ComfyUI #16783](https://github.com/Comfy-Org/ComfyUI/pull/16783).
+It remains an upstream review item, with upstream workflow approval and merge
+controlled by Comfy-Org maintainers. For INT8 fused MLP runtime adapters,
+retain that ComfyUI Patcher PR overlay until the repair is available upstream.
+The independent Core #16720 optimization is not included in this release set.
+
+
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
-**v0.1.7** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported **SM120 and SM121** Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
+**v0.1.8** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported **SM120 and SM121** Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
 
 The release has three parts:
 
@@ -337,7 +362,7 @@ A successful run with zero sparse calls is valid execution telemetry but is not 
 
 ## Release notes
 
-See [CHANGELOG.md](CHANGELOG.md) and [RELEASE_NOTES.md](RELEASE_NOTES.md) for the current v0.1.7 release scope, validation evidence, and historical release notes.
+See [CHANGELOG.md](CHANGELOG.md) and [RELEASE_NOTES.md](RELEASE_NOTES.md) for the current v0.1.8 release scope, validation evidence, and historical release notes.
 
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 

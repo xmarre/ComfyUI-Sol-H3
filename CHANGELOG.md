@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.8 — 2026-10-05
+
+- Preserves source-validation ownership when composed with an earlier runtime-diagnostic PR overlay. CI checks both sequential merge preflight and declared-base delta application, then exercises the composed runtime.
+- Shares packaged-source verification within each partitioned sampling request instead of scanning the source tree on every attention invocation. New requests and changed source identities require a fresh successful check; standalone checks remain uncached.
+- Reports partitioned source-verification calls, wall time and verified status separately from kernel arithmetic gates. Kernel arithmetic, bias, dispatch, completion and forecasting identities remain unchanged.
+- Recognizes Flow's canonical equal-grid exact-prefix control in Spectrum backend history, with geometry, zero-measure, semantic-digest and inherited-owner validation.
+- Keeps stale or malformed contracts opaque and preserves request-owned attention completion receipts, dense warmup and numerical-backend transitions.
+- Restores compatible forecast eligibility; the coordinated target-grid profile has reported audiovisual acceptance. No general speedup is claimed.
+- Omits the attention-mask allocation for validated unit prefix measure while retaining prefix and completion metadata. Dense partitioned attention can then use PyTorch's unmasked CUDA kernels; nonzero measures retain their additive bias.
+- Reports validated `partitioned_unit_measure_calls` in sampling receipts. CPU dense-oracle equivalence does not establish identical GPU rounding, speed or generated output.
+
 ## v0.1.7 — 2026-10-03
 
 - Adds Linux/WSL2 SM121 / GB10 support through the existing packaged `cute_sm120` CuTe backend.
