@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Partitioned Spectrum history recognizes Flow replacement closures whose native
+  (pre-partition) sequence is the uniform target grid, declared by
+  `native_carrier_grid="target"` and matching `native_carrier_rows_per_frame` in
+  the Flow contract. The partition itself remains `[target-grid head |
+  source-grid tail]`. Without this, the history policy stays opaque and Spectrum
+  executes every such step as an actual call. Contracts without the field keep
+  the reduced-grid carrier checks, and inconsistent declarations fail closed.
+  `sol_h3.partitioned_history.PARTITIONED_NATIVE_CARRIER_GRIDS` lists the
+  recognized carriers.
+
 ## v0.1.8 — 2026-10-05
 
 - Preserves source-validation ownership when composed with an earlier runtime-diagnostic PR overlay. CI checks both sequential merge preflight and declared-base delta application, then exercises the composed runtime.
