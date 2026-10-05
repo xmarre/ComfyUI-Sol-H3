@@ -393,3 +393,82 @@ def test_equal_row_products_on_different_grids_remain_opaque_with_a_recomputed_d
     classifier = SimpleNamespace(_closure_values=lambda _patch: values)
     assert not _partitioned_history_layout_valid(options, layout)
     assert _partitioned_flow_replacement_identity(classifier, patch, 0) is None
+
+
+def _target_band_replacement_values():
+    """Flow target-band closure: native carrier is the target grid for every frame."""
+    patch, previous = _flow_replacement_fixture()
+    values = dict(interop._closure_values(patch))
+    # 5 frames, head of 3 target frames (16 rows), tail of 2 source frames (4 rows).
+    values["plan"] = SimpleNamespace(
+        prefix_t=3,
+        temporal=5,
+        source_rows=4,
+        target_rows=16,
+        prefix_rows=48,
+        partitioned_rows=56,
+        target_hw=(8, 8),
+    )
+    values.update(video_end=87, carrier_prefix_rows=48)
+    values["layout"] = SimpleNamespace(
+        seq_len=87,
+        segments=[(0, 7, "nonvideo"), (7, 87, "video")],
+        signature=("native", 5, 8, 8),
+    )
+    values["partitioned_layout"] = SimpleNamespace(
+        seq_len=63,
+        segments=[(0, 7, "nonvideo"), (7, 63, "video")],
+        signature=(PARTITIONED_FLOW_IDENTITY, "partitioned"),
+    )
+    values["partition_contract"] = {
+        "semantic_digest": DIGEST,
+        "native_carrier_grid": "target",
+        "native_carrier_rows_per_frame": 16,
+    }
+    return patch, previous, values
+
+
+def test_target_native_carrier_replacement_identity_is_recognized():
+    patch, previous, values = _target_band_replacement_values()
+    classifier = SimpleNamespace(_closure_values=lambda _patch: values)
+    resolved = _partitioned_flow_replacement_identity(classifier, patch, 0)
+    assert resolved is not None
+    identity, inherited = resolved
+    assert identity[2:10] == (87, 63, 7, 5, 3, 4, 16, (8, 8))
+    assert inherited is previous
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"partition_contract": {"semantic_digest": DIGEST}},
+        {"partition_contract": {"semantic_digest": DIGEST, "native_carrier_grid": "source"}},
+        {"partition_contract": {"semantic_digest": DIGEST, "native_carrier_rows_per_frame": 16}},
+        {
+            "partition_contract": {
+                "semantic_digest": DIGEST,
+                "native_carrier_grid": "target",
+                "native_carrier_rows_per_frame": 4,
+            }
+        },
+        {"carrier_prefix_rows": 12},
+        {"video_end": 27},
+    ],
+)
+def test_target_native_carrier_identity_fails_closed_on_inconsistent_closure(mutation):
+    patch, _previous, values = _target_band_replacement_values()
+    values.update(mutation)
+    classifier = SimpleNamespace(_closure_values=lambda _patch: values)
+    assert _partitioned_flow_replacement_identity(classifier, patch, 0) is None
+
+
+def test_source_native_carrier_identity_rejects_a_declared_target_carrier():
+    patch, _previous = _flow_replacement_fixture()
+    values = dict(interop._closure_values(patch))
+    values["partition_contract"] = {
+        "semantic_digest": DIGEST,
+        "native_carrier_grid": "target",
+        "native_carrier_rows_per_frame": 16,
+    }
+    classifier = SimpleNamespace(_closure_values=lambda _patch: values)
+    assert _partitioned_flow_replacement_identity(classifier, patch, 0) is None

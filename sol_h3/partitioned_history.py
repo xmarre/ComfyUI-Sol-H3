@@ -19,6 +19,27 @@ VDN_PARTITIONED_SEQUENCE_MODE = "partitioned_attention_variable_grid_linear"
 _BRIDGE_MARKER = "_sol_h3_partitioned_history_bridge_v1"
 _RECEIPT_BRIDGE_MARKER = "_sol_h3_partitioned_receipt_bridge_v1"
 _VDN_HISTORY_BRIDGE_MARKER = "_sol_h3_partitioned_vdn_history_bridge_v1"
+# Native (pre-partition) video carriers whose Flow replacement closures this
+# release recognizes. "source" is the historical uniform reduced-grid carrier.
+# "target" is Flow's target-band continuation, whose native sequence is the
+# uniform target grid while the partition stays [target head | source tail].
+PARTITIONED_NATIVE_CARRIER_GRIDS = ("source", "target")
+
+
+def _native_carrier_rows_per_frame(contract, source_rows, target_rows):
+    """Return the native carrier rows per frame declared by Flow, or None."""
+    if not isinstance(contract, dict):
+        return None
+    if "native_carrier_grid" not in contract:
+        return source_rows if "native_carrier_rows_per_frame" not in contract else None
+    if (
+        contract.get("native_carrier_grid") != "target"
+        or type(contract.get("native_carrier_rows_per_frame")) is not int
+        or contract["native_carrier_rows_per_frame"] != target_rows
+        or target_rows <= source_rows
+    ):
+        return None
+    return target_rows
 
 
 def _digest(value):
@@ -199,17 +220,19 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
 
+    native_rows_per_frame = _native_carrier_rows_per_frame(partition_contract, source_rows, target_rows)
     if (
-        not 0 < prefix_t < temporal
+        native_rows_per_frame is None
+        or not 0 < prefix_t < temporal
         or source_rows <= 0
         or target_rows < source_rows
         or len(target_hw) != 2
         or any(value <= 0 or value % 2 for value in target_hw)
         or prefix_rows != prefix_t * target_rows
-        or carrier_prefix_rows != prefix_t * source_rows
+        or carrier_prefix_rows != prefix_t * native_rows_per_frame
         or partitioned_rows != prefix_rows + (temporal - prefix_t) * source_rows
         or video_start <= 0
-        or video_end != video_start + temporal * source_rows
+        or video_end != video_start + temporal * native_rows_per_frame
         or native_rows != video_end
         or partitioned_sequence_rows != video_start + partitioned_rows
         or not native_segments
@@ -466,5 +489,6 @@ def install_partitioned_history_bridge() -> None:
 
 __all__ = [
     "PARTITIONED_FLOW_IDENTITY",
+    "PARTITIONED_NATIVE_CARRIER_GRIDS",
     "install_partitioned_history_bridge",
 ]
