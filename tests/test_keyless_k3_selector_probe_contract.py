@@ -13,9 +13,16 @@ def _probe_source() -> str:
 
 def test_k3_probe_contract_and_evidence_identity_are_frozen():
     source = _probe_source()
-    assert 'PROBE_CONTRACT = "sol-h3-keyless-k3-selector-calibration-probe-v1"' in source
-    assert 'EVIDENCE_CONTRACT = "sol-h3-keyless-k3-selector-calibration-v1"' in source
-    assert 'REQUIRED_K1_CONTRACT = "sol-h3-keyless-route-summary-v2"' in source
+    assert 'PROBE_CONTRACT = "sol-h3-keyless-k3-selector-probe-v2"' in source
+    assert 'EVIDENCE_CONTRACT = "sol-h3-keyless-k3-selector-calibration-v2"' in source
+    assert (
+        'REQUIRED_K1_CONTRACT = "sol-h3-keyless-route-summary-sol-reduction-v6-bounded-b8"'
+        in source
+    )
+    assert (
+        'REQUIRED_K3_CONTRACT = "sol-h3-keyless-selector-k3-v2-k1-route-identity"'
+        in source
+    )
     assert '"promotion_evidence": False' in source
     assert '"thresholds_frozen": False' in source
 
@@ -30,8 +37,11 @@ def test_k3_probe_predeclares_real_h3_selector_cases():
 
 def test_k3_probe_compares_candidate_and_materialized_reference_selector():
     source = _probe_source()
-    assert "candidate_rc, candidate_vc = route_summary(" in source
+    assert "candidate_rc, candidate_vc = route_summary_sol_reduction(" in source
+    assert "k1_route = materialized_sol_reduction_v4_route_diagnostic(" in source
     assert "reference_rc, reference_vc, reference_threshold = prepare(" in source
+    assert "qb," in source
+    assert "kb," in source
     assert "candidate_output, candidate_trace = run_materialized_exact_selector_isolation(" in source
     assert "reference_output, reference_trace = run_materialized_exact_selector_isolation(" in source
     assert "route_trace_metrics(" in source
@@ -43,17 +53,20 @@ def test_k3_probe_binds_patcher_source_before_expensive_work():
     assert "--expected-probe-contract" in source
     assert "probe_source = replay_fixture._probe_source_identity(_REPO_ROOT)" in source
     assert "K3 calibration requires a clean tracked Sol-H3 worktree" in source
-    assert "refresh the Sol #22 Patcher overlay" in source
+    assert "refresh the complete Patcher stack through the K3-v2 PR" in source
+    assert '"critical_source_sha256"' in source
+    assert '"sol_h3/keyless_selector.py"' in source
+    assert '"sol_h3/keyless_route_summary.py"' in source
 
 
 def test_k3_probe_does_not_claim_no_route_or_production_promotion():
     source = _probe_source()
     assert (
-        '"exact-block K remains the globally materialized Comfy route to isolate selector behavior"'
+        '"exact-block K remains the globally materialized exact K1 row route "'
         in source
     )
     assert (
-        '"candidate K1 RC/VC come from raw V without a global candidate route tensor"'
+        '"candidate K1-v6 RC/VC come from raw V through bounded-b8 route scratch"'
         in source
     )
     assert (
@@ -73,3 +86,16 @@ def test_k3_probe_verifies_native_source_and_backend_provenance():
     assert '"nvidia-cutlass-dsl"' in source
     assert '"cuda-python"' in source
     assert '"triton"' in source
+
+
+def test_k3_v2_probe_records_corrected_lineage_and_exactness_controls():
+    source = _probe_source()
+    assert "K1_V9_EVIDENCE_SHA256" in source
+    assert "K2_V3_HOLDOUT_SHA256" in source
+    assert "HISTORICAL_K3_V1_SHA256" in source
+    assert '"all_route_centroids_exact"' in source
+    assert '"all_raw_value_sums_exact"' in source
+    assert '"all_thresholds_exact"' in source
+    assert '"all_route_traces_equal"' in source
+    assert '"all_outputs_exact"' in source
+    assert '"k1_route_vs_comfy_route"' in source
