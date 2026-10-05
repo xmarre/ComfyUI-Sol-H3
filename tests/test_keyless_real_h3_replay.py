@@ -5,12 +5,14 @@ import torch
 
 from sol_h3.keyless_real_h3_replay import (
     ENVELOPE,
+    K2_V3_ENVELOPE,
     V2_ENVELOPE,
     apply_split_half_rope_fp32_from_normalized,
     apply_split_half_rope_from_normalized,
     block_summary_oracle,
     checkpoint_tensor_names,
     identity_split_half_rope_like,
+    k2_v3_envelope_dict,
     metric_within_limit,
     scale_aware_metric_within_limit,
     public_rms_norm,
@@ -60,6 +62,56 @@ def test_frozen_v2_replay_envelope_values_and_provenance():
     assert V2_ENVELOPE.k2_output.worst_bf16_ulps == 1.0
     assert V2_ENVELOPE.k1_value_max_abs == 0.0
     assert v2_envelope_dict()["contract"] == V2_ENVELOPE.contract
+
+
+
+def test_frozen_k2_v3_replay_envelope_values_and_provenance():
+    assert K2_V3_ENVELOPE.contract == "sol-h3-keyless-k2-v3-replay-envelope-v1"
+    assert (
+        K2_V3_ENVELOPE.calibration_contract
+        == "sol-h3-keyless-k2-exact-route-calibration-v1"
+    )
+    assert K2_V3_ENVELOPE.calibration_sha256 == (
+        "65ff8ccd679a7f5c2e1c82d59d98068167b94922ab0bc3f75e6f636363ebc306"
+    )
+    assert K2_V3_ENVELOPE.calibration_case_count == 36
+    assert K2_V3_ENVELOPE.aggregate_margin_multiplier == 2.0
+    assert K2_V3_ENVELOPE.k2_output.rel_l2 == 0.002870015799999237
+    assert (
+        K2_V3_ENVELOPE.k2_output.max_abs_over_want_abs_max
+        == 0.012121212121212121
+    )
+    assert (
+        K2_V3_ENVELOPE.k2_output.mean_abs_over_want_mean_abs
+        == 0.0009517458902061093
+    )
+    assert K2_V3_ENVELOPE.k2_output.worst_bf16_ulps == 1.0
+    assert k2_v3_envelope_dict()["contract"] == K2_V3_ENVELOPE.contract
+
+
+def test_k2_v3_gate_is_inclusive_and_keeps_one_ulp_invariant():
+    limit = K2_V3_ENVELOPE.k2_output
+    metrics = {
+        "finite": True,
+        "rel_l2": limit.rel_l2,
+        "mean_abs": 999.0,
+        "max_abs": 999.0,
+    }
+    scale = {
+        "finite": True,
+        "max_abs_over_want_abs_max": limit.max_abs_over_want_abs_max,
+        "mean_abs_over_want_mean_abs": limit.mean_abs_over_want_mean_abs,
+        "worst": {"abs_error_in_want_bf16_ulps": limit.worst_bf16_ulps},
+    }
+    assert scale_aware_metric_within_limit(metrics, scale, limit)
+    assert not scale_aware_metric_within_limit(
+        metrics,
+        {
+            **scale,
+            "worst": {"abs_error_in_want_bf16_ulps": 2.0},
+        },
+        limit,
+    )
 
 
 def test_scale_aware_v2_gate_is_inclusive_and_keeps_one_ulp_invariant():
