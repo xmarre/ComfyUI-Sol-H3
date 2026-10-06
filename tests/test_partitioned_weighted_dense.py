@@ -209,3 +209,24 @@ def test_real_sm120_weighted_dense_request_and_native_gate(q_rows, kv_rows):
     finally:
         _FORWARD.reset(forward)
         _REQUEST.reset(token)
+
+
+def test_weighted_dense_may_extend_the_measure_over_the_global_sink(monkeypatch):
+    native, kernels = _host_runtime(monkeypatch)
+    q, k, v = _inputs()
+    state = Request(Config(backend="sol"))
+    token = _REQUEST.set(state)
+    forward = _FORWARD.set((None, state, 0, None, []))
+    try:
+        output, receipt = _call(q, k, v, prefix_range=(0, 79))
+        assert _accept_partitioned_receipt(receipt)
+        with pytest.raises(RuntimeError, match="overlaps the global sink"):
+            _call(q, k, v, prefix_range=(5, 79))
+    finally:
+        _FORWARD.reset(forward)
+        _REQUEST.reset(token)
+    assert request.PARTITIONED_SINK_MEASURE_API == 1
+    rounded = torch.zeros(len(k))
+    rounded[0:79] = torch.tensor(math.log(330 / 672), dtype=q.dtype).float()
+    torch.testing.assert_close(kernels[-1]["key_bias"], rounded, rtol=0, atol=0)
+    torch.testing.assert_close(output, _oracle(q, k, v, rounded, 128 ** -0.5), rtol=0, atol=0)

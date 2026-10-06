@@ -357,7 +357,10 @@ def _accept_partitioned_receipt(item) -> bool:
         ):
             return False
         start, end = prefix_k_range
-        if not sink_rows <= start < end <= kv_rows:
+        # Dense requests may also weigh the whole global sink: (0, end) with end
+        # beyond the sink. Sparse requests keep the measure at the sink boundary.
+        dense_sink_measure = route == PARTITIONED_DENSE_ROUTE and start == 0 and sink_rows < end <= kv_rows
+        if not (sink_rows <= start < end <= kv_rows or dense_sink_measure):
             return False
         if route != PARTITIONED_DENSE_ROUTE and start != sink_rows:
             return False
