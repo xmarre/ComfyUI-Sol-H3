@@ -1,35 +1,10 @@
 # ComfyUI-Sol-H3
 
-## Coordinated H3 releases
-
-Update the coordinated components together. Every release links this same
-version set and identifies its implementation PRs.
-
-| Component | Release | Included PRs |
-| --- | --- | --- |
-| Flow-Aligned Regenerate | [v0.3.9](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.9) | [#89](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/89), [#93](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/93) |
-| Sol-H3 | [v0.1.8](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.8) | [#37](https://github.com/xmarre/ComfyUI-Sol-H3/pull/37) |
-| VDN-H3-Plus | [v1.5.7](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.7) | [#33](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/33), [#34](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/34), [#35](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/35), [#36](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/36), [#37](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/37) |
-| H3 Continuum-Plus | [v3.4.5](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.5) | [#37](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/37), [#38](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/38) |
-| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | [#16](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/pull/16) |
-
-[Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)
-is the unchanged companion. Separate Keyless, audio-training and rejected
-decoded-geometry experiments are outside this release set.
-
-The tested Core adapter repair is
-[ComfyUI #16783](https://github.com/Comfy-Org/ComfyUI/pull/16783).
-It remains an upstream review item, with upstream workflow approval and merge
-controlled by Comfy-Org maintainers. For INT8 fused MLP runtime adapters,
-retain that ComfyUI Patcher PR overlay until the repair is available upstream.
-The independent Core #16720 optimization is not included in this release set.
-
-
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
-**v0.1.8** packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported **SM120 and SM121** Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
+Sol-H3 packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported **SM120 and SM121** Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
 
-The release has three parts:
+The package has three parts:
 
 - **Exact Runtime** — exact native H3 affine/runtime optimizations.
 - **Rectangular SOL** — Sana/CuTe `cute_sm120` attention on SM120/SM121 with independent query and K/V lengths.
@@ -39,15 +14,15 @@ Unvalidated combinations are experimental telemetry rather than blanket errors. 
 
 > **Native Windows:** the current custom SOL and Exact Runtime kernel paths are not supported execution targets. SOL delegates to inherited dense attention and Exact Runtime delegates to native H3, so the nodes can remain in a workflow but no Sol-H3 custom kernel executes. Use Linux/WSL2 on supported hardware for custom-kernel acceleration. See [Native Windows status](docs/WINDOWS.md).
 
-## v0.1.7: SM121 / GB10 support
+## SM121 / GB10 support
 
-v0.1.7 adds Linux/WSL2 execution support for compute capability **(12, 1)** devices such as NVIDIA GB10 / DGX Spark. SM121 is mapped to the existing packaged `cute_sm120` CuTe backend; the reported CUDA capability is **not** rewritten or spoofed.
+Since v0.1.7, Linux/WSL2 execution supports for compute capability **(12, 1)** devices such as NVIDIA GB10 / DGX Spark. SM121 is mapped to the existing packaged `cute_sm120` CuTe backend; the reported CUDA capability is **not** rewritten or spoofed.
 
 The SM121 admission is applied consistently across backend selection, the SOL loader, ordinary runtime shape checks, partitioned execution, and rectangular K/V token sizing. The vendored Sana patch stack and manifest/provenance hashes include the change, so source verification remains fail-closed.
 
-PR [#38](https://github.com/xmarre/ComfyUI-Sol-H3/pull/38) supplied real-GB10 execution evidence: a BF16 `1×64×4×128` kernel call returned `cute_sm120` with finite output, and a small Comfy prompt recorded `sol_backend=cute_sm120` with `sparse_calls=100`. Hosted CI independently covers dispatch, provenance and interoperability contracts. This release does not claim an independent maintainer GB10 benchmark or SM120/SM121 performance equivalence.
+PR [#38](https://github.com/xmarre/ComfyUI-Sol-H3/pull/38) supplied real-GB10 execution evidence: a BF16 `1×64×4×128` kernel call returned `cute_sm120` with finite output, and a small Comfy prompt recorded `sol_backend=cute_sm120` with `sparse_calls=100`. Hosted CI independently covers dispatch, provenance and interoperability contracts. This support does not claim an independent maintainer GB10 benchmark or SM120/SM121 performance equivalence.
 
-## v0.1.3 default: one dense trajectory evaluation
+## Default: one dense trajectory evaluation
 
 `Sol-H3 SOL Attention (Experimental)` now defaults to:
 
@@ -76,7 +51,7 @@ Previous controlled no-VDN hot evidence remains the measured speed trade-off:
 
 Existing saved workflows keep their serialized `dense_evaluations` value. Workflows created or saved under v0.1.2 can therefore remain at `0` after upgrading until changed explicitly. See [SOL trajectory warmup](docs/DENSE_EVALUATIONS.md) for the speed/quality trade-off, migration behavior and telemetry guidance.
 
-## v0.1.0 production status
+## Production validation
 
 The original full production stack was exercised on an **NVIDIA RTX PRO 6000 Blackwell Workstation Edition (SM120)** with PyTorch `2.10.0+cu130`.
 
@@ -196,6 +171,7 @@ Production-only history issues found during validation were fixed narrowly:
 - audited Diff-Aid activation wrappers are transparent only when Diff-Aid publishes its runtime declaration;
 - Flow's marked layout wrapper and mixed-grid wrapper are recognized only when exact marker/closure/geometry invariants agree;
 - progressive high stages consume Flow's explicit continuation contract so the one-evaluation trajectory warmup is not spuriously restarted;
+- Flow's partitioned exact-prefix replacement is recognized for both the reduced-grid native carrier and the target-grid native carrier declared by target-band continuation (`native_carrier_grid="target"` with matching rows per frame);
 - unknown/malformed wrappers remain opaque and force an actual call rather than weakening the gate.
 
 Untwist preprocessing remains exactly once. Receipt/provider transitions still reset incompatible history. With the v0.1.3 default `dense_evaluations=1`, backend history begins dense and the later `dense -> sol` route change is intentionally treated as a real history boundary. With the explicit `dense_evaluations=0` speed mode, history starts directly in `phase=sol` and that initial transition is absent.
@@ -360,9 +336,29 @@ The legacy `dense_warmup` telemetry value counts attention calls kept dense by e
 
 A successful run with zero sparse calls is valid execution telemetry but is not evidence of SOL acceleration.
 
-## Release notes
+## Release notes and coordinated release set
 
-See [CHANGELOG.md](CHANGELOG.md) and [RELEASE_NOTES.md](RELEASE_NOTES.md) for the current v0.1.8 release scope, validation evidence, and historical release notes.
+See [CHANGELOG.md](CHANGELOG.md) and [RELEASE_NOTES.md](RELEASE_NOTES.md) for per-version scope, validation evidence and historical release notes.
+
+Sol-H3 is released together with the other H3 components:
+
+| Component | Release | Included PRs |
+| --- | --- | --- |
+| Flow-Aligned Regenerate | [v0.3.10](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.10) | [#96](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/96) |
+| Sol-H3 | [v0.1.9](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.9) | [#39](https://github.com/xmarre/ComfyUI-Sol-H3/pull/39) |
+| VDN-H3-Plus | [v1.5.8](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.8) | [#38](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/38) |
+| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | [#39](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/40) |
+| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | unchanged |
+
+[Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)
+is the unchanged companion. Separate Keyless, audio-training and rejected
+decoded-geometry experiments are outside this release set.
+
+The tested Core adapter repair is
+[ComfyUI #16783](https://github.com/Comfy-Org/ComfyUI/pull/16783).
+For INT8 fused MLP runtime adapters, retain that ComfyUI Patcher PR overlay until
+the repair is available upstream. The independent Core #16720 optimization is
+not included in this release set.
 
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 
