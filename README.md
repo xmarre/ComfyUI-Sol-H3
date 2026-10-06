@@ -363,3 +363,15 @@ not included in this release set.
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 
 GPL-3.0-or-later; see `LICENSE` and `NOTICE`.
+### Partitioned conditioning-key measure
+
+`PARTITIONED_SINK_MEASURE_API = 1` permits dense partitioned requests to use a
+key-measure range `(0, end)` that covers the global conditioning sink and extends
+into video keys. Partial sink overlap and sink-covering sparse requests are
+rejected. Range and measure are included in weighted-dense validation and
+completion identity; receipt acceptance remains request/evaluation owned.
+
+Paired Flow/VDN can use this for the experimental `target_query_sink_measure`
+selector. This capability does not change ordinary Sol weighting or establish
+that a rendered continuation boundary improves. Existing requests retain their
+range and numerical policy.
