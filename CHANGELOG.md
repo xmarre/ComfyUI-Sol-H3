@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.9 — 2026-10-06
 
 - Partitioned Spectrum history recognizes Flow replacement closures whose native
   (pre-partition) sequence is the uniform target grid, declared by
