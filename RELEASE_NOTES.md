@@ -1,3 +1,17 @@
+## Unreleased: dense partitioned sink measure
+
+Dense partitioned requests may extend a key-measure range from row 0 through
+the packed non-video sink and into video keys. `PARTITIONED_SINK_MEASURE_API = 1`
+advertises this to paired Flow/VDN. Partial sink overlap and sink-covering sparse
+requests remain rejected. The range remains part of validation and completion
+identity; receipt ownership remains request/evaluation scoped.
+
+Use with [Flow #97](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/97)
+and [VDN #40](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/40) for the opt-in
+`target_query_sink_measure` comparison. Existing Sol requests retain their
+weighting and dispatch. This capability reuses the weighted dense kernel and
+does not establish rendered boundary quality or GPU performance.
+
 # ComfyUI-Sol-H3 v0.1.9
 
 Recognize Flow's target-grid native partition carrier in Spectrum backend history.
