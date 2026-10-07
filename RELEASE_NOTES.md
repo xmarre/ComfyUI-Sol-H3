@@ -1,3 +1,16 @@
+## Unreleased: domain-uniform Flow stream history
+
+Spectrum backend history recognizes Flow's opt-in target-band
+`target_band_context=domain_uniform_v1` block replacement.
+`PARTITIONED_DOMAIN_STREAM_API = 1` advertises the capability to paired Flow.
+The replacement evaluates two uniform-grid hidden streams per block. Each stream
+must carry a canonical equal-grid partition contract, a layout signature ending
+with its domain-stream leaf, a matching stream leaf, and a dense-query head
+inside its temporal extent. The identity records the policy, native layout and
+both streams' digests, row counts and signatures. Any inconsistency leaves the
+replacement unrecognized, so history stays opaque rather than reusing another
+identity. Existing classifiers, receipts and request routing are unchanged.
+
 ## Unreleased: dense partitioned sink measure
 
 Dense partitioned requests may extend a key-measure range from row 0 through
