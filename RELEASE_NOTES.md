@@ -1,4 +1,14 @@
-## Unreleased: domain-uniform Flow stream history
+# ComfyUI-Sol-H3 v0.1.10
+
+Companion release for Flow-Aligned Regenerate v0.3.11 and VDN-H3-Plus v1.5.9.
+
+Flow v0.3.11 runs partitioned continuation with the selected ComfyUI attention
+backend; Sol-H3 is optional there. When Sol attention is selected, Flow's
+default `progressive_uniform_source` continuation presents equal-grid partitions,
+which Sol routes and records in Spectrum history as before. The packaged
+kernel and its provenance are unchanged.
+
+## Domain-uniform Flow stream history
 
 Spectrum backend history recognizes Flow's opt-in target-band
 `target_band_context=domain_uniform_v1` block replacement.
@@ -11,7 +21,7 @@ both streams' digests, row counts and signatures. Any inconsistency leaves the
 replacement unrecognized, so history stays opaque rather than reusing another
 identity. Existing classifiers, receipts and request routing are unchanged.
 
-## Unreleased: dense partitioned sink measure
+## Dense partitioned sink measure
 
 Dense partitioned requests may extend a key-measure range from row 0 through
 the packed non-video sink and into video keys. `PARTITIONED_SINK_MEASURE_API = 1`
@@ -19,11 +29,35 @@ advertises this to paired Flow/VDN. Partial sink overlap and sink-covering spars
 requests remain rejected. The range remains part of validation and completion
 identity; receipt ownership remains request/evaluation scoped.
 
-Use with [Flow #97](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/97)
-and [VDN #40](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/40) for the opt-in
+Flow v0.3.11 and VDN-H3-Plus v1.5.9 use this for the opt-in
 `target_query_sink_measure` comparison. Existing Sol requests retain their
 weighting and dispatch. This capability reuses the weighted dense kernel and
 does not establish rendered boundary quality or GPU performance.
+
+## Coordinated release set
+
+Update the coordinated components together. Every release links this same
+version set and identifies its implementation PRs.
+
+| Component | Release | Included PRs |
+| --- | --- | --- |
+| Flow-Aligned Regenerate | [v0.3.11](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.11) | [#97](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/97) |
+| Sol-H3 | [v0.1.10](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.10) | [#40](https://github.com/xmarre/ComfyUI-Sol-H3/pull/40) |
+| VDN-H3-Plus | [v1.5.9](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.9) | [#39](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/40) |
+| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | unchanged |
+| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | unchanged |
+
+[Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)
+is the unchanged companion. Separate Keyless, audio-training and rejected
+decoded-geometry experiments are outside this release set.
+
+The tested Core adapter repair is
+[ComfyUI #16783](https://github.com/Comfy-Org/ComfyUI/pull/16783).
+For INT8 fused MLP runtime adapters, retain that ComfyUI Patcher PR overlay until
+the repair is available upstream. The independent Core #16720 optimization is
+not included in this release set.
+
+---
 
 # ComfyUI-Sol-H3 v0.1.9
 

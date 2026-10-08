@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.10 — 2026-10-08
+
+- Spectrum backend history recognizes Flow's domain-uniform target-band block
+  replacement (two uniform-grid hidden streams per block) and advertises
+  `PARTITIONED_DOMAIN_STREAM_API = 1`. Inconsistent stream metadata leaves the
+  replacement opaque.
+- Dense partitioned requests may weight the packed non-video sink with a
+  key-measure range starting at row 0 (`PARTITIONED_SINK_MEASURE_API = 1`).
+  Partial sink overlap and sink-covering sparse requests remain rejected.
+
 ## v0.1.9 — 2026-10-06
 
 - Partitioned Spectrum history recognizes Flow replacement closures whose native
