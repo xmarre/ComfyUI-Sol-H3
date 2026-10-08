@@ -139,6 +139,16 @@ The historical v2 compatibility bridge expanded Q work by roughly **4.4–5.4x**
 
 Global/anchor calls remain VDN-native. Masked Flex remains VDN-native; its existing grouped fallback can use v3.
 
+### Flow partitioned exact-prefix continuation
+
+From Flow v0.3.11, partitioned continuation runs with the selected ComfyUI
+attention backend; Sol-H3 is an optional backend there, not a requirement.
+Flow's default `progressive_uniform_source` continuation evaluates reduced-grid
+low/probe and target-grid high stages as equal-grid partitions. With Sol
+selected, VDN-H3-Plus v1.5.9 routes their local query groups through Sol's own
+sparse selection, as in a non-partitioned call, and Sol records the stages in
+Spectrum history.
+
 ### Flow mixed-grid external sequence
 
 Flow's explicit API-2 contract:
@@ -172,6 +182,7 @@ Production-only history issues found during validation were fixed narrowly:
 - Flow's marked layout wrapper and mixed-grid wrapper are recognized only when exact marker/closure/geometry invariants agree;
 - progressive high stages consume Flow's explicit continuation contract so the one-evaluation trajectory warmup is not spuriously restarted;
 - Flow's partitioned exact-prefix replacement is recognized for both the reduced-grid native carrier and the target-grid native carrier declared by target-band continuation (`native_carrier_grid="target"` with matching rows per frame);
+- Flow's domain-uniform target-band streams are recognized per stream when each carries a canonical equal-grid contract and matching stream leaf;
 - unknown/malformed wrappers remain opaque and force an actual call rather than weakening the gate.
 
 Untwist preprocessing remains exactly once. Receipt/provider transitions still reset incompatible history. With the v0.1.3 default `dense_evaluations=1`, backend history begins dense and the later `dense -> sol` route change is intentionally treated as a real history boundary. With the explicit `dense_evaluations=0` speed mode, history starts directly in `phase=sol` and that initial transition is absent.
@@ -336,6 +347,19 @@ The legacy `dense_warmup` telemetry value counts attention calls kept dense by e
 
 A successful run with zero sparse calls is valid execution telemetry but is not evidence of SOL acceleration.
 
+### Partitioned conditioning-key measure
+
+`PARTITIONED_SINK_MEASURE_API = 1` permits dense partitioned requests to use a
+key-measure range `(0, end)` that covers the global conditioning sink and extends
+into video keys. Partial sink overlap and sink-covering sparse requests are
+rejected. Range and measure are included in weighted-dense validation and
+completion identity; receipt acceptance remains request/evaluation owned.
+
+Paired Flow/VDN can use this for the experimental `target_query_sink_measure`
+selector. This capability does not change ordinary Sol weighting or establish
+that a rendered continuation boundary improves. Existing requests retain their
+range and numerical policy.
+
 ## Release notes and coordinated release set
 
 See [CHANGELOG.md](CHANGELOG.md) and [RELEASE_NOTES.md](RELEASE_NOTES.md) for per-version scope, validation evidence and historical release notes.
@@ -344,10 +368,10 @@ Sol-H3 is released together with the other H3 components:
 
 | Component | Release | Included PRs |
 | --- | --- | --- |
-| Flow-Aligned Regenerate | [v0.3.10](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.10) | [#96](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/96) |
-| Sol-H3 | [v0.1.9](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.9) | [#39](https://github.com/xmarre/ComfyUI-Sol-H3/pull/39) |
-| VDN-H3-Plus | [v1.5.8](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.8) | [#38](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/38) |
-| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | [#39](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/40) |
+| Flow-Aligned Regenerate | [v0.3.11](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.11) | [#97](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/97) |
+| Sol-H3 | [v0.1.10](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.10) | [#40](https://github.com/xmarre/ComfyUI-Sol-H3/pull/40) |
+| VDN-H3-Plus | [v1.5.9](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.9) | [#39](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/40) |
+| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | unchanged |
 | Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | unchanged |
 
 [Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)

@@ -184,8 +184,9 @@ def test_failed_weighted_dense_cannot_publish_completion_or_cache_success(monkey
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("prefix_range", [(11, 79), (0, 79)])
 @pytest.mark.parametrize("q_rows,kv_rows", [(65, 193), (672, 3011)])
-def test_real_sm120_weighted_dense_request_and_native_gate(q_rows, kv_rows):
+def test_real_sm120_weighted_dense_request_and_native_gate(q_rows, kv_rows, prefix_range):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires real SM120")
     from sol_h3.provenance import verify_source
@@ -196,16 +197,74 @@ def test_real_sm120_weighted_dense_request_and_native_gate(q_rows, kv_rows):
     forward = _FORWARD.set((None, state, 0, None, []))
     try:
         with torch.inference_mode():
-            got, receipt = _call(q, k, v)
+            got, receipt = _call(q, k, v, prefix_range=prefix_range)
             assert _accept_partitioned_receipt(receipt)
-            again, _ = _call(q, k, v)
+            again, _ = _call(q, k, v, prefix_range=prefix_range)
             torch.testing.assert_close(got, again, rtol=0, atol=0)
             rounded = torch.zeros(len(k), device=q.device)
-            rounded[11:79] = torch.tensor(math.log(330 / 672), dtype=q.dtype).float()
+            rounded[slice(*prefix_range)] = torch.tensor(math.log(330 / 672), dtype=q.dtype).float()
             from sol_h3.sparse import arithmetic_gate_passes, error_metrics
             metrics = error_metrics(got, _oracle(q, k, v, rounded, 128 ** -0.5))
             assert arithmetic_gate_passes(metrics), metrics
         assert len(state.gates) == 1 and state.partitioned_weighted_dense_calls == 2
+    finally:
+        _FORWARD.reset(forward)
+        _REQUEST.reset(token)
+
+
+def test_weighted_dense_may_extend_the_measure_over_the_global_sink(monkeypatch):
+    native, kernels = _host_runtime(monkeypatch)
+    q, k, v = _inputs()
+    state = Request(Config(backend="sol"))
+    token = _REQUEST.set(state)
+    forward = _FORWARD.set((None, state, 0, None, []))
+    try:
+        output, receipt = _call(q, k, v, prefix_range=(0, 79))
+        assert _accept_partitioned_receipt(receipt)
+        with pytest.raises(RuntimeError, match="overlaps the global sink"):
+            _call(q, k, v, prefix_range=(5, 79))
+    finally:
+        _FORWARD.reset(forward)
+        _REQUEST.reset(token)
+    assert request.PARTITIONED_SINK_MEASURE_API == 1
+    rounded = torch.zeros(len(k))
+    rounded[0:79] = torch.tensor(math.log(330 / 672), dtype=q.dtype).float()
+    torch.testing.assert_close(kernels[-1]["key_bias"], rounded, rtol=0, atol=0)
+    torch.testing.assert_close(output, _oracle(q, k, v, rounded, 128 ** -0.5), rtol=0, atol=0)
+
+
+def test_sink_measure_rejects_sparse_without_completion_or_success_cache(monkeypatch):
+    native, kernels = _host_runtime(monkeypatch)
+    q, k, v = _inputs()
+    state = Request(Config(backend="sol", dense_evaluations=0, dense_layers=0))
+    token = _REQUEST.set(state)
+    forward = _FORWARD.set((None, state, 5, None, []))
+    try:
+        with pytest.raises(RuntimeError, match="overlaps the global sink"):
+            _call(q, k, v, prefix_range=(0, 79), force_dense=False)
+        assert not getattr(state, "partitioned_validated_receipts", set())
+        assert not getattr(state, "partitioned_weighted_dense_verified", {})
+        assert not native and not kernels
+    finally:
+        _FORWARD.reset(forward)
+        _REQUEST.reset(token)
+
+
+def test_sink_range_is_part_of_weighted_dense_identity(monkeypatch):
+    native, kernels = _host_runtime(monkeypatch)
+    q, k, v = _inputs()
+    state = Request(Config(backend="sol"))
+    token = _REQUEST.set(state)
+    forward = _FORWARD.set((None, state, 0, None, []))
+    try:
+        baseline, a = _call(q, k, v)
+        changed, b = _call(q, k, v, prefix_range=(0, 79))
+        repeated, c = _call(q, k, v, prefix_range=(0, 79))
+        assert a[3] != b[3] and b[3] == c[3]
+        assert all(_accept_partitioned_receipt(x) for x in (a, b, c))
+        assert len(native) == 2 and len(kernels) == 3
+        assert not torch.equal(baseline, changed)
+        assert torch.equal(changed, repeated)
     finally:
         _FORWARD.reset(forward)
         _REQUEST.reset(token)

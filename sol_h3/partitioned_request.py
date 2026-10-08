@@ -39,6 +39,9 @@ PARTITIONED_DENSE_ROUTE = "partitioned_dense"
 PARTITIONED_SOL_ROUTE = "partitioned_sol"
 PARTITIONED_MAPPED_ROUTE = "partitioned_sol_mapped"
 PARTITIONED_WEIGHTED_DENSE_CONTRACT = "sm120-weighted-all-selected-v1"
+# Dense requests may extend the key measure over the global sink, so a target-grid
+# query group can weigh text/reference/audio rows like its own target-grid keys.
+PARTITIONED_SINK_MEASURE_API = 1
 MAX_WEIGHTED_DENSE_GATE_ENTRIES = 64
 MAX_BIAS_CACHE_ENTRIES = 64
 MAX_BIAS_CACHE_BYTES = 4 * 1024 * 1024
@@ -568,7 +571,8 @@ def partitioned_request_attention(
     )
     exact_end = sink_rows
     if prefix_k_range is not None:
-        if prefix_k_range[0] < sink_rows:
+        sink_measure = dense_execution and prefix_k_range[0] == 0 and prefix_k_range[1] > sink_rows
+        if prefix_k_range[0] < sink_rows and not sink_measure:
             raise RuntimeError("partitioned Sol target-prefix K/V range overlaps the global sink")
         if not dense_execution and prefix_k_range[0] != sink_rows:
             raise RuntimeError(
@@ -740,6 +744,7 @@ __all__ = [
     "PARTITIONED_MAPPED_ROUTE",
     "PARTITIONED_RECEIPT_TAG",
     "PARTITIONED_REQUEST_ABI",
+    "PARTITIONED_SINK_MEASURE_API",
     "PARTITIONED_SOL_ROUTE",
     "partitioned_request_attention",
 ]

@@ -24,6 +24,14 @@ _VDN_HISTORY_BRIDGE_MARKER = "_sol_h3_partitioned_vdn_history_bridge_v1"
 # "target" is Flow's target-band continuation, whose native sequence is the
 # uniform target grid while the partition stays [target head | source tail].
 PARTITIONED_NATIVE_CARRIER_GRIDS = ("source", "target")
+# Flow target-band domain-uniform execution runs two uniform-grid hidden streams
+# inside one block replacement. Each stream carries a canonical equal-grid
+# contract; this API version recognizes that replacement as one history identity.
+PARTITIONED_DOMAIN_STREAM_API = 1
+PARTITIONED_DOMAIN_STREAM_KEY = "h3_flow_partitioned_domain_stream_v1"
+PARTITIONED_DOMAIN_UNIFORM_IDENTITY = "h3_flow_partitioned_domain_uniform_v1"
+PARTITIONED_DOMAIN_UNIFORM_POLICY = "domain_uniform_v1"
+_DOMAIN_STREAM_NAMES = ("target", "source")
 
 
 def _native_carrier_rows_per_frame(contract, source_rows, target_rows):
@@ -288,6 +296,97 @@ def _partitioned_flow_replacement_identity(interop, patch, block_index):
     return identity, values["previous"]
 
 
+def _partitioned_flow_domain_replacement_identity(interop, patch, block_index):
+    """Recognize Flow's two-stream domain-uniform block replacement exactly."""
+    module = str(getattr(patch, "__module__", ""))
+    qualname = str(getattr(patch, "__qualname__", ""))
+    if not (
+        (
+            module == "h3_flow_regenerate.partitioned_transformer"
+            or module.endswith(".h3_flow_regenerate.partitioned_transformer")
+        )
+        and qualname.endswith("_domain_uniform_forward.<locals>.wrap.<locals>.call")
+    ):
+        return None
+
+    values = interop._closure_values(patch)
+    required = {"layer", "previous", "streams", "layout", "video_start", "inner", "domain_policy"}
+    if values is None or not required.issubset(values):
+        return None
+    if type(values["layer"]) is not int or values["layer"] != int(block_index):
+        return None
+    policy = values["domain_policy"]
+    streams = values["streams"]
+    layout = values["layout"]
+    try:
+        native_rows = int(layout.seq_len)
+        native_segments = tuple(layout.segments)
+        video_start = int(values["video_start"])
+        inner_blocks = len(values["inner"].blocks)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if (
+        policy != PARTITIONED_DOMAIN_UNIFORM_POLICY
+        or not isinstance(streams, tuple)
+        or len(streams) != len(_DOMAIN_STREAM_NAMES)
+        or not native_segments
+        or native_segments[-1] != (video_start, native_rows, "video")
+        or block_index < 0
+        or block_index >= inner_blocks
+    ):
+        return None
+
+    stream_identity = []
+    for expected_name, stream in zip(_DOMAIN_STREAM_NAMES, streams):
+        try:
+            name = str(stream.name)
+            contract = stream.contract
+            stream_layout = stream.layout
+            leaf = stream.leaf
+            head = int(stream.attention_head_t)
+            rows = int(stream_layout.seq_len)
+            signature = stream_layout.signature
+            segments = tuple(stream_layout.segments)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            name != expected_name
+            or not _same_grid_control_contract_valid(contract)
+            or rows != contract["sequence_rows"]
+            or not segments
+            or segments[-1] != (contract["video_start"], rows, "video")
+            or not isinstance(signature, tuple)
+            or len(signature) < 2
+            or signature[0] != PARTITIONED_FLOW_IDENTITY
+            or signature[-1] != (PARTITIONED_DOMAIN_STREAM_KEY, policy, name)
+            or not isinstance(leaf, dict)
+            or leaf
+            != {
+                "api": PARTITIONED_DOMAIN_STREAM_API,
+                "policy": policy,
+                "stream": name,
+                "flow_semantic_digest": contract["semantic_digest"],
+                "native_sequence_rows": native_rows,
+                "native_video_start": video_start,
+            }
+            or not contract["prefix_t"] <= head < contract["temporal"]
+        ):
+            return None
+        stream_identity.append(
+            (name, contract["semantic_digest"], rows, contract["temporal"], head, repr(signature))
+        )
+
+    identity = (
+        PARTITIONED_DOMAIN_UNIFORM_IDENTITY,
+        policy,
+        native_rows,
+        video_start,
+        repr(getattr(layout, "signature", None)),
+        tuple(stream_identity),
+    )
+    return identity, values["previous"]
+
+
 def _accept_partitioned_receipt(item) -> bool:
     from .mapped_neighbors import POLICY as MAPPED_POLICY
     from .partitioned_request import (
@@ -357,7 +456,10 @@ def _accept_partitioned_receipt(item) -> bool:
         ):
             return False
         start, end = prefix_k_range
-        if not sink_rows <= start < end <= kv_rows:
+        # Dense requests may also weigh the whole global sink: (0, end) with end
+        # beyond the sink. Sparse requests keep the measure at the sink boundary.
+        dense_sink_measure = route == PARTITIONED_DENSE_ROUTE and start == 0 and sink_rows < end <= kv_rows
+        if not (sink_rows <= start < end <= kv_rows or dense_sink_measure):
             return False
         if route != PARTITIONED_DENSE_ROUTE and start != sink_rows:
             return False
@@ -432,7 +534,14 @@ def install_partitioned_history_bridge() -> None:
             identity = released(patch, block_index)
             if identity is not None:
                 return identity
-            return _partitioned_flow_replacement_identity(
+            identity = _partitioned_flow_replacement_identity(
+                interop,
+                patch,
+                block_index,
+            )
+            if identity is not None:
+                return identity
+            return _partitioned_flow_domain_replacement_identity(
                 interop,
                 patch,
                 block_index,
@@ -488,6 +597,9 @@ def install_partitioned_history_bridge() -> None:
 
 
 __all__ = [
+    "PARTITIONED_DOMAIN_STREAM_API",
+    "PARTITIONED_DOMAIN_STREAM_KEY",
+    "PARTITIONED_DOMAIN_UNIFORM_IDENTITY",
     "PARTITIONED_FLOW_IDENTITY",
     "PARTITIONED_NATIVE_CARRIER_GRIDS",
     "install_partitioned_history_bridge",
