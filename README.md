@@ -89,8 +89,10 @@ and recompute Q in bounded projection chunks. With the compatible
 overlay, eligible VDN native forwards instead project Q/K/V in bounded chunks
 into three independent full-length BF16 carriers, preserving VDN's learned
 linear branch and grouped softmax while avoiding its redundant full-V clone.
-The VDN path does not recompute Q. Physical Flow partitioned attention and
-unqualified runtime projection hooks retain their established owners. Native
+The VDN path does not recompute Q. With the paired VDN partitioned wrapper
+(API 2), Flow's physical low/probe/high domains can use this bounded projection
+without changing any Flow attention or temporal/linear ownership. Unqualified
+runtime projection hooks retain their established owners. Native
 two-pass projection adds compute; sampler memory/time and GPU output parity
 remain unmeasured. [Memory details](docs/MEMORY.md).
 

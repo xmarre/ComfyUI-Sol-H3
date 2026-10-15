@@ -183,7 +183,12 @@ not the native Sol two-pass Q streamer. Its counters are
 `streamed_vdn_projection_calls` and `streamed_vdn_projection_rows`, separate from
 `streamed_blocks`.
 
-Physical Flow partitioned producers still own their Q/K/V domains. Those
+VDN's Flow-aware partitioned forward can use the same carrier producer when
+the VDN object-patch wrapper advertises bounded-projection API 2. This is a
+QKV allocation-only change: physical mixed/equal-grid domains, protected
+prefix weighting, grouped attention, diagnostics and pre-/post-RoPE raw
+linear reads continue in their original owners. The wrapper must explicitly
+publish API 2 or Sol rejects the partitioned admission. Other foreign physical
 producers, weighted measures and inherited preprocessing remain on their
 established path;
 the native producer must not bypass them. Runtime projection weight/bias hooks
@@ -254,9 +259,9 @@ delegated owners. Record actual/forecast NFE counts and inherited dense backend.
 Exercise native single-chunk, VDN (with and without the companion bounded
 projection VDN overlay), Flow continuation, mixed-grid/partitioned and Spectrum
 on/off configurations. Require `streamed_vdn_projection_calls > 0` before
-attributing a VDN workload's memory change to bounded QKV projection. Physical
-Flow partitioned execution remains delegated without that saving. Compare
-the same continuation with `qkv_chunk_size=0` and `4096`, verifying exact
+attributing a VDN workload's memory change to bounded QKV projection. VDN-owned physical Flow partitioned execution can now use this same bounded
+projection path; require nonzero `streamed_vdn_projection_calls` on the
+actual low/probe/high stages. Compare the same continuation with `qkv_chunk_size=0` and `4096`, verifying exact
 audio/video prefix ownership, full attention receipts, runtime retention and
 decoded quality on a real SM120/SM121 device. Repeat generations
 with prompt/reference changes; check post-request live memory against equivalent

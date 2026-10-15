@@ -59,10 +59,13 @@ def ineligible_reason(block, args, state, previous, *, vdn=False):
     # These integrations own raw Q/K/V, transforms, physical key measures, or
     # query domains. Keep their established producer and provider contracts.
     if vdn:
-        # The VDN forward owns full raw Q/K/V, window geometry and its learned
-        # linear branch. Never take over its attention operator or physical Flow
-        # partitioned production; offer only independently-owned QKV carriers.
-        if options.get("h3_flow_partitioned_stage_v1") is not None:
+        # All VDN attention/linear/physical domain operations remain VDN-owned.
+        # The Flow wrapper advertises API 2 only if it can also consume the
+        # checked independent-carrier producer on its partitioned path.
+        partitioned = options.get("h3_flow_partitioned_stage_v1") is not None
+        producer_api = getattr(getattr(getattr(block, "attn", None), "forward", None),
+                               "_vdn_bounded_projection_api", None)
+        if partitioned and producer_api != 2:
             return "vdn_partitioned_owner"
     else:
         if any(options.get(key) is not None for key in (
@@ -83,7 +86,7 @@ def ineligible_reason(block, args, state, previous, *, vdn=False):
     if vdn:
         # Require the matching VDN consumer to advertise this ownership ABI.
         # Previous VDN versions intentionally fall back to full native QKV.
-        if getattr(attn.forward, "_vdn_bounded_projection_api", None) != 1:
+        if getattr(attn.forward, "_vdn_bounded_projection_api", None) not in (1, 2):
             return "vdn_producer_api"
     elif getattr(attn.forward, "__func__", None) is not Attention.forward:
         return "block_or_attention_owner"

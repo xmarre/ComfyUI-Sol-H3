@@ -437,3 +437,5 @@ def test_vdn_projection_admission_requires_explicit_matching_forward_capability(
         assert streamed.ineligible_reason(block, args, state, None, vdn=True) is None
         options["h3_flow_partitioned_stage_v1"] = object()
         assert streamed.ineligible_reason(block, args, state, None, vdn=True) == "vdn_partitioned_owner"
+        vdn_forward._vdn_bounded_projection_api = 2
+        assert streamed.ineligible_reason(block, args, state, None, vdn=True) is None
