@@ -172,7 +172,7 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
     from comfy.patcher_extension import WrapperExecutor, WrappersMP
     from vdn_h3.hybrid import VDNState, apply_vdn
     from vdn_h3.softmax_provider import PROVIDER_API_VERSION
-    from sol_h3 import runtime, sparse
+    from sol_h3 import runtime, sparse, streamed
     from sol_h3.contracts import Config
     from sol_h3.runtime import install, _REQUEST
 
@@ -202,9 +202,11 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
         "softmax_gate.up.bias": gate_bias,
     })
     apply_vdn(patcher, vdn_state)
-    assert all(getattr(patcher.object_patches[
-        f"diffusion_model.blocks.{i}.attn.forward"], "_vdn_forward", False)
-        for i in range(3))
+    assert all(
+        getattr(patcher.object_patches[f"diffusion_model.blocks.{i}.attn.forward"],
+                "_vdn_bounded_projection_api", None) == 1
+        for i in range(3)
+    )
 
     preprocess_calls = []
     def transform(q, k, v, heads, **kw):
@@ -234,7 +236,7 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
         to = dict(sol.model_options["transformer_options"])
         to.update({"cond_or_uncond": [0], "uuids": ["positive"]})
 
-        def actual():
+        def actual(*, expect_bounded):
             executor = WrapperExecutor.new_class_executor(
                 patched._forward, patched,
                 sol.get_all_wrappers(WrappersMP.DIFFUSION_MODEL))
@@ -250,10 +252,30 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
             assert state.vdn_kernel_q_rows == state.vdn_requested_q_rows > 0
             assert state.fallbacks["vdn_global_native"] > 0
             assert state.fallbacks["vdn_provider_contract_missing"] == 0
+            if expect_bounded:
+                assert state.streamed_vdn_projection_calls == len(patched.blocks)
+                assert state.streamed_vdn_projection_rows > 0
+            else:
+                assert state.streamed_vdn_projection_calls == 0
+            return out
 
-        with torch.no_grad():
-            WrapperExecutor.new_executor(
-                actual, sol.get_all_wrappers(WrappersMP.OUTER_SAMPLE)).execute()
+        def run(expect_bounded):
+            with torch.no_grad():
+                return WrapperExecutor.new_executor(
+                    lambda: actual(expect_bounded=expect_bounded),
+                    sol.get_all_wrappers(WrappersMP.OUTER_SAMPLE)).execute()
+
+        baseline = run(False)
+        # Only force CPU admission. A real CUDA request must still satisfy all
+        # device, source, hook, duration and physical-domain guards.
+        monkeypatch.setattr(
+            streamed, "ineligible_reason",
+            lambda _block, _args, _state, _previous, *, vdn=False:
+                None if vdn else "short_sequence",
+        )
+        bounded = run(True)
+        for produced, expected in zip(bounded, baseline, strict=True):
+            torch.testing.assert_close(produced, expected, atol=0, rtol=0)
         assert preprocess_calls
     finally:
         sol.unpatch_model(unpatch_weights=False)
