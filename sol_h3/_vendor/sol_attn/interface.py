@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular/mapped SM120 geometry and streamed query origin; see the recorded tools/*sm120.patch stack.
 """Public Sol-Attn interface."""
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import threading
 import torch
 
 BLOCK_SIZE = 64
-MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4"
+MAPPED_NEIGHBOR_CONTRACT = "sana-sol-engine-sol-attn-64-rect-sm120-query-origin-v5"
 _CUTE_BACKENDS = {
     (9, 0): "cute_sm90",
     (10, 0): "cute_sm100",
@@ -25,6 +25,29 @@ _CUTE_BACKENDS = {
 }
 _compiled = {}
 _compile_lock = threading.Lock()
+
+
+class PreparedKV:
+    """Invocation-owned BF16 summaries; valid only for these unmodified K/V views."""
+
+    def __init__(self, k, v):
+        arch = _validate_inputs(k, k, v, "diag")
+        if _backend_for_arch(arch) != "cute_sm120":
+            raise ValueError("Prepared K/V requires cute_sm120")
+        from .preprocess import _reduce_kv
+        self.k, self.v = k, v
+        self._versions = tuple(None if t.is_inference() else t._version for t in (k, v))
+        self._stream_id = torch.cuda.current_stream(k.device).cuda_stream
+        with torch.cuda.device(k.device):
+            self.kc, self.vc = _reduce_kv(k, v)
+
+    def check(self, k, v):
+        if not k.is_set_to(self.k) or not v.is_set_to(self.v):
+            raise ValueError("Prepared K/V does not belong to these K/V views")
+        if torch.cuda.current_stream(k.device).cuda_stream != self._stream_id:
+            raise ValueError("Prepared K/V must execute on its allocating CUDA stream")
+        if any(version is not None and tensor._version != version for tensor, version in zip((k, v), self._versions)):
+            raise ValueError("Prepared K/V was modified after its summaries were computed")
 
 
 def _validate_inputs(
@@ -224,6 +247,7 @@ def _compile_sm120(
         scale,
         sink_start_block,
         sink_end_block,
+        0,  # runtime global query-block origin; ordinary callers start at zero
         stream=stream,
         options="--enable-tvm-ffi",
     )
@@ -246,6 +270,8 @@ def _sol_attn_cute(
     valid_tokens=None,
     key_bias=None,
     mapped_neighbor_intervals=None,
+    query_start=0,
+    prepared_kv=None,
 ):
     from .preprocess import prepare
 
@@ -255,16 +281,18 @@ def _sol_attn_cute(
     valid_blocks = (kv_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     with torch.cuda.device(q.device):
-        kc, vc, threshold = prepare(
-            q,
-            k,
-            v,
-            scale=scale,
-            tau=tau,
-            thresh_type=thresh_type,
-            valid_tokens=tokens,
-            valid_kv_tokens=kv_tokens,
-        )
+        if prepared_kv is None:
+            kc, vc, threshold = prepare(
+                q, k, v, scale=scale, tau=tau, thresh_type=thresh_type,
+                valid_tokens=tokens, valid_kv_tokens=kv_tokens,
+            )
+        else:
+            if arch not in ((12, 0), (12, 1)) or thresh_type != "diag":
+                raise ValueError("Prepared K/V requires SM120/SM121 diagonal thresholds")
+            prepared_kv.check(k, v)
+            from .preprocess import _compute_diag_threshold
+            kc, vc = prepared_kv.kc, prepared_kv.vc
+            threshold = _compute_diag_threshold(q, kc, tau=tau, scale=scale, valid_kv_tokens=kv_tokens)
         output = torch.empty_like(q)
         lse = torch.empty(
             (batch, capacity_tokens, heads),
@@ -403,6 +431,7 @@ def _sol_attn_cute(
                 scale,
                 sink_start_block,
                 sink_end_block,
+                query_start // BLOCK_SIZE,
                 stream=stream,
             )
     return output[:, :tokens]
@@ -475,6 +504,8 @@ def sol_attn(
     compile_bucket_size: int | None = None,
     key_bias: torch.Tensor | None = None,
     mapped_neighbor_intervals: torch.Tensor | None = None,
+    query_start: int = 0,
+    prepared_kv: PreparedKV | None = None,
 ) -> torch.Tensor:
     """Compute noncausal Sol-Attn for innermost-contiguous BF16 BTHD tensors.
 
@@ -494,6 +525,12 @@ def sol_attn(
     if kv_splits not in (1, 2, 4):
         raise ValueError("kv_splits must be 1, 2, or 4")
     backend = _backend_for_arch(arch)
+    if type(query_start) is not int or query_start < 0 or query_start % BLOCK_SIZE:
+        raise ValueError("query_start must be a nonnegative multiple of 64")
+    if (query_start or prepared_kv is not None) and backend != "cute_sm120":
+        raise ValueError("Streamed query execution requires cute_sm120")
+    if prepared_kv is not None and not isinstance(prepared_kv, PreparedKV):
+        raise TypeError("prepared_kv must be an invocation-owned PreparedKV")
     if key_bias is not None:
         if backend != "cute_sm120":
             raise ValueError("key_bias is currently supported by cute_sm120 only")
@@ -566,6 +603,8 @@ def sol_attn(
         valid_tokens=valid_tokens,
         key_bias=key_bias,
         mapped_neighbor_intervals=mapped_neighbor_intervals,
+        query_start=query_start,
+        prepared_kv=prepared_kv,
     )
 
 

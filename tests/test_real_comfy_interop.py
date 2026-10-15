@@ -46,6 +46,59 @@ def test_real_modelpatcher_duplicate_owner_and_wrappers(native):
     assert _REQUEST.get() is None
 
 
+def test_real_native_projection_streaming_keeps_dense_provider_ownership(native, monkeypatch):
+    """CPU integration/ordering only; the native CUDA arithmetic gate is separate."""
+    from types import SimpleNamespace
+    from comfy.ldm.minimax.model import Attention, rope_rotation_table
+    from sol_h3 import runtime, streamed
+    from sol_h3.contracts import Config
+    from sol_h3.runtime import BlockPatch, Request, _FORWARD
+    from sol_h3.native_contract import function_digest
+    assert function_digest(Attention.forward) in streamed.NATIVE_ATTENTION_DIGESTS
+    torch.manual_seed(719)
+    attn = Attention(128, 2, 128, 1e-5, dtype=torch.bfloat16, device="cpu", operations=torch.nn).eval()
+    attn.requires_grad_(False)
+    x = torch.randn(257, 128, dtype=torch.bfloat16)
+    angles = torch.randn(257, 48).repeat(1, 2)
+    rope = rope_rotation_table(angles, x.dtype)
+    calls = []
+
+    def inherited(original, q, k, v, heads, mask=None, **kwargs):
+        calls.append((q.shape[2], k.shape[2]))
+        output = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        return output if kwargs.get("skip_output_reshape") else output.transpose(1, 2).flatten(2)
+
+    config = Config(exact=False, backend="sol", qkv_chunk_size=64)
+    state = Request(config)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=attn)])
+    token = _FORWARD.set((model, state, 0, set(), []))
+    # Execute the actual Core projection/RoPE/dispatch on CPU. Only admission
+    # is bypassed; this does not qualify the CUDA path numerically.
+    monkeypatch.setattr(streamed, "ineligible_reason", lambda *args: None)
+    monkeypatch.setattr(runtime, "_shape_reason", lambda *args, **kwargs: None)
+    layout = SimpleNamespace(seq_len=257, segments=[(0, 65, "text"), (65, 257, "video")])
+    options = {"optimized_attention_override": inherited, "minimax_h3_layout": layout}
+
+    def block(args):
+        return {"img": args["attention"](args["img"], rope_freqs=args["rope_freqs"],
+                                          transformer_options=args["transformer_options"])}
+
+    try:
+        with torch.inference_mode():
+            expected = attn(x, rope_freqs=rope, transformer_options=options)
+            calls.clear()
+            actual = BlockPatch(0, config)({"img": x, "rope_freqs": rope, "layout": layout,
+                                            "transformer_options": options}, {"original_block": block})["img"]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert calls == [(64, 257)] * 4 + [(1, 257)]
+        assert state.streamed_blocks == 1 and state.streamed_q_rows == 257
+        assert state.dense_calls == 5
+        assert state.last_routes is None
+        assert options["optimized_attention_override"] is inherited
+    finally:
+        _FORWARD.reset(token)
+
+
 @pytest.mark.parametrize("mode", ["auto", "sageattn3"])
 def test_actual_kj_sage_wrapper_and_comfy_recursion(native, monkeypatch, mode):
     kj = os.environ.get("KJNODES_PATH")

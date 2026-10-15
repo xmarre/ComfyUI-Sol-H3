@@ -171,7 +171,8 @@ def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatc
         calibration_identity="measure-a",
     )
     assert out.shape == (1, 260, 256)
-    assert [c["sink_tokens"] for c in calls] == [260, 192]
+    assert [c["sink_tokens"] for c in calls] == [260] * 5 + [192]
+    assert [c.get("query_start", 0) for c in calls[:5]] == [0, 64, 128, 192, 256]
     assert all(c["sink_start"] == 0 for c in calls)
     assert all(c["key_bias"] is bias for c in calls)
     assert len(state.gates) == 1
@@ -182,7 +183,7 @@ def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatc
         exact_k_blocks=(0, 3),
         calibration_identity="measure-a",
     )
-    assert len(calls) == 3
+    assert len(calls) == 7
     assert len(state.gates) == 1
 
     other = bias.clone()
@@ -193,7 +194,7 @@ def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatc
         exact_k_blocks=(0, 3),
         calibration_identity="measure-b",
     )
-    assert len(calls) == 5
+    assert len(calls) == 13
     assert len(state.gates) == 2
 
 
@@ -226,7 +227,7 @@ def test_weighted_bridge_clamps_empty_exact_k_range_to_k_rows(monkeypatch):
     )
 
     assert out.shape == (1, 130, 256)
-    assert [call["sink_tokens"] for call in calls] == [130, 0]
+    assert [call["sink_tokens"] for call in calls] == [130] * 3 + [0]
     assert calls[-1]["sink_start"] == 130
 
 
