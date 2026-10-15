@@ -15,6 +15,7 @@ class Config:
     tau: float = 1.0
     dense_evaluations: int = 1
     dense_layers: int = 2
+    qkv_chunk_size: int = 4096
 
     def __post_init__(self):
         if self.backend not in {"inherit", "sol"}:
@@ -25,6 +26,8 @@ class Config:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
+        if type(self.qkv_chunk_size) is not int or self.qkv_chunk_size < 0 or self.qkv_chunk_size % 64:
+            raise ValueError("qkv_chunk_size must be zero or a positive multiple of 64")
 
     def metadata(self):
         owns_sol = self.backend == "sol"
@@ -36,6 +39,7 @@ class Config:
                 "kernel_contract": CONTRACT if owns_sol else None,
                 "sol_source": SOURCE if owns_sol else None,
                 "sana_revision": REVISION if owns_sol else None,
+                "qkv_producer": "bf16-kv-two-pass-q-v1" if owns_sol and self.qkv_chunk_size else "native",
                 "exact_kernel": "rounded-affine-v1" if self.exact else "native",
                 "history_policy": "attention_backend_history_v1"}
         data["fingerprint"] = hashlib.sha256(

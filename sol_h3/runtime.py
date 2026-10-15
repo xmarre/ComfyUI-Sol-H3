@@ -62,6 +62,10 @@ class Request:
     disabled_dense_providers: set = field(default_factory=set)
     exact_verified: set = field(default_factory=set)
     sparse_verified: set = field(default_factory=set)
+    streamed_native_verified: dict = field(default_factory=dict)
+    streamed_blocks: int = 0
+    streamed_q_rows: int = 0
+    streamed_skips: Counter = field(default_factory=Counter)
     dense_attention_backends: set = field(default_factory=set)
     gates: list = field(default_factory=list)
     kernel: object = None
@@ -88,7 +92,9 @@ class SamplingWrapper:
         token = _REQUEST.set(state)
         success = False
         try:
-            result = executor(*args, **kwargs)
+            from .memory_profile import sampling
+            with sampling(self.config):
+                result = executor(*args, **kwargs)
             success = True
             return result
         finally:
@@ -104,6 +110,9 @@ class SamplingWrapper:
                         "sol_backend": getattr(state.kernel, "backend_name", None),
                         "sol_source_tree_verified": getattr(state.kernel, "source_tree_verified", False),
                         "sparse_calls": state.sparse_calls,
+                        "streamed_blocks": state.streamed_blocks,
+                        "streamed_q_rows": state.streamed_q_rows,
+                        "streamed_skips": dict(state.streamed_skips),
                         "dense_warmup": state.dense_calls,
                         "external_mixed_sol_calls": state.external_mixed_sol_calls,
                         "external_mixed_q_rows": state.external_mixed_q_rows,
@@ -169,6 +178,8 @@ class DiffusionWrapper:
         seen = set()
         routes = []
         token = _FORWARD.set((model, state, state.evaluations, seen, routes))
+        from .memory_profile import mark
+        mark("evaluation_enter", evaluation=state.evaluations)
         try:
             result = executor(x, timestep, context, options, **kwargs)
             if seen:
@@ -178,6 +189,7 @@ class DiffusionWrapper:
                 state.last_routes = identity
             return result
         finally:
+            mark("evaluation_exit", evaluation=state.evaluations)
             _FORWARD.reset(token)
 
 
@@ -316,6 +328,9 @@ class BlockPatch:
         route_start = len(routes)
 
         def record(route, fallback=False, measure_plan=None, fields=None):
+            from .streamed import _STREAM
+            if route in {"sol", "dense_warmup"} and _STREAM.get() is not None:
+                route += "_streamed"
             routes.append((self.index, route))
             receipt(
                 options, self.index, route,
@@ -380,7 +395,15 @@ class BlockPatch:
                     return out
 
                 current_options = kw.get("transformer_options") or options
-                reason = _shape_reason(q, k, v, heads, mask, kw)
+                from .streamed import _STREAM
+                stream = _STREAM.get()
+                if stream is not None:
+                    stream.check(q, k, v)
+                reason = _shape_reason(q, k, v, heads, mask, kw, rectangular=stream is not None)
+                from .memory_profile import enabled, mark, storage_bytes
+                if reason is None and enabled():
+                    mark("attention_provider_enter", block=self.index, rows=q.shape[2], kv_rows=k.shape[2],
+                         qkv_storage_bytes=storage_bytes(q, k, v))
                 if current_options.get("minimax_h3_untwist_rope", {}).get("enabled") and not hasattr(
                     previous, "attention_preprocess_v1"
                 ):
@@ -401,7 +424,7 @@ class BlockPatch:
                     external_mixed = reason is None
                 elif reason is None:
                     try:
-                        prefix = prefix_length(layout, q.shape[2])
+                        prefix = prefix_length(layout, q.shape[2] if stream is None else stream.rows)
                     except RuntimeError:
                         reason = "packed_layout_not_representable"
 
@@ -528,7 +551,13 @@ class BlockPatch:
 
                 from .sparse import attention, KernelUnavailable
                 try:
-                    result = attention(q, k, v, prefix, config, state, dense_attention=dense_attention)
+                    if stream is None:
+                        result = attention(q, k, v, prefix, config, state, dense_attention=dense_attention)
+                    else:
+                        result = attention(
+                            q, k, v, prefix, config, state, dense_attention=dense_attention,
+                            query_start=stream.query_start, kv_workspace=stream,
+                        )
                 except KernelUnavailable as exc:
                     record("kernel_unavailable:" + str(exc), True)
                     dense_provider = previous
@@ -734,6 +763,20 @@ class BlockPatch:
 
         def original_block(call_args):
             block = model.blocks[self.index]
+            if config.backend == "sol":
+                from .streamed import attention as streamed_attention, ineligible_reason as stream_reason
+                reason = stream_reason(block, call_args, state, previous)
+                if reason is None:
+                    def streamed(h, rope_freqs=None, transformer_options=None):
+                        result = streamed_attention(
+                            block.attn, h, rope_freqs, transformer_options, config.qkv_chunk_size,
+                        )
+                        state.streamed_blocks += 1
+                        state.streamed_q_rows += h.shape[0]
+                        return result
+                    call_args = {**call_args, "attention": streamed}
+                else:
+                    state.streamed_skips[reason] += 1
             if config.exact:
                 from .exact import execute_block, ineligible_reason
                 reason = ineligible_reason(block, call_args)

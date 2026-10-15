@@ -39,10 +39,10 @@ EXPECTED_SOL_BLOBS = {
     "sol_h3/mapped_neighbors.py": "834323e2bbafa5f39467b82327e344cf3368a21e",
     # Reference dispatch/host statistics changed; preserved GPU captures still
     # qualify their original source and do not establish this candidate's speed.
-    "sol_h3/sparse.py": "86db5c25797813d99101cb5bc8253f9d0f018903",
-    "sol_h3/provenance.py": "e3d0e3341d18e21080c33bf0f6fae4b8ebe0e237",
-    "sol_h3/sol_manifest.json": "c756d399d19b75ee4f8cda9ed4e959118dc901c7",
-    "tools/mapped_neighbor_probe.py": "445055a66699e66d33da52242749248b2abcae4d",
+    "sol_h3/sparse.py": "b8f381fdd2698e150952fbcfae42666b9d2dabdf",
+    "sol_h3/provenance.py": "abc5d384c79fe16b463abe4556494d34333ecf40",
+    "sol_h3/sol_manifest.json": "5479eb8d1eabe7765b392bc346daf540a72f7ace",
+    "tools/mapped_neighbor_probe.py": "60ee67bb558dafbd3616954c7d117839fd359b03",
 }
 EXPECTED_VDN_BLOBS = {
     "vdn_h3/query_positions.py": "cadb2ad93da16cdc11365f2c4008527d2ccdbb4d",
