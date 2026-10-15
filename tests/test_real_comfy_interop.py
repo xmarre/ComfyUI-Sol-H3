@@ -217,7 +217,7 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
     inherited.attention_preprocess_v1 = (transform, None)
     patcher.model_options["transformer_options"]["optimized_attention_override"] = inherited
 
-    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0, qkv_chunk_size=64)
     sol = install(patcher, cfg)
     monkeypatch.setattr(runtime, "_shape_reason", lambda *a, **kw: None)
     def oracle(q, k, v, **kw):
