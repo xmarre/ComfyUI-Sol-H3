@@ -55,7 +55,7 @@ def test_dynamic_compile_reuses_shapes_and_strides_but_rebinds_all_live_argument
 
         def compiled(*args, **kwargs):
             q, k, v, output = args[:4]
-            launches.append((q.shape[1], k.shape[1], args[-2:]))
+            launches.append((q.shape[1], k.shape[1], args[-3:-1], args[-1]))
             output.copy_(_reference(q[0], k[0], v[0], args[7] if biased else None).unsqueeze(0))
 
         interface._compiled[key] = compiled
@@ -78,6 +78,7 @@ def test_dynamic_compile_reuses_shapes_and_strides_but_rebinds_all_live_argument
     assert compiles == [(False, False), (True, False), (True, True)]
     assert [row[:2] for row in launches] == [(17, 75), (33, 131), (63, 193)] * 3
     assert all(row[2] == (0, (row[1] + 63) // 64) for row in launches)
+    assert all(row[3] == 0 for row in launches)  # partition-local query origin
     assert state.partitioned_kernel_compile_calls == 3
     assert state.partitioned_kernel_compile_cache_hits == 6
     assert state.partitioned_kernel_compile_wall_s >= 0.0
