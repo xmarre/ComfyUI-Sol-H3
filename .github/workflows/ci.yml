@@ -109,8 +109,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xmarre/ComfyUI-VDN-H3-Plus
-          ref: 667b080724e360d066565d21cb8147f2f9dfe1ab
+          ref: 333d63f81d33fe29dc1f1f637c5f4a4396880f99
           path: _deps/VDN
+          persist-credentials: false
+      # Keep historical interop/provenance fixtures pinned to their audited
+      # source. Run the new paired candidate in a separate test process.
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI-VDN-H3-Plus
+          ref: 7617a857eab89590a736b59af57d96508df7dcca
+          path: _deps/VDNBounded
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -127,6 +135,12 @@ jobs:
           DIFFAID_PATH: ${{ github.workspace }}/_deps/DiffAid
           FLOW_PATH: ${{ github.workspace }}/_deps/Flow
           VDN_PATH: ${{ github.workspace }}/_deps/VDN
+      - name: Validate candidate bounded VDN projection with actual Sol object patch
+        run: python -m pytest -q tests/test_real_comfy_interop.py::test_real_modelpatcher_vdn_v4_object_patch_reaches_sol
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
+          VDN_PATH: ${{ github.workspace }}/_deps/VDNBounded
+          VDN_EXPECT_BOUNDED: '1'
       - name: Validate current partitioned Flow history
         run: python -m pytest -q tests/test_real_partitioned_history.py
         env:

@@ -791,7 +791,10 @@ class BlockPatch:
                 from .streamed import attention as streamed_attention, ineligible_reason as stream_reason
                 attn_forward = getattr(getattr(block, "attn", None), "forward", None)
                 is_vdn = bool(getattr(attn_forward, "_vdn_forward", False))
-                reason = stream_reason(block, call_args, state, previous, vdn=is_vdn)
+                reason = (
+                    stream_reason(block, call_args, state, previous, vdn=True)
+                    if is_vdn else stream_reason(block, call_args, state, previous)
+                )
                 if reason is None and is_vdn:
                     projection_owner = block.attn.qkv_proj
 
