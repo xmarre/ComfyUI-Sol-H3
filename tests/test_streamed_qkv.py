@@ -386,3 +386,54 @@ def test_vdn_raw_qkv_projection_failed_chunk_does_not_retain_projection_temporar
     # The failing projection's traceback may retain its local; the preceding
     # completed chunk must have released its packed projection immediately.
     assert roots[0]() is None
+
+
+def test_vdn_projection_admission_requires_explicit_matching_forward_capability(monkeypatch):
+    class CudaFacade(torch.Tensor):
+        @property
+        def device(self):
+            return torch.device("cuda:0")
+
+    class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head_dim = 128
+            self.qkv_proj = torch.nn.Linear(128, 384, bias=False, dtype=torch.bfloat16)
+
+        def forward(self, x):
+            return x
+
+    class DiTBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attention()
+
+        def forward(self, x):
+            return x
+
+    native = ModuleType("comfy.ldm.minimax.model")
+    native.Attention = Attention
+    native.DiTBlock = DiTBlock
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (12, 0))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    block = DiTBlock()
+    x = torch.empty(513, 128, dtype=torch.bfloat16).as_subclass(CudaFacade)
+    state = Request(Config(exact=False, backend="sol", qkv_chunk_size=64))
+    options = {
+        "vdn_h3_external_sequence_v1": {"api": 2},
+        "minimax_h3_untwist_rope": {"enabled": True},
+    }
+    args = {"img": x, "rope_freqs": object(), "transformer_options": options}
+
+    def vdn_forward(x):
+        return x
+
+    vdn_forward._vdn_forward = True
+    block.attn.forward = vdn_forward
+    with torch.inference_mode():
+        assert streamed.ineligible_reason(block, args, state, None, vdn=True) == "vdn_producer_api"
+        vdn_forward._vdn_bounded_projection_api = 1
+        assert streamed.ineligible_reason(block, args, state, None, vdn=True) is None
+        options["h3_flow_partitioned_stage_v1"] = object()
+        assert streamed.ineligible_reason(block, args, state, None, vdn=True) == "vdn_partitioned_owner"
