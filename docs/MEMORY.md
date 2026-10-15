@@ -164,9 +164,28 @@ It requires an audited native Attention/DiTBlock forward, BF16, RoPE and
 SM120/SM121 inference. Unknown source, autograd, graph capture, hooks or compiled
 module calls retain native execution.
 
-VDN forwards consume raw Q/K/V for their learned linear branch. Flow partitioned
-and mixed-grid owners define physical query/key domains. Those producers,
-weighted measures and inherited preprocessing remain on their existing path;
+VDN forwards consume raw Q/K/V for their learned linear branch. With the
+cooperating VDN-H3-Plus bounded-projection API v1 installed, VDN's *native
+forward* can instead receive independent full-length BF16 Q/K/V carriers filled
+from bounded native projection chunks. Its original learned linear branch,
+post-RoPE preprocessing, grouped-window/gated softmax and output projection
+still execute in VDN. Independent V storage avoids its packed-QKV preservation
+clone. Sol requires the explicit VDN forward capability marker and does not
+modify or replace the VDN attention operator. Without a compatible VDN overlay,
+it continues to use VDN's native producer and records the skip reason.
+
+At 100,000 rows and 56 heads, native packed QKV plus VDN V clone uses
+5.3406 GiB before softmax/output. Independent Q/K/V carriers plus one 4096-row
+packed BF16 chunk use approximately 4.169 GiB, a 1.17 GiB reduction in those
+particular listed allocations. These sizes are source-derived; actual CUDA peaks
+and latency remain unmeasured. The VDN path uses **one** bounded projection pass,
+not the native Sol two-pass Q streamer. Its counters are
+`streamed_vdn_projection_calls` and `streamed_vdn_projection_rows`, separate from
+`streamed_blocks`.
+
+Physical Flow partitioned producers still own their Q/K/V domains. Those
+producers, weighted measures and inherited preprocessing remain on their
+established path;
 the native producer must not bypass them. Runtime projection weight/bias hooks
 and explicit full-precision/cast overrides also retain native execution: repeating a dynamic full-weight adapter patch per
 chunk can be both stateful and prohibitively expensive. Merged weights and
@@ -232,9 +251,14 @@ Compare allocated and reserved peaks separately. Require `streamed_blocks > 0`
 before attributing a change to native projection; inspect `streamed_skips` for
 delegated owners. Record actual/forecast NFE counts and inherited dense backend.
 
-Exercise native single-chunk, VDN, Flow continuation, mixed-grid/partitioned and
-Spectrum on/off configurations. Delegated VDN/Flow paths should preserve routing
-and quality, but have no claimed native-projection saving. Repeat generations
+Exercise native single-chunk, VDN (with and without the companion bounded
+projection VDN overlay), Flow continuation, mixed-grid/partitioned and Spectrum
+on/off configurations. Require `streamed_vdn_projection_calls > 0` before
+attributing a VDN workload's memory change to bounded QKV projection. Physical
+Flow partitioned execution remains delegated without that saving. Compare
+the same continuation with `qkv_chunk_size=0` and `4096`, verifying exact
+audio/video prefix ownership, full attention receipts, runtime retention and
+decoded quality on a real SM120/SM121 device. Repeat generations
 with prompt/reference changes; check post-request live memory against equivalent
 output/model residency. Observe device-wide usage separately if it disagrees
 with PyTorch's counters. Disable profiling for final timing comparisons.

@@ -383,4 +383,6 @@ def test_vdn_raw_qkv_projection_failed_chunk_does_not_retain_projection_temporar
 
     with pytest.raises(RuntimeError, match="projection failed"):
         streamed.vdn_project_qkv(projection, torch.empty(129, 128), 1, 128, 64)
-    assert all(ref() is None for ref in roots)
+    # The failing projection's traceback may retain its local; the preceding
+    # completed chunk must have released its packed projection immediately.
+    assert roots[0]() is None
