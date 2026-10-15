@@ -257,7 +257,9 @@ def test_vdn_qkv_provider_restores_inherited_options_on_exception(monkeypatch):
     state = Request(cfg)
     owner = object()
     seen = []
-    forward = lambda *_args: None
+    def forward(*_args):
+        return None
+
     forward._vdn_forward = True
     attn = SimpleNamespace(forward=forward, qkv_proj=owner)
     model = SimpleNamespace(blocks=[SimpleNamespace(attn=attn)])
