@@ -378,7 +378,7 @@ def _sm120_union(
             args = interface._to_cute_tensors(tensors)
             if state is not None:
                 state.partitioned_kernel_compile_cache_hits += 1
-        compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
+        compiled(*args, float(scale), sink_start_block, sink_end_block, 0, stream=stream)
     return output[0]
 
 

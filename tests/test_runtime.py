@@ -1,4 +1,5 @@
 import copy
+import gc
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -8,6 +9,42 @@ import torch
 from sol_h3 import runtime
 from sol_h3.contracts import KEY, Config
 from sol_h3.runtime import BlockPatch, DiffusionWrapper, Request, SamplingWrapper, _FORWARD, _REQUEST, install
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_block_providers_release_hidden_storage_without_cyclic_gc(fails):
+    from torch.multiprocessing.reductions import StorageWeakRef
+    cfg = Config(exact=False, backend="sol")
+    state = Request(cfg)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(forward=lambda: None))])
+    token = _FORWARD.set((model, state, 0, set(), []))
+    inherited = {"optimized_attention_override": object(), "vdn_softmax_provider_v4": object()}
+    observed = []
+
+    def block(args):
+        observed.append(args["transformer_options"])
+        if fails:
+            raise ValueError("cancelled")
+        return {}
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        x = torch.empty(193, 128, dtype=torch.bfloat16)
+        storage = StorageWeakRef(x.untyped_storage())
+        arguments = {"img": x, "transformer_options": dict(inherited)}
+        if fails:
+            with pytest.raises(ValueError, match="cancelled"):
+                BlockPatch(0, cfg)(arguments, {"original_block": block})
+        else:
+            assert BlockPatch(0, cfg)(arguments, {"original_block": block}) == {}
+        assert observed[0] == inherited
+        del x, arguments
+        assert storage.expired(), "block callbacks retained hidden storage until cyclic GC"
+    finally:
+        if enabled:
+            gc.enable()
+        _FORWARD.reset(token)
 
 
 @pytest.fixture
