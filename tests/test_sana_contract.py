@@ -64,7 +64,7 @@ def test_public_api():
     assert tuple(inspect.signature(interface.sol_attn).parameters) == (
         'q', 'k', 'v', 'scale', 'tau', 'thresh_type', 'kv_splits',
         'sink_tokens', 'sink_start', 'compile_bucket_size', 'key_bias',
-        'mapped_neighbor_intervals')
+        'mapped_neighbor_intervals', 'query_start', 'prepared_kv')
     assert interface._backend_for_arch((12, 0), cute_available=True) == 'cute_sm120'
     assert interface._backend_for_arch((12, 1), cute_available=True) == 'cute_sm120'
     assert interface._backend_for_arch((12, 0), cute_available=False) == 'triton'

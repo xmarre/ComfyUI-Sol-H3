@@ -56,7 +56,7 @@ def load_kernel(device):
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
                sink_start=0, sink_tokens=0, key_bias=None,
-               mapped_neighbor_intervals=None):
+               mapped_neighbor_intervals=None, query_start=0, prepared_kv=None):
         _sink_blocks(sink_start, sink_tokens, k.shape[1])
         return sol_attn(
             q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
@@ -64,15 +64,62 @@ def load_kernel(device):
             sink_start=sink_start, sink_tokens=sink_tokens,
             key_bias=key_bias,
             mapped_neighbor_intervals=mapped_neighbor_intervals,
+            query_start=query_start, prepared_kv=prepared_kv,
         )
 
+    from ._vendor.sol_attn.interface import PreparedKV
+    kernel.prepare_kv = PreparedKV
     kernel.backend_name = backend
     kernel.source_tree_verified = True
     kernel.block_size = BLOCK_SIZE
     return kernel
 
 
+METRIC_CHUNK_ELEMENTS = 262144
+
+
+def _metric_tiles(tensor):
+    """Slice before flattening so a strided output never creates a full copy."""
+    if tensor.numel() <= METRIC_CHUNK_ELEMENTS:
+        yield tensor
+        return
+    row_elements = math.prod(tensor.shape[1:])
+    if row_elements > METRIC_CHUNK_ELEMENTS:
+        for row in tensor.unbind(0):
+            yield from _metric_tiles(row)
+    else:
+        rows = max(1, METRIC_CHUNK_ELEMENTS // row_elements)
+        for start in range(0, tensor.shape[0], rows):
+            yield tensor[start:start + rows]
+
+
+def _bounded_error_statistics(got, want):
+    # Scalar aggregates remain on-device; the gate still transfers statistics
+    # only once. FP64 sums prevent loss of small errors across long clips.
+    stats = torch.zeros(6, dtype=torch.float64, device=got.device)
+    stats[0] = 1
+    for g, w in zip(_metric_tiles(got), _metric_tiles(want)):
+        gf, wf = g.float(), w.float()
+        delta = gf - wf
+        absolute = delta.abs()
+        stats[0].mul_(torch.isfinite(gf).all() & torch.isfinite(wf).all() & torch.isfinite(delta).all())
+        stats[1] = torch.maximum(stats[1], wf.abs().max())
+        stats[2] = torch.maximum(stats[2], absolute.max())
+        stats[3].add_(absolute.sum(dtype=torch.float64))
+        stats[4].add_(delta.double().square().sum())
+        stats[5].add_(wf.double().square().sum())
+        del gf, wf, delta, absolute
+    return torch.stack((
+        stats[0], stats[1], stats[2], stats[3] / got.numel(),
+        stats[4].sqrt() / stats[5].sqrt().clamp_min(1e-12),
+    )).tolist()
+
+
 def error_metrics(got, want):
+    if got.shape != want.shape or got.device != want.device or not got.numel():
+        raise ValueError("Arithmetic metrics require equal nonempty shapes on the same device")
+    if got.numel() > METRIC_CHUNK_ELEMENTS:
+        return _metrics_from_statistics(_bounded_error_statistics(got, want))
     got_f = got.float()
     want_f = want.float()
     delta = got_f - want_f
@@ -86,6 +133,10 @@ def error_metrics(got, want):
         abs_delta.mean(),
         torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(want_f).clamp_min(1e-12),
     )).tolist()
+    return _metrics_from_statistics(statistics)
+
+
+def _metrics_from_statistics(statistics):
     finite = bool(statistics[0])
     if not finite:
         return {
@@ -171,14 +222,16 @@ def _validate_mapped_descriptor(mapped, q, k):
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,
               calibration_identity=None, mapped_neighbor_intervals=None,
-              mapped_calibration_identity=None):
+              mapped_calibration_identity=None, query_start=0, kv_workspace=None):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
             or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
             or q.shape[0] != 1 or q.shape[-1] != 128
             or q.shape[2] == 0 or k.shape[2] == 0):
         raise RuntimeError("SOL requires Q [1, heads, Tq, 128], KV [1, heads, Tkv, 128]")
     _sink_blocks(0, prefix, k.shape[2])
-    if recompute_prefix_queries and prefix > q.shape[2]:
+    if type(query_start) is not int or query_start < 0 or query_start % BLOCK_SIZE:
+        raise RuntimeError("SOL query_start must be a nonnegative multiple of 64")
+    if recompute_prefix_queries and not query_start and kv_workspace is None and prefix > q.shape[2]:
         raise RuntimeError("Prefix query recomputation exceeds the available Q rows")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
@@ -227,6 +280,14 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
+    streamed_kwargs = {}
+    if kv_workspace is not None:
+        kv_workspace.check(q, k, v)
+        if kv_workspace.prepared_kv is None:
+            kv_workspace.prepared_kv = state.kernel.prepare_kv(kb, vb)
+        streamed_kwargs["prepared_kv"] = kv_workspace.prepared_kv
+    if query_start:
+        streamed_kwargs["query_start"] = query_start
 
     layout_key = _bthd_layout_key(qb, kb, vb)
     # Descriptor values are intentionally absent: every map with this layout reuses
@@ -240,6 +301,7 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
             sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
             mapped_neighbor_intervals=mapped_neighbor_intervals,
+            **streamed_kwargs,
         )
         want = _dense_reference(q, k, v, None, key_bias=key_bias)
         metrics = error_metrics(got, want)
@@ -272,10 +334,12 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
         sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias,
         mapped_neighbor_intervals=mapped_neighbor_intervals,
+        **streamed_kwargs,
     )
-    if prefix and recompute_prefix_queries:
-        out[:, :prefix] = _dense_reference(
-            q[:, :, :prefix], k, v, dense_attention, key_bias=key_bias
+    prefix_queries = min(q.shape[2], max(0, prefix - query_start))
+    if prefix_queries and recompute_prefix_queries:
+        out[:, :prefix_queries] = _dense_reference(
+            q[:, :, :prefix_queries], k, v, dense_attention, key_bias=key_bias
         )
     state.sparse_calls += 1
     return out.reshape(1, q.shape[2], -1)
