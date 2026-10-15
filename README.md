@@ -2,6 +2,11 @@
 
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
+**Unreleased memory architecture:** this branch adds bounded BF16 QKV production,
+bounded arithmetic qualification and deterministic temporary-callback cleanup.
+GPU memory, sampler timing and decoded-quality acceptance remain open. See
+[BF16 memory architecture and acceptance procedure](docs/MEMORY.md).
+
 Sol-H3 packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported **SM120 and SM121** Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
 
 The package has three parts:
@@ -76,6 +81,12 @@ The real packaged kernel, VDN API-v3 rectangular route, Flow mixed-grid route, S
 Apply MODEL patches and then apply **Sol-H3 SOL Attention (Experimental)** before sampling. `exact_fusion=true` also requests Exact Runtime. A later **Sol-H3 Exact Runtime** node merges with the same lifecycle rather than installing a second one.
 
 The SOL node defaults to `tau=1.0`, `dense_evaluations=1`, and `dense_layers=2`. `dense_evaluations` is a trajectory-level dense warmup; `dense_layers` is a per-evaluation leading-layer dense policy. They are not interchangeable. Set `dense_evaluations=0` only when explicitly choosing the faster SOL-first trajectory and accepting the documented startup-continuity risk.
+
+The optional `qkv_chunk_size` defaults to `4096`; `0` selects full native QKV
+production. Eligible native BF16 H3 calls above 32,768 rows retain full BF16 K/V
+and recompute Q in bounded projection chunks. Foreign attention owners and runtime
+projection hooks retain their existing producer. This adds projection work; a
+speed improvement has not been measured. [Memory details](docs/MEMORY.md).
 
 On native Windows, the node can remain in the workflow but both custom-kernel paths fail closed: SOL delegates to inherited dense attention because CuTe is unavailable, and Exact Runtime records `exact:native_windows_unvalidated` then executes the untouched native H3 block. Linux/WSL2 supports the SM120 and SM121 targets described above.
 
@@ -203,7 +214,7 @@ The bridge preserves BF16 and native H3 scaling. `sink_start=0` keeps the leadin
 Kernel contract identity:
 
 ```text
-sana-sol-engine-sol-attn-64-rect-sm120-v2
+sana-sol-engine-sol-attn-64-rect-sm120-query-origin-v5
 ```
 
 ### Zero-copy BTHD bridge
@@ -341,7 +352,15 @@ bthd_strides
 dense_provider_failures
 numerical_backend_transitions
 compatibility_fallbacks
+streamed_blocks
+streamed_q_rows
+streamed_skips
+qkv_storage_bytes
 ```
+
+Set `SOL_H3_MEMORY_PROFILE=1` when launching ComfyUI for opt-in allocated/reserved
+memory attribution on real sampler requests. [The memory procedure](docs/MEMORY.md)
+explains baseline matching, first-use/warmed measurements and remaining acceptance.
 
 The legacy `dense_warmup` telemetry value counts attention calls kept dense by either `dense_evaluations` or `dense_layers`; it is not a count of full dense denoiser evaluations. Diagnose trajectory warmup with the configured `dense_evaluations`, backend-history `phase`, `numerical_backend_transitions`, and actual/forecast topology.
 
