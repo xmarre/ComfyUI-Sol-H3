@@ -84,9 +84,15 @@ The SOL node defaults to `tau=1.0`, `dense_evaluations=1`, and `dense_layers=2`.
 
 The optional `qkv_chunk_size` defaults to `4096`; `0` selects full native QKV
 production. Eligible native BF16 H3 calls above 32,768 rows retain full BF16 K/V
-and recompute Q in bounded projection chunks. Foreign attention owners and runtime
-projection hooks retain their existing producer. This adds projection work; a
-speed improvement has not been measured. [Memory details](docs/MEMORY.md).
+and recompute Q in bounded projection chunks. With the compatible
+[VDN-H3-Plus PR #42](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/42)
+overlay, eligible VDN native forwards instead project Q/K/V in bounded chunks
+into three independent full-length BF16 carriers, preserving VDN's learned
+linear branch and grouped softmax while avoiding its redundant full-V clone.
+The VDN path does not recompute Q. Physical Flow partitioned attention and
+unqualified runtime projection hooks retain their established owners. Native
+two-pass projection adds compute; sampler memory/time and GPU output parity
+remain unmeasured. [Memory details](docs/MEMORY.md).
 
 On native Windows, the node can remain in the workflow but both custom-kernel paths fail closed: SOL delegates to inherited dense attention because CuTe is unavailable, and Exact Runtime records `exact:native_windows_unvalidated` then executes the untouched native H3 block. Linux/WSL2 supports the SM120 and SM121 targets described above.
 
@@ -354,6 +360,8 @@ numerical_backend_transitions
 compatibility_fallbacks
 streamed_blocks
 streamed_q_rows
+streamed_vdn_projection_calls
+streamed_vdn_projection_rows
 streamed_skips
 qkv_storage_bytes
 ```
