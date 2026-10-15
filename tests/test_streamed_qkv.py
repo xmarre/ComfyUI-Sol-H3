@@ -352,3 +352,35 @@ def test_real_cute_query_streaming_is_bitwise_equal_to_unsliced_kernel(rows, kv_
         torch.cuda.synchronize()
     # Query blocks and K/V arithmetic are identical; no tolerance is needed.
     assert torch.equal(output, baseline)
+
+
+@pytest.mark.parametrize("rows,chunk", [(1, 64), (65, 64), (193, 64), (513, 128)])
+def test_vdn_raw_qkv_projection_matches_full_projection_and_owns_disjoint_storage(rows, chunk):
+    torch.manual_seed(rows)
+    linear = torch.nn.Linear(16, 3 * 2 * 8, bias=False, dtype=torch.bfloat16).eval()
+    x = torch.randn(rows, 16, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        expected = tuple(p.view(rows, 2, 8).clone() for p in linear(x).split(16, -1))
+        projected = streamed.vdn_project_qkv(linear, x, 2, 8, chunk)
+    for actual, want in zip(projected, expected):
+        torch.testing.assert_close(actual, want, atol=0, rtol=0)
+    assert len({t.untyped_storage().data_ptr() for t in projected}) == 3
+
+
+def test_vdn_raw_qkv_projection_failed_chunk_does_not_retain_projection_temporary():
+    import weakref
+    roots = []
+    calls = 0
+
+    def projection(x):
+        nonlocal calls
+        calls += 1
+        tmp = x.new_zeros((len(x), 384))
+        roots.append(weakref.ref(tmp))
+        if calls == 2:
+            raise RuntimeError("projection failed")
+        return tmp
+
+    with pytest.raises(RuntimeError, match="projection failed"):
+        streamed.vdn_project_qkv(projection, torch.empty(129, 128), 1, 128, 64)
+    assert all(ref() is None for ref in roots)

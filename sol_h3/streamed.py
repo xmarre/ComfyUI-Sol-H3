@@ -38,7 +38,7 @@ class QueryStream:
             raise RuntimeError("Streamed H3 attention lost its invocation-owned K/V geometry")
 
 
-def ineligible_reason(block, args, state, previous):
+def ineligible_reason(block, args, state, previous, *, vdn=False):
     if not state.config.qkv_chunk_size:
         return "disabled"
     x = args.get("img")
@@ -58,21 +58,34 @@ def ineligible_reason(block, args, state, previous):
     options = args["transformer_options"]
     # These integrations own raw Q/K/V, transforms, physical key measures, or
     # query domains. Keep their established producer and provider contracts.
-    if any(options.get(key) is not None for key in (
-        "vdn_h3_external_sequence_v1", "h3_flow_mixed_grid_attention_measure_v1", "attention_measure_v1",
-    )) or options.get("minimax_h3_untwist_rope", {}).get("enabled"):
-        return "external_sequence_or_transform"
-    if hasattr(previous, "attention_preprocess_v1"):
-        return "inherited_preprocess"
-    try:
-        prefix_length(options.get("minimax_h3_layout", args.get("layout")), x.shape[0])
-    except RuntimeError:
-        return "packed_layout"
+    if vdn:
+        # The VDN forward owns full raw Q/K/V, window geometry and its learned
+        # linear branch. Never take over its attention operator or physical Flow
+        # partitioned production; offer only independently-owned QKV carriers.
+        if options.get("h3_flow_partitioned_stage_v1") is not None:
+            return "vdn_partitioned_owner"
+    else:
+        if any(options.get(key) is not None for key in (
+            "vdn_h3_external_sequence_v1", "h3_flow_mixed_grid_attention_measure_v1", "attention_measure_v1",
+        )) or options.get("minimax_h3_untwist_rope", {}).get("enabled"):
+            return "external_sequence_or_transform"
+        if hasattr(previous, "attention_preprocess_v1"):
+            return "inherited_preprocess"
+        try:
+            prefix_length(options.get("minimax_h3_layout", args.get("layout")), x.shape[0])
+        except RuntimeError:
+            return "packed_layout"
     from comfy.ldm.minimax.model import Attention, DiTBlock
     from torch.nn.modules import module as hooks
     attn = getattr(block, "attn", None)
-    if (type(block) is not DiTBlock or getattr(block.forward, "__func__", None) is not DiTBlock.forward
-            or type(attn) is not Attention or getattr(attn.forward, "__func__", None) is not Attention.forward):
+    if type(block) is not DiTBlock or getattr(block.forward, "__func__", None) is not DiTBlock.forward or type(attn) is not Attention:
+        return "block_or_attention_owner"
+    if vdn:
+        # Require the matching VDN consumer to advertise this ownership ABI.
+        # Previous VDN versions intentionally fall back to full native QKV.
+        if getattr(attn.forward, "_vdn_bounded_projection_api", None) != 1:
+            return "vdn_producer_api"
+    elif getattr(attn.forward, "__func__", None) is not Attention.forward:
         return "block_or_attention_owner"
     if attn.head_dim != 128 or args.get("rope_freqs") is None:
         return "head_or_rope_geometry"
@@ -97,6 +110,8 @@ def ineligible_reason(block, args, state, previous):
     producer = getattr(attn.qkv_proj.forward, "__func__", None)
     if producer is None or producer.__module__ not in ("comfy.ops", "torch.nn.modules.linear"):
         return "projection_owner"
+    if vdn:
+        return None
     checked = state.streamed_native_verified
     if Attention.forward not in checked:
         try:
@@ -188,3 +203,32 @@ def attention(attn, x, rope_freqs, transformer_options, chunk_size, *, project=p
     result = attn.out_proj(output)
     mark("streamed_out_projection", rows=rows)
     return result
+
+
+def vdn_project_qkv(projection, x, heads, dim, chunk_size):
+    """Project VDN's *raw* QKV in bounded rows into disjoint BF16 carriers.
+
+    VDN performs its learned linear readout from these raw carriers before
+    applying QK norm/RoPE, then runs its original grouped/dense softmax.
+    The independent V carrier eliminates VDN's packed-QKV preservation clone.
+    """
+    if type(chunk_size) is not int or chunk_size <= 0 or chunk_size % 64:
+        raise ValueError("VDN QKV chunk size must be a positive multiple of 64")
+    if x.ndim != 2 or heads * dim * 3 <= 0:
+        raise ValueError("VDN bounded projection received invalid geometry")
+    rows = x.shape[0]
+    q, k, v = (x.new_empty((rows, heads, dim)) for _ in range(3))
+    pieces = packed = None
+    try:
+        for start in range(0, rows, chunk_size):
+            stop = min(rows, start + chunk_size)
+            packed = projection(x[start:stop])
+            if packed.shape != (stop - start, heads * dim * 3):
+                raise RuntimeError("VDN bounded projection produced unexpected QKV geometry")
+            pieces = packed.split(heads * dim, dim=-1)
+            for carrier, piece in zip((q, k, v), pieces):
+                carrier[start:stop].copy_(piece.view(stop - start, heads, dim))
+            pieces = packed = None
+    finally:
+        pieces = packed = None
+    return q, k, v

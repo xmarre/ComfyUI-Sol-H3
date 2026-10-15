@@ -248,3 +248,36 @@ def test_dense_provider_compute_errors_are_not_swallowed(monkeypatch):
 
     assert not state.disabled_dense_providers
     assert not state.dense_provider_failures
+
+
+def test_vdn_qkv_provider_restores_inherited_options_on_exception(monkeypatch):
+    from sol_h3 import streamed
+
+    cfg = Config(exact=False, backend="sol", qkv_chunk_size=64)
+    state = Request(cfg)
+    owner = object()
+    seen = []
+    forward = lambda *_args: None
+    forward._vdn_forward = True
+    attn = SimpleNamespace(forward=forward, qkv_proj=owner)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=attn)])
+    token = _FORWARD.set((model, state, 0, set(), []))
+    x = torch.zeros(513, 384, dtype=torch.bfloat16)
+    options = {"sol_h3_vdn_qkv_projection_v1": "inherited"}
+    args = {"img": x, "transformer_options": options}
+    monkeypatch.setattr(streamed, "ineligible_reason", lambda *_args, **_kw: None)
+
+    def fail(call_args):
+        bridge = call_args["transformer_options"]
+        producer = bridge["sol_h3_vdn_qkv_projection_v1"]
+        assert callable(producer)
+        seen.append(bridge)
+        raise ValueError("injected failure")
+
+    try:
+        with pytest.raises(ValueError, match="injected failure"):
+            BlockPatch(0, cfg)(args, {"original_block": fail})
+    finally:
+        _FORWARD.reset(token)
+    assert seen[0]["sol_h3_vdn_qkv_projection_v1"] == "inherited"
+    assert options == {"sol_h3_vdn_qkv_projection_v1": "inherited"}

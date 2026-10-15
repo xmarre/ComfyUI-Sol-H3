@@ -6,6 +6,7 @@ import logging
 from threading import Lock
 
 from .contracts import KEY, Config, adaln_status, prefix_length
+from .streamed import vdn_project_qkv
 from .mixed_measure import FLOW_MIXED_MEASURE_KEY, reduce_kv, validate_measure_contract
 from . import weighted_measure
 from .interop import (
@@ -65,6 +66,8 @@ class Request:
     streamed_native_verified: dict = field(default_factory=dict)
     streamed_blocks: int = 0
     streamed_q_rows: int = 0
+    streamed_vdn_projection_calls: int = 0
+    streamed_vdn_projection_rows: int = 0
     streamed_skips: Counter = field(default_factory=Counter)
     dense_attention_backends: set = field(default_factory=set)
     gates: list = field(default_factory=list)
@@ -115,6 +118,8 @@ class SamplingWrapper:
                         "sparse_calls": state.sparse_calls,
                         "streamed_blocks": state.streamed_blocks,
                         "streamed_q_rows": state.streamed_q_rows,
+                        "streamed_vdn_projection_calls": state.streamed_vdn_projection_calls,
+                        "streamed_vdn_projection_rows": state.streamed_vdn_projection_rows,
                         "streamed_skips": dict(state.streamed_skips),
                         "dense_warmup": state.dense_calls,
                         "external_mixed_sol_calls": state.external_mixed_sol_calls,
@@ -319,7 +324,8 @@ class BlockPatch:
 
     def __call__(self, args, extra):
         options = dict(args["transformer_options"])
-        provider_keys = ("optimized_attention_override", VDN_KEY, VDN_KEY_V2, VDN_KEY_V3, VDN_KEY_V4, VDN_PREPROCESS_KEY)
+        provider_keys = ("optimized_attention_override", VDN_KEY, VDN_KEY_V2, VDN_KEY_V3, VDN_KEY_V4, VDN_PREPROCESS_KEY,
+                         "sol_h3_vdn_qkv_projection_v1")
         inherited_providers = {key: options[key] for key in provider_keys if key in options}
         try:
             return self._call({**args, "transformer_options": options}, extra)
@@ -783,8 +789,21 @@ class BlockPatch:
             block = model.blocks[self.index]
             if config.backend == "sol":
                 from .streamed import attention as streamed_attention, ineligible_reason as stream_reason
-                reason = stream_reason(block, call_args, state, previous)
-                if reason is None:
+                is_vdn = bool(getattr(getattr(block.attn, "forward", None), "_vdn_forward", False))
+                reason = stream_reason(block, call_args, state, previous, vdn=is_vdn)
+                if reason is None and is_vdn:
+                    projection_owner = block.attn.qkv_proj
+
+                    def vdn_project(projection, h, heads, dim):
+                        if projection is not projection_owner:
+                            raise RuntimeError("VDN projection owner changed during Sol block execution")
+                        result = vdn_project_qkv(projection, h, heads, dim, config.qkv_chunk_size)
+                        state.streamed_vdn_projection_calls += 1
+                        state.streamed_vdn_projection_rows += h.shape[0]
+                        return result
+
+                    options["sol_h3_vdn_qkv_projection_v1"] = vdn_project
+                elif reason is None:
                     def streamed(h, rope_freqs=None, transformer_options=None):
                         result = streamed_attention(
                             block.attn, h, rope_freqs, transformer_options, config.qkv_chunk_size,
