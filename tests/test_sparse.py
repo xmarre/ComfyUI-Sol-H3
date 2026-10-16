@@ -171,7 +171,8 @@ def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatc
         calibration_identity="measure-a",
     )
     assert out.shape == (1, 260, 256)
-    assert [c["sink_tokens"] for c in calls] == [260, 192]
+    assert [c["sink_tokens"] for c in calls] == [260] * 5 + [192]
+    assert [c.get("query_start", 0) for c in calls[:5]] == [0, 64, 128, 192, 256]
     assert all(c["sink_start"] == 0 for c in calls)
     assert all(c["key_bias"] is bias for c in calls)
     assert len(state.gates) == 1
@@ -182,7 +183,7 @@ def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatc
         exact_k_blocks=(0, 3),
         calibration_identity="measure-a",
     )
-    assert len(calls) == 3
+    assert len(calls) == 7
     assert len(state.gates) == 1
 
     other = bias.clone()
@@ -193,7 +194,7 @@ def test_weighted_bridge_uses_measure_specific_gate_and_exact_k_range(monkeypatc
         exact_k_blocks=(0, 3),
         calibration_identity="measure-b",
     )
-    assert len(calls) == 5
+    assert len(calls) == 13
     assert len(state.gates) == 2
 
 
@@ -226,7 +227,7 @@ def test_weighted_bridge_clamps_empty_exact_k_range_to_k_rows(monkeypatch):
     )
 
     assert out.shape == (1, 130, 256)
-    assert [call["sink_tokens"] for call in calls] == [130, 0]
+    assert [call["sink_tokens"] for call in calls] == [130] * 3 + [0]
     assert calls[-1]["sink_start"] == 130
 
 
@@ -236,3 +237,71 @@ def test_weighted_bridge_rejects_bias_without_bound_route_metadata(monkeypatch):
     state = Request(Config(exact=False, backend="sol"))
     with pytest.raises(RuntimeError, match="calibration identity"):
         sparse.attention(q, q, q, 1, state.config, state, key_bias=torch.zeros(65))
+
+
+def test_full_domain_gate_triton_falls_back_without_cuda():
+    from sol_h3.gate_metrics_triton import gate_statistics
+    a = torch.zeros((1, 67, 8, 128), dtype=torch.bfloat16)
+    assert gate_statistics(a, a) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("layout", ["bthd", "btd", "noncontiguous"])
+@pytest.mark.parametrize("nonfinite", [False, True])
+def test_full_domain_fused_gate_matches_reference_on_cuda(layout, nonfinite):
+    pytest.importorskip("triton")
+    from sol_h3.gate_metrics_triton import gate_statistics
+
+    # Enough rows to cross the legacy 262144-element tiled reduction boundary.
+    a = torch.randn((1, 397, 7, 128), device="cuda", dtype=torch.bfloat16)
+    b = (a.float() + torch.randn_like(a.float()) * 0.008).bfloat16()
+    if layout == "btd":
+        a, b = a.reshape(1, 397, -1), b.reshape(1, 397, -1)
+    elif layout == "noncontiguous":
+        a, b = a.transpose(-1, -2), b.transpose(-1, -2)
+        # Non-contiguous final stride is deliberately left to the original path.
+        assert gate_statistics(a, b) is None
+        return
+    if nonfinite:
+        a.reshape(-1)[77] = float("nan")
+        b.reshape(-1)[183] = float("inf")
+    with torch.no_grad():
+        observed = gate_statistics(a, b)
+        assert observed is not None
+        oracle = sparse.ErrorAccumulator(a.device, enable_fused=False)
+        oracle.add(a, b)
+        expected = oracle.statistics()
+    assert bool(observed[0]) == bool(expected[0])
+    if nonfinite:
+        assert observed[0] == 0.0
+    else:
+        for got, want in zip(observed[1:], expected[1:], strict=True):
+            assert got == pytest.approx(want, rel=2e-6, abs=2e-8)
+        assert sparse.arithmetic_gate_passes(
+            sparse._metrics_from_statistics(observed)
+        ) == sparse.arithmetic_gate_passes(
+            sparse._metrics_from_statistics(expected)
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("nonfinite", [False, True])
+def test_fused_accumulator_preserves_all_query_chunks(nonfinite):
+    pytest.importorskip("triton")
+    torch.manual_seed(211)
+    # This models the two 4096+remainder chunks used to qualify >4096 Q rows.
+    a = torch.randn((1, 5120, 7, 128), device="cuda", dtype=torch.bfloat16)
+    b = (a.float() * 0.998).bfloat16()
+    if nonfinite:
+        a[0, 4210, 2, 27] = float("nan")
+    with torch.no_grad():
+        exact = sparse.ErrorAccumulator(a.device, enable_fused=False)
+        candidate = sparse.ErrorAccumulator(a.device)
+        for start, stop in ((0, 4096), (4096, 5120)):
+            exact.add(a[:, start:stop], b[:, start:stop])
+            candidate.add(a[:, start:stop], b[:, start:stop])
+        actual, expected = candidate.statistics(), exact.statistics()
+    assert bool(actual[0]) == bool(expected[0])
+    if not nonfinite:
+        for got, want in zip(actual[1:], expected[1:], strict=True):
+            assert got == pytest.approx(want, rel=2e-6, abs=2e-8)
