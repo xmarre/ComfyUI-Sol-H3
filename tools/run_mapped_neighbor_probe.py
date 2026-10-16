@@ -40,8 +40,8 @@ EXPECTED_SOL_BLOBS = {
     # The candidate preserves mapped-neighbor compute math but changes the
     # all-domain gate reduction machinery. Pin BOTH dispatch and reducer bytes;
     # historical captures do not qualify new SM120 compilation or throughput.
-    "sol_h3/sparse.py": "9af91de1352920e921b30b3011557f648473b8ed",
-    "sol_h3/gate_metrics_triton.py": "7508c33851ab7b5dfb648370d77887481d4328b3",
+    "sol_h3/sparse.py": "8eb8531653a39b03219d436bdfa53f5294e19781",
+    "sol_h3/gate_metrics_triton.py": "89638535ce21a90c0074a557148762285c328d3b",
     "sol_h3/provenance.py": "abc5d384c79fe16b463abe4556494d34333ecf40",
     "sol_h3/sol_manifest.json": "c2b8a6b00b9d2e2a03b8a952252e6e23158af37b",
     "tools/mapped_neighbor_probe.py": "60ee67bb558dafbd3616954c7d117839fd359b03",

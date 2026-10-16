@@ -19,14 +19,24 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch  # noqa: E402
 
-from sol_h3.gate_metrics_triton import gate_statistics  # noqa: E402
+from sol_h3.gate_metrics_triton import gate_partials  # noqa: E402
 from sol_h3.sparse import ErrorAccumulator  # noqa: E402
 
 
-def _reference(got, want):
-    acc = ErrorAccumulator(got.device)
-    acc.add(got, want)
+def _accumulate(got, want, *, fused):
+    acc = ErrorAccumulator(got.device, enable_fused=fused)
+    for start in range(0, got.shape[1], 4096):
+        stop = min(got.shape[1], start + 4096)
+        acc.add(got[:, start:stop], want[:, start:stop])
     return acc.statistics()
+
+
+def _reference(got, want):
+    return _accumulate(got, want, fused=False)
+
+
+def _candidate(got, want):
+    return _accumulate(got, want, fused=True)
 
 
 def _time_cuda(func, rounds):
@@ -59,9 +69,10 @@ def main():
             want = torch.randn((1, 56, rows, 128), device=device, dtype=torch.bfloat16).transpose(1, 2)
             got = (want.contiguous().float() * 0.999).bfloat16()
             reference = _reference(got, want)
-            candidate = gate_statistics(got, want)
-            if candidate is None:
+            # Enforce actual Triton activation, not a silent PyTorch fallback.
+            if gate_partials(got[:, :min(rows, 4096)], want[:, :min(rows, 4096)]) is None:
                 raise RuntimeError("candidate reducer did not activate on the target layout")
+            candidate = _candidate(got, want)
             finite_match = bool(candidate[0]) == bool(reference[0])
             errors = [abs(float(a) - float(b)) for a, b in zip(candidate[1:], reference[1:], strict=True)]
             tol = [max(2e-6 * abs(float(v)), 2e-8) for v in reference[1:]]
@@ -71,9 +82,9 @@ def main():
             # Warm both routes independently; compilation time is reported by
             # the first activation above and is not hidden in the gate mean.
             _reference(got, want)
-            gate_statistics(got, want)
+            _candidate(got, want)
             old = _time_cuda(lambda: _reference(got, want), args.rounds)
-            new = _time_cuda(lambda: gate_statistics(got, want), args.rounds)
+            new = _time_cuda(lambda: _candidate(got, want), args.rounds)
             report.append({
                 "q_rows": rows,
                 "heads": 56,

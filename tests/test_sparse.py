@@ -268,7 +268,7 @@ def test_full_domain_fused_gate_matches_reference_on_cuda(layout, nonfinite):
     with torch.no_grad():
         observed = gate_statistics(a, b)
         assert observed is not None
-        oracle = sparse.ErrorAccumulator(a.device)
+        oracle = sparse.ErrorAccumulator(a.device, enable_fused=False)
         oracle.add(a, b)
         expected = oracle.statistics()
     assert bool(observed[0]) == bool(expected[0])
@@ -282,3 +282,26 @@ def test_full_domain_fused_gate_matches_reference_on_cuda(layout, nonfinite):
         ) == sparse.arithmetic_gate_passes(
             sparse._metrics_from_statistics(expected)
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("nonfinite", [False, True])
+def test_fused_accumulator_preserves_all_query_chunks(nonfinite):
+    pytest.importorskip("triton")
+    torch.manual_seed(211)
+    # This models the two 4096+remainder chunks used to qualify >4096 Q rows.
+    a = torch.randn((1, 5120, 7, 128), device="cuda", dtype=torch.bfloat16)
+    b = (a.float() * 0.998).bfloat16()
+    if nonfinite:
+        a[0, 4210, 2, 27] = float("nan")
+    with torch.no_grad():
+        exact = sparse.ErrorAccumulator(a.device, enable_fused=False)
+        candidate = sparse.ErrorAccumulator(a.device)
+        for start, stop in ((0, 4096), (4096, 5120)):
+            exact.add(a[:, start:stop], b[:, start:stop])
+            candidate.add(a[:, start:stop], b[:, start:stop])
+        actual, expected = candidate.statistics(), exact.statistics()
+    assert bool(actual[0]) == bool(expected[0])
+    if not nonfinite:
+        for got, want in zip(actual[1:], expected[1:], strict=True):
+            assert got == pytest.approx(want, rel=2e-6, abs=2e-8)

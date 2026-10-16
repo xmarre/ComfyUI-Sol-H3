@@ -67,12 +67,11 @@ if triton is not None:
         tl.store(partial + 5*TILES + tile, ref_square)
 
 
-def gate_statistics(got: torch.Tensor, want: torch.Tensor):
-    """Full-domain [finite, reference_peak, error_peak, mean_abs, rel_l2] or None.
+def gate_partials(got: torch.Tensor, want: torch.Tensor):
+    """Return exhaustive CUDA gate partials [6, tiles], or None on fallback.
 
-    Uses no activation-sized FP32/difference allocations; the temporary buffer
-    is six FP64 elements per ~2048 compared elements. Returns None only when
-    the conservative optional-accelerator eligibility contract is not met.
+    This API permits large query sequences to accumulate several bounded
+    all-selected gate chunks without any per-chunk host synchronization.
     """
     if (
         triton is None or got.device.type != "cuda"
@@ -113,6 +112,15 @@ def gate_statistics(got: torch.Tensor, want: torch.Tensor):
             )
             _COMPILE_FALLBACK_REPORTED = True
         return None
+    return partial
+
+
+def gate_statistics(got: torch.Tensor, want: torch.Tensor):
+    """Full-domain [finite, reference_peak, error_peak, mean_abs, rel_l2]."""
+    partial = gate_partials(got, want)
+    if partial is None:
+        return None
+    n = got.numel()
     # Preserve the original FP64 statistical aggregation and one host read.
     sums = torch.stack((
         partial[0].amin(),

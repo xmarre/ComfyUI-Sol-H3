@@ -97,16 +97,26 @@ def _metric_tiles(tensor):
 class ErrorAccumulator:
     """Whole-output metrics with bounded temporary storage and one host read."""
 
-    def __init__(self, device):
+    def __init__(self, device, *, enable_fused=True):
         self.stats = torch.zeros(6, dtype=torch.float64, device=device)
         self.stats[0] = 1
         self.elements = 0
+        self._enable_fused = bool(enable_fused)
+        self._fused_partials = []
 
     def add(self, got, want):
         if got.shape != want.shape or got.device != want.device or not got.numel():
             raise ValueError("Arithmetic metrics require equal nonempty shapes on the same device")
         stats = self.stats
         self.elements += got.numel()
+        if self._enable_fused and got.device.type == "cuda":
+            from .gate_metrics_triton import gate_partials
+            partial = gate_partials(got, want)
+            if partial is not None:
+                # The entire chunk remains validated, but its statistics can
+                # be aggregated with other chunks in one final device read.
+                self._fused_partials.append(partial)
+                return
         for g, w in zip(_metric_tiles(got), _metric_tiles(want)):
             gf, wf = g.float(), w.float()
             delta = gf - wf
@@ -123,6 +133,15 @@ class ErrorAccumulator:
         stats = self.stats
         if not self.elements:
             raise ValueError("No arithmetic samples were accumulated")
+        if self._fused_partials:
+            partial = torch.cat(self._fused_partials, dim=1)
+            stats[0].mul_(partial[0].amin())
+            stats[1] = torch.maximum(stats[1], partial[1].amax())
+            stats[2] = torch.maximum(stats[2], partial[2].amax())
+            stats[3].add_(partial[3].sum(dtype=torch.float64))
+            stats[4].add_(partial[4].sum(dtype=torch.float64))
+            stats[5].add_(partial[5].sum(dtype=torch.float64))
+            self._fused_partials.clear()
         return torch.stack((
             stats[0], stats[1], stats[2], stats[3] / self.elements,
             stats[4].sqrt() / stats[5].sqrt().clamp_min(1e-12),
