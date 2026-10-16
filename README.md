@@ -427,6 +427,10 @@ It replaces thousands of individual PyTorch metric-reduction launches when an
 eligible BF16 3-D/4-D result is checked; other inputs keep the reference
 implementation. Only metric aggregation order may differ at floating-point
 roundoff levels. First-use kernel compilation and actual GPU throughput must be
-measured on SM120; no speedup has been established by CPU CI alone. ComfyUI
-Patcher installation needs no additional environment variables or node setting.
+measured on SM120; no speedup has been established by CPU CI alone.
+A standalone, model-free GPU acceptance benchmark is available via
+`python tools/benchmark_gate_metrics.py`; it compares exact statistics
+and time against the preserved PyTorch reference at production-like
+query/head shapes without starting a video generation.
+ComfyUI Patcher installation needs no additional environment variables or node setting.
 
