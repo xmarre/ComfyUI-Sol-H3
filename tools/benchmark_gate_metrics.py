@@ -84,7 +84,6 @@ def main():
                 "maximum_statistic_difference": max(errors),
                 "full_domain_compared": True,
             })
-            del want, got
     print(json.dumps({"device": str(device), "results": report}, indent=2))
 
 
