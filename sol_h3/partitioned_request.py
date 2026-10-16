@@ -739,6 +739,12 @@ def partitioned_request_attention(
     return result
 
 
+# VDN can use a zero-copy Q view for this trusted provider: every route
+# uses Q as read-only input, including dense/reference and mapped Sol fallbacks.
+# Arbitrary externally injected partitioned providers are not given this marker.
+partitioned_request_attention._vdn_readonly_query_contract_v1 = True
+
+
 __all__ = [
     "PARTITIONED_DENSE_ROUTE",
     "PARTITIONED_MAPPED_ROUTE",

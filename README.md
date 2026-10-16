@@ -434,3 +434,14 @@ and time against the preserved PyTorch reference at production-like
 query/head shapes without starting a video generation.
 ComfyUI Patcher installation needs no additional environment variables or node setting.
 
+
+### VDN zero-copy grouped Q ownership (draft)
+
+Sol's native v4 and physical partitioned attention providers advertise a
+read-only-Q marker to VDN. VDN may therefore pass slices for grouped contiguous
+query intervals instead of materializing extra `index_select` copies and
+indexed output scatters. Provider behavior, Q/K/V numerical values, query
+position maps, key/value gather, and dense fallback remain unchanged. Unknown
+third-party providers are not trusted and retain the old isolated Q-gather
+behavior. CPU CI checks the marker, while real RTX PRO 6000 peak-memory and
+sampling latency acceptance remains required before release.

@@ -781,6 +781,11 @@ class BlockPatch:
             options[VDN_KEY] = vdn_provider_v1
             options[VDN_KEY_V2] = vdn_provider_v2
             options[VDN_KEY_V3] = vdn_provider_v3
+            # VDN may give the official Sol v4 provider a contiguous Q view
+            # instead of a copied indexed gather. This callback reads Q but
+            # never mutates it, including native-fallback branches. Unknown
+            # third-party providers receive the old isolated gather.
+            vdn_provider_v4._vdn_readonly_query_contract_v1 = True
             options[VDN_KEY_V4] = vdn_provider_v4
             if hasattr(previous, "attention_preprocess_v1"):
                 options[VDN_PREPROCESS_KEY] = vdn_preprocess
