@@ -8,7 +8,12 @@ CPU and unsupported layouts continue to use the original reduction code.
 """
 from __future__ import annotations
 
+import logging
+
 import torch
+
+_log = logging.getLogger("comfy.sol_h3")
+_COMPILE_FALLBACK_REPORTED = False
 
 try:
     import triton
@@ -85,11 +90,25 @@ def gate_statistics(got: torch.Tensor, want: torch.Tensor):
     n = got.numel()
     block = 8192
     tiles = triton.cdiv(n, block)
-    partial = torch.empty((6, tiles), dtype=torch.float64, device=got.device)
-    _partial_gate_metrics[(tiles,)](
-        got, want, partial, n, *shape[1:], *gs, *ws, tiles, block,
-        num_warps=4,
-    )
+    global _COMPILE_FALLBACK_REPORTED
+    try:
+        partial = torch.empty((6, tiles), dtype=torch.float64, device=got.device)
+        _partial_gate_metrics[(tiles,)](
+            got, want, partial, n, *shape[1:], *gs, *ws, tiles, block,
+            num_warps=4,
+        )
+    except Exception as exc:
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            raise
+        # An unavailable Triton compiler/backend must never break a generation.
+        # Fall back to the exhaustive PyTorch oracle, not an unchecked result.
+        if not _COMPILE_FALLBACK_REPORTED:
+            _log.warning(
+                "Sol-H3 fused arithmetic-gate reducer unavailable; "
+                "falling back to exhaustive PyTorch statistics: %s", exc,
+            )
+            _COMPILE_FALLBACK_REPORTED = True
+        return None
     # Preserve the original FP64 statistical aggregation and one host read.
     sums = torch.stack((
         partial[0].amin(),
