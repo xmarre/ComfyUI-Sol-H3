@@ -416,3 +416,17 @@ not included in this release set.
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 
 GPL-3.0-or-later; see `LICENSE` and `NOTICE`.
+
+### Arithmetic-gate reduction acceleration (experimental)
+
+On CUDA with Triton available, Sol now computes its **full-query, full-key**
+arithmetic-qualification statistics with a fused, tiled reduction and a small
+FP64 partial buffer. This does **not** skip kernel numerical qualification,
+change Sol's sparse attention output or change VDN/Flow projection arithmetic.
+It replaces thousands of individual PyTorch metric-reduction launches when an
+eligible BF16 3-D/4-D result is checked; other inputs keep the reference
+implementation. Only metric aggregation order may differ at floating-point
+roundoff levels. First-use kernel compilation and actual GPU throughput must be
+measured on SM120; no speedup has been established by CPU CI alone. ComfyUI
+Patcher installation needs no additional environment variables or node setting.
+

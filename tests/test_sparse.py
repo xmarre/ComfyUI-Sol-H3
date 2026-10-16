@@ -237,3 +237,48 @@ def test_weighted_bridge_rejects_bias_without_bound_route_metadata(monkeypatch):
     state = Request(Config(exact=False, backend="sol"))
     with pytest.raises(RuntimeError, match="calibration identity"):
         sparse.attention(q, q, q, 1, state.config, state, key_bias=torch.zeros(65))
+
+
+def test_full_domain_gate_triton_falls_back_without_cuda():
+    from sol_h3.gate_metrics_triton import gate_statistics
+    a = torch.zeros((1, 67, 8, 128), dtype=torch.bfloat16)
+    assert gate_statistics(a, a) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("layout", ["bthd", "btd", "noncontiguous"])
+@pytest.mark.parametrize("nonfinite", [False, True])
+def test_full_domain_fused_gate_matches_reference_on_cuda(layout, nonfinite):
+    pytest.importorskip("triton")
+    from sol_h3.gate_metrics_triton import gate_statistics
+
+    # Enough rows to cross the legacy 262144-element tiled reduction boundary.
+    a = torch.randn((1, 397, 7, 128), device="cuda", dtype=torch.bfloat16)
+    b = (a.float() + torch.randn_like(a.float()) * 0.008).bfloat16()
+    if layout == "btd":
+        a, b = a.reshape(1, 397, -1), b.reshape(1, 397, -1)
+    elif layout == "noncontiguous":
+        a, b = a.transpose(-1, -2), b.transpose(-1, -2)
+        # Non-contiguous final stride is deliberately left to the original path.
+        assert gate_statistics(a, b) is None
+        return
+    if nonfinite:
+        a.reshape(-1)[77] = float("nan")
+        b.reshape(-1)[183] = float("inf")
+    with torch.no_grad():
+        observed = gate_statistics(a, b)
+        assert observed is not None
+        oracle = sparse.ErrorAccumulator(a.device)
+        oracle.add(a, b)
+        expected = oracle.statistics()
+    assert bool(observed[0]) == bool(expected[0])
+    if nonfinite:
+        assert observed[0] == 0.0
+    else:
+        for got, want in zip(observed[1:], expected[1:], strict=True):
+            assert got == pytest.approx(want, rel=2e-6, abs=2e-8)
+        assert sparse.arithmetic_gate_passes(
+            sparse._metrics_from_statistics(observed)
+        ) == sparse.arithmetic_gate_passes(
+            sparse._metrics_from_statistics(expected)
+        )

@@ -133,6 +133,16 @@ def error_metrics(got, want):
     if got.shape != want.shape or got.device != want.device or not got.numel():
         raise ValueError("Arithmetic metrics require equal nonempty shapes on the same device")
     if got.numel() > METRIC_CHUNK_ELEMENTS:
+        # Preserve exhaustive all-Q/all-K arithmetic qualification. On SM120,
+        # thousands of small PyTorch reductions used to dominate gate overhead;
+        # the optional fused implementation computes the SAME full-domain
+        # statistics with bounded partial storage and one host read. CPU and
+        # unsupported layouts retain the reference reduction unchanged.
+        if got.device.type == "cuda":
+            from .gate_metrics_triton import gate_statistics
+            statistics = gate_statistics(got, want)
+            if statistics is not None:
+                return _metrics_from_statistics(statistics)
         accumulator = ErrorAccumulator(got.device)
         accumulator.add(got, want)
         return _metrics_from_statistics(accumulator.statistics())
