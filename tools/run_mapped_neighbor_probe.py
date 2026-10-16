@@ -41,7 +41,7 @@ EXPECTED_SOL_BLOBS = {
     # all-domain gate reduction machinery. Pin BOTH dispatch and reducer bytes;
     # historical captures do not qualify new SM120 compilation or throughput.
     "sol_h3/sparse.py": "9af91de1352920e921b30b3011557f648473b8ed",
-    "sol_h3/gate_metrics_triton.py": "c6ae9931aa334a4b097a47f416acd11c9bf56516",
+    "sol_h3/gate_metrics_triton.py": "6fe8dbf7d1c902e734a3d54058d650231aa44872",
     "sol_h3/provenance.py": "abc5d384c79fe16b463abe4556494d34333ecf40",
     "sol_h3/sol_manifest.json": "c2b8a6b00b9d2e2a03b8a952252e6e23158af37b",
     "tools/mapped_neighbor_probe.py": "60ee67bb558dafbd3616954c7d117839fd359b03",

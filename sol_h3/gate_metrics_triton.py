@@ -45,7 +45,7 @@ if triton is not None:
         # BF16 has no representable value at the FP32 maximum; this detects
         # BF16 nonfinites and FP32 overflow in the difference without relying
         # on optional libdevice predicates.
-        finite = (tl.abs(g) < 3.4028234663852886e38) & (tl.abs(w) < 3.4028234663852886e38) & (tl.abs(delta) < 3.4028234663852886e38)
+        finite = (\n            (tl.abs(g) < 3.4028234663852886e38)\n            & (tl.abs(w) < 3.4028234663852886e38)\n            & (tl.abs(delta) < 3.4028234663852886e38)\n        )
         # Masked lanes represent zeros, so neither maxima nor norms change.
         all_finite = tl.min(tl.where(valid, finite.to(tl.int32), 1), 0)
         reference_max = tl.max(tl.abs(w), 0)
@@ -67,7 +67,7 @@ def gate_statistics(got: torch.Tensor, want: torch.Tensor):
     """Full-domain [finite, reference_peak, error_peak, mean_abs, rel_l2] or None.
 
     Uses no activation-sized FP32/difference allocations; the temporary buffer
-    is six FP64 elements per ~8192 compared elements. Returns None only when
+    is six FP64 elements per ~2048 compared elements. Returns None only when
     the conservative optional-accelerator eligibility contract is not met.
     """
     if (
@@ -88,7 +88,7 @@ def gate_statistics(got: torch.Tensor, want: torch.Tensor):
         gs = tuple(got.stride())
         ws = tuple(want.stride())
     n = got.numel()
-    block = 8192
+    block = 2048
     tiles = triton.cdiv(n, block)
     global _COMPILE_FALLBACK_REPORTED
     try:
