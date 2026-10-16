@@ -161,8 +161,15 @@ the actual sampler peak. Only an end-to-end run can establish the net saving.
 The producer enters through the existing block `attention` argument. It does not
 mutate module forwards, clone models or construct a second weight producer.
 It requires an audited native Attention/DiTBlock forward, BF16, RoPE and
-SM120/SM121 inference. Unknown source, autograd, graph capture, hooks or compiled
-module calls retain native execution.
+SM120/SM121 inference. Unknown source, autograd, graph capture, arbitrary hooks or compiled
+module calls retain native execution. A VDN-owned forward may opt into bounded
+QKV projection while its QKV module has only VDN's exact
+`vdn_h3.apply._PostForwardLoRA` post-hooks. These hooks apply a row-local
+additive low-rank residual (and optional bias), so slicing changes the batch
+geometry without changing which tokens participate in the adapter. Block/attention
+hooks, projection pre-hooks, unknown projection post-hooks, global hooks and
+compiled module calls still fail closed. The special admission does not enable
+the native two-pass producer with hooks.
 
 VDN forwards consume raw Q/K/V for their learned linear branch. With the
 cooperating VDN-H3-Plus bounded-projection API v1 installed, VDN's *native
@@ -182,6 +189,29 @@ and latency remain unmeasured. The VDN path uses **one** bounded projection pass
 not the native Sol two-pass Q streamer. Its counters are
 `streamed_vdn_projection_calls` and `streamed_vdn_projection_rows`, separate from
 `streamed_blocks`.
+
+### Runtime performance finding, October 2026
+
+The supplied two-chunk Continuum/Flow/VDN run telemetry reports
+`qkv_chunk_size=4096` but `streamed_vdn_projection_calls=0` and
+`streamed_skips={"module_hooks_or_compile":300}` per six-model-call stage.
+VDN `lora_mode=bypass` had installed 209 module post-forward hooks. Thus the
+observed prior sampler memory decrease **cannot** establish that bounded QKV
+ran; Sol was using the unbounded native projection. This candidate narrows
+admission to exactly the VDN row-wise hook while retaining strict rejection of
+unknown/stateful hooks. It must produce nonzero projection counters on the
+actual CUDA workflow before claiming any QKV memory saving.
+
+The additive hook itself runs on each projection chunk, and the INT8 convrot
+base can be re-launched on many small slices. This increases kernel launches
+and may change GEMM shape-dependent rounding. A larger chunk reduces launches
+but raises the peak packed temporary allocation. No faster default is asserted
+without GPU evidence. The targeted script
+`tools/vdn_qkv_projection_benchmark.py` runs the real quantized Comfy
+projection with VDN's post-forward adapter and compares full, 4096, 8192 and
+16384-row arms at typical low/high sequence lengths, reporting warmed CUDA
+latency, allocator peaks, retention and representative output parity.
+
 
 VDN's Flow-aware partitioned forward can use the same carrier producer when
 the VDN object-patch wrapper advertises bounded-projection API 2. This is a
@@ -223,6 +253,7 @@ From the Sol node checkout in the ComfyUI environment:
 python -m pytest -q tests/test_streamed_qkv.py tests/test_weighted_sm120_gpu.py tests/test_zero_copy_bthd.py tests/test_partitioned_dynamic_compile.py
 python tools/streamed_attention_benchmark.py --comfyui-path /path/to/ComfyUI --projection int8-convrot --rows 32768 65536 100000 --output /path/to/results/streamed-int8.json
 python tools/streamed_attention_benchmark.py --comfyui-path /path/to/ComfyUI --projection bf16 --rows 32768 65536 100000 --output /path/to/results/streamed-bf16.json
+python tools/vdn_qkv_projection_benchmark.py --comfyui-path /path/to/ComfyUI --vdn-path /path/to/ComfyUI/custom_nodes/comfyui-vdn-h3-plus --rows 54744 107630 --chunks 4096 8192 16384 --output /path/to/results/vdn-bounded-qkv.json
 ```
 
 Repeat with `--dense` for inherited dense warmup and `--order streamed-first` to

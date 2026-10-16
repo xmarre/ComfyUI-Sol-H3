@@ -38,6 +38,25 @@ class QueryStream:
             raise RuntimeError("Streamed H3 attention lost its invocation-owned K/V geometry")
 
 
+def _vdn_rowwise_post_hooks_supported(projection):
+    """Only the known VDN additive row-local LoRA hook may be chunked.
+
+    Chunked projection changes each call's input shape. VDN's owned LoRA
+    callback is row-wise F.linear(F.linear(x, down), up) plus an optional
+    constant bias; arbitrary pre/post hooks can have cross-row or call-count
+    semantics and must continue using the full native projection.
+    """
+    if not projection._forward_hooks:
+        return True
+    if projection._forward_hooks_with_kwargs or projection._forward_hooks_always_called:
+        return False
+    try:
+        from vdn_h3.apply import _PostForwardLoRA
+    except ImportError:
+        return False
+    return all(type(hook) is _PostForwardLoRA for hook in projection._forward_hooks.values())
+
+
 def ineligible_reason(block, args, state, previous, *, vdn=False):
     if not state.config.qkv_chunk_size:
         return "disabled"
@@ -92,10 +111,20 @@ def ineligible_reason(block, args, state, previous, *, vdn=False):
         return "block_or_attention_owner"
     if attn.head_dim != 128 or args.get("rope_freqs") is None:
         return "head_or_rope_geometry"
-    for module in (block, attn, attn.qkv_proj):
+    # Block/attention hooks are not known row-local. The VDN bypass adapter
+    # uses additive *projection* post-hooks; accept only that exact hook class
+    # on a cooperating VDN forward. Native two-pass and all other hooks keep
+    # the existing fail-closed contract.
+    for module in (block, attn):
         if (module._forward_hooks or module._forward_pre_hooks
                 or getattr(module, "_compiled_call_impl", None) is not None):
             return "module_hooks_or_compile"
+    projection = attn.qkv_proj
+    if (projection._forward_pre_hooks
+            or getattr(projection, "_compiled_call_impl", None) is not None
+            or (projection._forward_hooks and
+                (not vdn or not _vdn_rowwise_post_hooks_supported(projection)))):
+        return "module_hooks_or_compile"
     if hooks._global_forward_hooks or hooks._global_forward_pre_hooks:
         return "global_hooks"
     if getattr(attn.qkv_proj, "quant_format", None) not in (None, "int8_tensorwise"):
