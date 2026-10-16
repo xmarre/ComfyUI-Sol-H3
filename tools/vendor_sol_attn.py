@@ -16,6 +16,7 @@ PATCHES = (
     ('mapped-neighbor-sm120-v4', ROOT / 'tools/mapped_neighbor_sm120.patch'),
     ('sm121-cute-sm120', ROOT / 'tools/sm121_cute_sm120.patch'),
     ('streamed-query-sm120-v5', ROOT / 'tools/streamed_sm120.patch'),
+    ('grouped-kv-summary-v1', ROOT / 'tools/grouped_kv_sm120.patch'),
 )
 
 

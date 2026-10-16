@@ -326,6 +326,10 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
     streamed_kwargs = {}
+    from .grouped_kv import current as current_grouped_kv
+    grouped_prepared = current_grouped_kv(kb, vb)
+    if grouped_prepared is not None:
+        streamed_kwargs["prepared_kv"] = grouped_prepared
     if kv_workspace is not None:
         kv_workspace.check(q, k, v)
         if kv_workspace.prepared_kv is None:

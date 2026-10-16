@@ -68,6 +68,8 @@ class Request:
     streamed_q_rows: int = 0
     streamed_vdn_projection_calls: int = 0
     streamed_vdn_projection_rows: int = 0
+    grouped_kv_fused_calls: int = 0
+    grouped_kv_fused_rows: int = 0
     streamed_skips: Counter = field(default_factory=Counter)
     dense_attention_backends: set = field(default_factory=set)
     gates: list = field(default_factory=list)
@@ -120,6 +122,8 @@ class SamplingWrapper:
                         "streamed_q_rows": state.streamed_q_rows,
                         "streamed_vdn_projection_calls": state.streamed_vdn_projection_calls,
                         "streamed_vdn_projection_rows": state.streamed_vdn_projection_rows,
+                        "grouped_kv_fused_calls": state.grouped_kv_fused_calls,
+                        "grouped_kv_fused_rows": state.grouped_kv_fused_rows,
                         "streamed_skips": dict(state.streamed_skips),
                         "dense_warmup": state.dense_calls,
                         "external_mixed_sol_calls": state.external_mixed_sol_calls,
@@ -785,6 +789,9 @@ class BlockPatch:
             # instead of a copied indexed gather. This callback reads Q but
             # never mutates it, including native-fallback branches. Unknown
             # third-party providers receive the old isolated gather.
+            from .grouped_kv import execute as grouped_kv_execute
+            if not warmup:
+                vdn_provider_v4.grouped_kv_v1 = grouped_kv_execute
             vdn_provider_v4._vdn_readonly_query_contract_v1 = True
             options[VDN_KEY_V4] = vdn_provider_v4
             if hasattr(previous, "attention_preprocess_v1"):
