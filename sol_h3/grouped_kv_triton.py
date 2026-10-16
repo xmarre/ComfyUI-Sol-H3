@@ -41,8 +41,12 @@ def _gather_summaries(
     v = tl.where((rows < Sinks)[:, None], vp, v)
     count = tl.minimum(64, Rows - block * 64)
     summary = (block * Heads + head) * 128 + dims
-    tl.store(KC + summary, tl.sum(k.to(tl.float32), axis=0) / count)
-    tl.store(VC + summary, tl.sum(v.to(tl.float32), axis=0))
+    # Match sol_attn.preprocess._reduce_kv_kernel exactly: Triton's default
+    # tl.sum preserves the BF16 reduction dtype (it does NOT auto-promote
+    # floating inputs). FP32 accumulation would change rounded summaries,
+    # hence sparse tile selection, despite gathering identical K/V values.
+    tl.store(KC + summary, tl.sum(k, axis=0) / count)
+    tl.store(VC + summary, tl.sum(v, axis=0))
 
 
 def gather_summaries(key, value, k_out, v_out, window_index, sink_rows):

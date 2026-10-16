@@ -74,6 +74,14 @@ def _union(q, k, v, sinks, bias=None, mapped=None, preparation=None):
     )
 
 
+def _exact_match(got, expected, *, stage, field):
+    """Preserve the bitwise gate, but identify the failing group and tensor."""
+    try:
+        torch.testing.assert_close(got, expected, atol=0, rtol=0)
+    except AssertionError as exc:
+        raise AssertionError(f"{stage} {field}: {exc}") from exc
+
+
 def parity_cases():
     reports = []
     torch.manual_seed(6181)
@@ -86,6 +94,7 @@ def parity_cases():
         (129, 0, 65, False, False, False),
     ):
         rows = sinks + windows
+        case = f"parity sinks={sinks} windows={windows} q={q_rows} mapped={mapped} weighted={weighted} interleaved={interleaved}"
         q, k, v, ko, vo, index = _allocate(max(519, rows), q_rows, rows, sinks, 2, interleaved=interleaved)
         _gather(k, v, ko, vo, index, sinks)
         original_k, original_v = ko.clone(), vo.clone()
@@ -106,15 +115,15 @@ def parity_cases():
                 prepared = grouped_kv.current(kg.unsqueeze(0), vg.unsqueeze(0))
                 assert prepared is not None
                 # Exhaustive bitwise comparison: summary changes can change sparse routing.
-                torch.testing.assert_close(kg, original_k, atol=0, rtol=0)
-                torch.testing.assert_close(vg, original_v, atol=0, rtol=0)
-                torch.testing.assert_close(prepared.kc, kc, atol=0, rtol=0)
-                torch.testing.assert_close(prepared.vc, vc, atol=0, rtol=0)
+                _exact_match(kg, original_k, stage=case, field="gathered K")
+                _exact_match(vg, original_v, stage=case, field="gathered V")
+                _exact_match(prepared.kc, kc, stage=case, field="BF16 K centroid")
+                _exact_match(prepared.vc, vc, stage=case, field="BF16 V sum")
                 return _union(q, kg, vg, sinks, bias, descriptor)
 
             candidate = grouped_kv.execute(k, v, ko, vo, index, sinks, consume)
             assert state.grouped_kv_fused_calls == 1
-        torch.testing.assert_close(candidate, baseline, atol=0, rtol=0)
+        _exact_match(candidate, baseline, stage=case, field="sparse attention output")
         # All-selected comparison also covers the independent dense operator.
         all_selected = _union(q, ko, vo, rows, bias, descriptor)
         mask = None if bias is None else bias.to(q.dtype).view(1, 1, 1, -1)
@@ -192,8 +201,8 @@ def production_case(source_rows, q_rows, kv_rows, sinks, rounds):
 
     kc, vc = baseline_prepare()
     fc, fv = fused_prepare()
-    torch.testing.assert_close(kc, fc, atol=0, rtol=0)
-    torch.testing.assert_close(vc, fv, atol=0, rtol=0)
+    _exact_match(fc, kc, stage=f"production q={q_rows} kv={kv_rows}", field="BF16 K centroid")
+    _exact_match(fv, vc, stage=f"production q={q_rows} kv={kv_rows}", field="BF16 V sum")
     del kc, vc, fc, fv
     descriptor = torch.tensor(
         [[1, min(4, (kv_rows + 63) // 64)]] * ((q_rows + 63) // 64), dtype=torch.int32, device=q.device
@@ -211,7 +220,7 @@ def production_case(source_rows, q_rows, kv_rows, sinks, rounds):
     with scope() as state:
         expected = baseline()
         actual = candidate()
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        _exact_match(actual, expected, stage=f"production q={q_rows} kv={kv_rows}", field="full sparse attention output")
         del expected, actual
         # Alternate arm order to reduce the effect of warm pool/clock drift.
         first = {"legacy": measure(baseline, rounds), "fused": measure(candidate, rounds)}
@@ -257,7 +266,9 @@ def main():
             raise RuntimeError("This acceptance requires an SM120/SM121 GPU")
         report["device"] = torch.cuda.get_device_name()
         with torch.inference_mode():
+            report["phase"] = "bf16_parity"
             report["parity"] = parity_cases()
+            report["phase"] = "production_shapes"
             # Synthetic restricted domains sized for recorded long H3 source
             # sequences. These are not captures of a particular H3 workflow.
             report["production_shapes"] = [
@@ -265,6 +276,7 @@ def main():
                 production_case(107630, 6580, 35901, 3101, args.rounds),
             ]
         report["numerical_and_memory_passed"] = True
+        report["phase"] = "performance_gate"
         report["component_performance_passed"] = all(
             case[order]["fused"]["cuda_ms"] <= case[order]["legacy"]["cuda_ms"] * 1.05
             for case in report["production_shapes"] for order in ("first", "reversed_order")
