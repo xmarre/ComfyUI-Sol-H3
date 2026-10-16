@@ -37,7 +37,7 @@ def _launch(q, k, v, *, bias=None, mapped=None):
 
 
 def test_dynamic_compile_reuses_shapes_and_strides_but_rebinds_all_live_arguments(monkeypatch):
-    compiles, launches = [], []
+    compiles, launches, preparations = [], [], []
     monkeypatch.setattr(provenance, "verify_source", lambda: None)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (12, 0))
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
@@ -47,6 +47,7 @@ def test_dynamic_compile_reuses_shapes_and_strides_but_rebinds_all_live_argument
     monkeypatch.setattr(interface, "_to_cute_tensors", lambda tensors: tensors)
 
     def prepare(q, k, v, **kwargs):
+        preparations.append(q.shape)
         kc = torch.empty(1, (k.shape[1] + 63) // 64, q.shape[2], 128, dtype=q.dtype)
         return kc, torch.empty_like(kc), torch.empty(1, (q.shape[1] + 63) // 64, q.shape[2])
 
@@ -55,7 +56,7 @@ def test_dynamic_compile_reuses_shapes_and_strides_but_rebinds_all_live_argument
 
         def compiled(*args, **kwargs):
             q, k, v, output = args[:4]
-            launches.append((q.shape[1], k.shape[1], args[-2:]))
+            launches.append((q.shape[1], k.shape[1], args[-3:-1], args[-1]))
             output.copy_(_reference(q[0], k[0], v[0], args[7] if biased else None).unsqueeze(0))
 
         interface._compiled[key] = compiled
@@ -78,9 +79,20 @@ def test_dynamic_compile_reuses_shapes_and_strides_but_rebinds_all_live_argument
     assert compiles == [(False, False), (True, False), (True, True)]
     assert [row[:2] for row in launches] == [(17, 75), (33, 131), (63, 193)] * 3
     assert all(row[2] == (0, (row[1] + 63) // 64) for row in launches)
+    assert all(row[3] == 0 for row in launches)  # partition-local query origin
     assert state.partitioned_kernel_compile_calls == 3
     assert state.partitioned_kernel_compile_cache_hits == 6
     assert state.partitioned_kernel_compile_wall_s >= 0.0
+    assert len(preparations) == 9
+    preparation = []
+    q, k, v = _inputs(17, 75)
+    for _ in range(2):
+        request._sm120_union(
+            q, k, v, tau=1.0, scale=128**-0.5, sink_rows=len(k),
+            key_bias=None, mapped_neighbor_intervals=None, preparation=preparation,
+        )
+    assert len(preparations) == 10  # same invocation: qualification + production
+
 
 
 def test_dynamic_tensor_type_keeps_broadcast_rank_dtype_and_leading_stride_distinct():
