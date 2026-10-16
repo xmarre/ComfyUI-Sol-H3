@@ -46,6 +46,71 @@ def test_real_modelpatcher_duplicate_owner_and_wrappers(native):
     assert _REQUEST.get() is None
 
 
+def test_real_native_projection_streaming_keeps_dense_provider_ownership(native, monkeypatch):
+    """CPU integration/ordering only; the native CUDA arithmetic gate is separate."""
+    from types import SimpleNamespace
+    from comfy.ldm.minimax.model import Attention, rope_rotation_table
+    from sol_h3 import runtime, streamed
+    from sol_h3.contracts import Config
+    from sol_h3.runtime import BlockPatch, Request, _FORWARD
+    from sol_h3.native_contract import function_digest
+    assert function_digest(Attention.forward) in streamed.NATIVE_ATTENTION_DIGESTS
+    torch.manual_seed(719)
+    attn = Attention(128, 2, 128, 1e-5, dtype=torch.bfloat16, device="cpu", operations=torch.nn).eval()
+    attn.requires_grad_(False)
+    x = torch.randn(257, 128, dtype=torch.bfloat16)
+    angles = torch.randn(257, 48).repeat(1, 2)
+    rope = rope_rotation_table(angles, x.dtype)
+    calls = []
+
+    def inherited(original, q, k, v, heads, mask=None, **kwargs):
+        calls.append((q.shape[2], k.shape[2]))
+        output = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        return output if kwargs.get("skip_output_reshape") else output.transpose(1, 2).flatten(2)
+
+    config = Config(exact=False, backend="sol", qkv_chunk_size=64)
+    state = Request(config)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=attn)])
+    token = _FORWARD.set((model, state, 0, set(), []))
+    # Execute the actual Core projection/RoPE/dispatch on CPU. Only admission
+    # is bypassed; this does not qualify the CUDA path numerically.
+    monkeypatch.setattr(streamed, "ineligible_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "_shape_reason", lambda *args, **kwargs: None)
+    layout = SimpleNamespace(seq_len=257, segments=[(0, 65, "text"), (65, 257, "video")])
+    options = {"optimized_attention_override": inherited, "minimax_h3_layout": layout}
+
+    def block(args):
+        return {"img": args["attention"](args["img"], rope_freqs=args["rope_freqs"],
+                                          transformer_options=args["transformer_options"])}
+
+    try:
+        with torch.inference_mode():
+            expected = attn(x, rope_freqs=rope, transformer_options=options)
+            calls.clear()
+            actual = BlockPatch(0, config)({"img": x, "rope_freqs": rope, "layout": layout,
+                                            "transformer_options": options}, {"original_block": block})["img"]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert calls == [(64, 257)] * 4 + [(1, 257)]
+        assert state.streamed_blocks == 1 and state.streamed_q_rows == 257
+        assert state.dense_calls == 5
+        assert state.last_routes is None
+        assert options["optimized_attention_override"] is inherited
+    finally:
+        _FORWARD.reset(token)
+
+
+def test_benchmark_constructs_native_int8_convrot_projection(native):
+    from tools.streamed_attention_benchmark import make_attention
+    with torch.inference_mode():
+        attn = make_attention(256, 2, "int8-convrot", device="cpu")
+        assert attn.qkv_proj.weight._params.convrot
+        assert attn.qkv_proj.weight._params.scale.numel() == 768
+        x = torch.randn(65, 256, dtype=torch.bfloat16)
+        full = attn.qkv_proj(x)
+        chunked = torch.cat([attn.qkv_proj(x[start:start + 64]) for start in range(0, 65, 64)])
+        torch.testing.assert_close(chunked, full, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("mode", ["auto", "sageattn3"])
 def test_actual_kj_sage_wrapper_and_comfy_recursion(native, monkeypatch, mode):
     kj = os.environ.get("KJNODES_PATH")
@@ -106,8 +171,9 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
     from comfy.model_patcher import ModelPatcher
     from comfy.patcher_extension import WrapperExecutor, WrappersMP
     from vdn_h3.hybrid import VDNState, apply_vdn
+    from vdn_h3.apply import _PostForwardLoRA
     from vdn_h3.softmax_provider import PROVIDER_API_VERSION
-    from sol_h3 import runtime, sparse
+    from sol_h3 import runtime, sparse, streamed
     from sol_h3.contracts import Config
     from sol_h3.runtime import install, _REQUEST
 
@@ -137,9 +203,28 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
         "softmax_gate.up.bias": gate_bias,
     })
     apply_vdn(patcher, vdn_state)
-    assert all(getattr(patcher.object_patches[
-        f"diffusion_model.blocks.{i}.attn.forward"], "_vdn_forward", False)
-        for i in range(3))
+    expect_bounded = os.environ.get("VDN_EXPECT_BOUNDED") == "1"
+    adapter_handles = []
+    if expect_bounded:
+        # Production VDN lora_mode=bypass registers exactly this hook on QKV.
+        # Exercise its row-local residual inside both full and bounded paths.
+        down = torch.randn(4, 128, dtype=torch.bfloat16) * 0.015625
+        up = torch.randn(384, 4, dtype=torch.bfloat16) * 0.015625
+        for block in inner.blocks:
+            adapter_handles.append(block.attn.qkv_proj.register_forward_hook(
+                _PostForwardLoRA([(down, up, 0.5)])
+            ))
+        assert all(
+            getattr(patcher.object_patches[f"diffusion_model.blocks.{i}.attn.forward"],
+                    "_vdn_bounded_projection_api", None) == 1
+            for i in range(3)
+        )
+    else:
+        assert all(
+            getattr(patcher.object_patches[f"diffusion_model.blocks.{i}.attn.forward"],
+                    "_vdn_forward", False)
+            for i in range(3)
+        )
 
     preprocess_calls = []
     def transform(q, k, v, heads, **kw):
@@ -150,7 +235,16 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
     inherited.attention_preprocess_v1 = (transform, None)
     patcher.model_options["transformer_options"]["optimized_attention_override"] = inherited
 
-    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0)
+    from sol_h3 import grouped_kv
+    group_calls = []
+    grouped_execute = grouped_kv.execute
+    def record_group(*args, **kwargs):
+        group_calls.append((args[2].shape[0], args[5]))
+        return grouped_execute(*args, **kwargs)
+    monkeypatch.setattr(grouped_kv, "execute", record_group)
+    expect_grouped = os.environ.get("VDN_EXPECT_GROUPED") == "1"
+
+    cfg = Config(exact=False, backend="sol", dense_evaluations=0, dense_layers=0, qkv_chunk_size=64)
     sol = install(patcher, cfg)
     monkeypatch.setattr(runtime, "_shape_reason", lambda *a, **kw: None)
     def oracle(q, k, v, **kw):
@@ -166,10 +260,41 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
     patched = patched_outer.diffusion_model
     try:
         assert getattr(patched.blocks[0].attn.forward, "_vdn_forward", False)
+        if expect_bounded:
+            class CudaFacade(torch.Tensor):
+                @property
+                def device(self):
+                    return torch.device("cuda:0")
+
+            fake = torch.empty(513, 128, dtype=torch.bfloat16).as_subclass(CudaFacade)
+            from sol_h3.runtime import Request
+            with monkeypatch.context() as m, torch.inference_mode():
+                m.setattr(torch.cuda, "get_device_capability", lambda _: (12, 0))
+                m.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+                admitted = streamed.ineligible_reason(
+                    patched.blocks[0],
+                    {"img": fake, "rope_freqs": object(), "transformer_options": {}},
+                    Request(Config(exact=False, backend="sol", qkv_chunk_size=64)),
+                    None, vdn=True,
+                )
+                assert admitted is None, admitted
+                # Unknown observers can be stateful or sequence-dependent.
+                bad_hook = patched.blocks[0].attn.qkv_proj.register_forward_hook(
+                    lambda *_args: None
+                )
+                try:
+                    assert streamed.ineligible_reason(
+                        patched.blocks[0],
+                        {"img": fake, "rope_freqs": object(), "transformer_options": {}},
+                        Request(Config(exact=False, backend="sol", qkv_chunk_size=64)),
+                        None, vdn=True,
+                    ) == "module_hooks_or_compile"
+                finally:
+                    bad_hook.remove()
         to = dict(sol.model_options["transformer_options"])
         to.update({"cond_or_uncond": [0], "uuids": ["positive"]})
 
-        def actual():
+        def actual(*, expect_bounded):
             executor = WrapperExecutor.new_class_executor(
                 patched._forward, patched,
                 sol.get_all_wrappers(WrappersMP.DIFFUSION_MODEL))
@@ -180,15 +305,45 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
             state = _REQUEST.get()
             assert state.sparse_calls > 0
             assert state.vdn_local_sol_calls > 0
+            if expect_grouped:
+                assert len(group_calls) >= state.vdn_local_sol_calls
+            else:
+                assert not group_calls
             assert state.vdn_rectangular_sol_calls > 0
             assert state.vdn_square_expanded_calls == 0
             assert state.vdn_kernel_q_rows == state.vdn_requested_q_rows > 0
             assert state.fallbacks["vdn_global_native"] > 0
             assert state.fallbacks["vdn_provider_contract_missing"] == 0
+            if expect_bounded:
+                assert state.streamed_vdn_projection_calls == len(patched.blocks)
+                assert state.streamed_vdn_projection_rows > 0
+            else:
+                assert state.streamed_vdn_projection_calls == 0
+            return out
 
-        with torch.no_grad():
-            WrapperExecutor.new_executor(
-                actual, sol.get_all_wrappers(WrappersMP.OUTER_SAMPLE)).execute()
+        def run(expect_bounded):
+            group_calls.clear()
+            with torch.no_grad():
+                return WrapperExecutor.new_executor(
+                    lambda: actual(expect_bounded=expect_bounded),
+                    sol.get_all_wrappers(WrappersMP.OUTER_SAMPLE)).execute()
+
+        baseline = run(False)
+        # Only force CPU admission. A real CUDA request must still satisfy all
+        # device, source, hook, duration and physical-domain guards.
+        if expect_bounded:
+            monkeypatch.setattr(
+                streamed, "ineligible_reason",
+                lambda _block, _args, _state, _previous, *, vdn=False:
+                    None if vdn else "short_sequence",
+            )
+            bounded = run(True)
+            for produced, expected in zip(bounded, baseline, strict=True):
+                # BF16 GEMM can select different block shapes for full versus
+                # bounded input rows; require close output, not identical bits.
+                torch.testing.assert_close(produced, expected, atol=2e-2, rtol=2e-2)
         assert preprocess_calls
     finally:
         sol.unpatch_model(unpatch_weights=False)
+        for handle in reversed(adapter_handles):
+            handle.remove()

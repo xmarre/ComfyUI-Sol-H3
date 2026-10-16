@@ -457,9 +457,11 @@ class HistoryPolicy:
             return False
         plain_routes = {
             "sol",
+            "sol_streamed",
             "sol_external_mixed",
             "sol_external_mixed_measure",
             "dense_warmup",
+            "dense_warmup_streamed",
             "vdn_local_sol",
             "vdn_dense_warmup",
             "vdn_local_native",

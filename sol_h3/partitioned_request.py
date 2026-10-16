@@ -32,6 +32,7 @@ from .mapped_neighbors import (
     validate_wire_map,
 )
 from .sparse import arithmetic_gate_passes, error_metrics
+from .grouped_kv import execute as _grouped_kv_execute
 
 PARTITIONED_REQUEST_ABI = "sol-h3-partitioned-single-union-v1"
 PARTITIONED_RECEIPT_TAG = "sol_h3_partitioned_exact_prefix_v2"
@@ -275,6 +276,7 @@ def _sm120_union(
     sink_rows: int,
     key_bias: torch.Tensor | None,
     mapped_neighbor_intervals: torch.Tensor | None,
+    preparation=None,
 ) -> torch.Tensor:
     """Execute one SM120 sparse attention union with optional bias + mapped metadata."""
     from ._vendor.sol_attn import interface
@@ -313,16 +315,27 @@ def _sm120_union(
     batch, q_rows, heads, _ = qb.shape
     kv_rows = kb.shape[1]
     with torch.cuda.device(q.device):
-        kc, vc, threshold = prepare(
-            qb,
-            kb,
-            vb,
-            scale=float(scale),
-            tau=float(tau),
-            thresh_type="diag",
-            valid_tokens=q_rows,
-            valid_kv_tokens=kv_rows,
-        )
+        from .grouped_kv import current as current_grouped_kv
+        prepared = current_grouped_kv(kb, vb)
+        if preparation is not None and preparation:
+            kc, vc, threshold = preparation[0]
+        elif prepared is not None:
+            from ._vendor.sol_attn.preprocess import _compute_diag_threshold
+            kc, vc = prepared.kc, prepared.vc
+            threshold = _compute_diag_threshold(qb, kc, tau=float(tau), scale=float(scale), valid_kv_tokens=kv_rows)
+        else:
+            kc, vc, threshold = prepare(
+                qb,
+                kb,
+                vb,
+                scale=float(scale),
+                tau=float(tau),
+                thresh_type="diag",
+                valid_tokens=q_rows,
+                valid_kv_tokens=kv_rows,
+            )
+        if preparation is not None and not preparation:
+            preparation.append((kc, vc, threshold))
         output = torch.empty_like(qb)
         lse = torch.empty((batch, q_rows, heads), device=q.device, dtype=torch.float32)
         stream = interface._stream(q.device)
@@ -378,7 +391,7 @@ def _sm120_union(
             args = interface._to_cute_tensors(tensors)
             if state is not None:
                 state.partitioned_kernel_compile_cache_hits += 1
-        compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
+        compiled(*args, float(scale), sink_start_block, sink_end_block, 0, stream=stream)
     return output[0]
 
 
@@ -655,6 +668,7 @@ def partitioned_request_attention(
         tuple(v.stride()),
         calibration_identity,
     )
+    preparation = []
     if layout_key not in verified:
         gate_started = time.perf_counter()
         got = _sm120_union(
@@ -666,12 +680,14 @@ def partitioned_request_attention(
             sink_rows=int(k.shape[0]),
             key_bias=key_bias,
             mapped_neighbor_intervals=mapped,
+            preparation=preparation,
         )
         want = _weighted_dense(q, k, v, key_bias, scale=scale)
         gate = error_metrics(
             got.transpose(0, 1).unsqueeze(0),
             want.transpose(0, 1).unsqueeze(0),
         )
+        del got, want
         gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(gate):
             raise RuntimeError(f"partitioned Sol all-selected arithmetic gate failed: {gate}")
@@ -698,6 +714,7 @@ def partitioned_request_attention(
         sink_rows=exact_end,
         key_bias=key_bias,
         mapped_neighbor_intervals=mapped,
+        preparation=preparation,
     )
     state.partitioned_sparse_calls = getattr(state, "partitioned_sparse_calls", 0) + 1
     state.partitioned_requested_q_rows = getattr(state, "partitioned_requested_q_rows", 0) + int(q.shape[0])
@@ -737,6 +754,13 @@ def partitioned_request_attention(
         fields=fields,
     )
     return result
+
+
+# VDN can use a zero-copy Q view for this trusted provider: every route
+# uses Q as read-only input, including dense/reference and mapped Sol fallbacks.
+# Arbitrary externally injected partitioned providers are not given this marker.
+partitioned_request_attention.grouped_kv_v1 = _grouped_kv_execute
+partitioned_request_attention._vdn_readonly_query_contract_v1 = True
 
 
 __all__ = [

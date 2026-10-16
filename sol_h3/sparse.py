@@ -56,7 +56,7 @@ def load_kernel(device):
 
     def kernel(q, k, v, *, tau, thresh_type="diag", kv_splits=1,
                sink_start=0, sink_tokens=0, key_bias=None,
-               mapped_neighbor_intervals=None):
+               mapped_neighbor_intervals=None, query_start=0, prepared_kv=None):
         _sink_blocks(sink_start, sink_tokens, k.shape[1])
         return sol_attn(
             q, k, v, scale=q.shape[-1] ** -0.5, tau=float(tau),
@@ -64,15 +64,107 @@ def load_kernel(device):
             sink_start=sink_start, sink_tokens=sink_tokens,
             key_bias=key_bias,
             mapped_neighbor_intervals=mapped_neighbor_intervals,
+            query_start=query_start, prepared_kv=prepared_kv,
         )
 
+    from ._vendor.sol_attn.interface import PreparedKV
+    kernel.prepare_kv = PreparedKV
     kernel.backend_name = backend
     kernel.source_tree_verified = True
     kernel.block_size = BLOCK_SIZE
     return kernel
 
 
+METRIC_CHUNK_ELEMENTS = 262144
+GATE_QUERY_CHUNK_SIZE = 4096
+
+
+def _metric_tiles(tensor):
+    """Slice before flattening so a strided output never creates a full copy."""
+    if tensor.numel() <= METRIC_CHUNK_ELEMENTS:
+        yield tensor
+        return
+    row_elements = math.prod(tensor.shape[1:])
+    if row_elements > METRIC_CHUNK_ELEMENTS:
+        for row in tensor.unbind(0):
+            yield from _metric_tiles(row)
+    else:
+        rows = max(1, METRIC_CHUNK_ELEMENTS // row_elements)
+        for start in range(0, tensor.shape[0], rows):
+            yield tensor[start:start + rows]
+
+
+class ErrorAccumulator:
+    """Whole-output metrics with bounded temporary storage and one host read."""
+
+    def __init__(self, device, *, enable_fused=True):
+        self.stats = torch.zeros(6, dtype=torch.float64, device=device)
+        self.stats[0] = 1
+        self.elements = 0
+        self._enable_fused = bool(enable_fused)
+        self._fused_partials = []
+
+    def add(self, got, want):
+        if got.shape != want.shape or got.device != want.device or not got.numel():
+            raise ValueError("Arithmetic metrics require equal nonempty shapes on the same device")
+        stats = self.stats
+        self.elements += got.numel()
+        if self._enable_fused and got.device.type == "cuda":
+            from .gate_metrics_triton import gate_partials
+            partial = gate_partials(got, want)
+            if partial is not None:
+                # The entire chunk remains validated, but its statistics can
+                # be aggregated with other chunks in one final device read.
+                self._fused_partials.append(partial)
+                return
+        for g, w in zip(_metric_tiles(got), _metric_tiles(want)):
+            gf, wf = g.float(), w.float()
+            delta = gf - wf
+            absolute = delta.abs()
+            stats[0].mul_(torch.isfinite(gf).all() & torch.isfinite(wf).all() & torch.isfinite(delta).all())
+            stats[1] = torch.maximum(stats[1], wf.abs().max())
+            stats[2] = torch.maximum(stats[2], absolute.max())
+            stats[3].add_(absolute.sum(dtype=torch.float64))
+            stats[4].add_(delta.double().square().sum())
+            stats[5].add_(wf.double().square().sum())
+            del gf, wf, delta, absolute
+
+    def statistics(self):
+        stats = self.stats
+        if not self.elements:
+            raise ValueError("No arithmetic samples were accumulated")
+        if self._fused_partials:
+            partial = torch.cat(self._fused_partials, dim=1)
+            stats[0].mul_(partial[0].amin())
+            stats[1] = torch.maximum(stats[1], partial[1].amax())
+            stats[2] = torch.maximum(stats[2], partial[2].amax())
+            stats[3].add_(partial[3].sum(dtype=torch.float64))
+            stats[4].add_(partial[4].sum(dtype=torch.float64))
+            stats[5].add_(partial[5].sum(dtype=torch.float64))
+            self._fused_partials.clear()
+        return torch.stack((
+            stats[0], stats[1], stats[2], stats[3] / self.elements,
+            stats[4].sqrt() / stats[5].sqrt().clamp_min(1e-12),
+        )).tolist()
+
+
 def error_metrics(got, want):
+    if got.shape != want.shape or got.device != want.device or not got.numel():
+        raise ValueError("Arithmetic metrics require equal nonempty shapes on the same device")
+    if got.numel() > METRIC_CHUNK_ELEMENTS:
+        # Preserve exhaustive all-Q/all-K arithmetic qualification. On SM120,
+        # thousands of small PyTorch reductions used to dominate gate overhead;
+        # the optional fused implementation computes the SAME full-domain
+        # statistics with bounded partial storage and one host read. CPU and
+        # unsupported layouts retain the reference reduction unchanged.
+        if got.device.type == "cuda":
+            from .gate_metrics_triton import gate_statistics
+            statistics = gate_statistics(got, want)
+            if statistics is not None:
+                return _metrics_from_statistics(statistics)
+        accumulator = ErrorAccumulator(got.device)
+        accumulator.add(got, want)
+        return _metrics_from_statistics(accumulator.statistics())
     got_f = got.float()
     want_f = want.float()
     delta = got_f - want_f
@@ -86,6 +178,10 @@ def error_metrics(got, want):
         abs_delta.mean(),
         torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(want_f).clamp_min(1e-12),
     )).tolist()
+    return _metrics_from_statistics(statistics)
+
+
+def _metrics_from_statistics(statistics):
     finite = bool(statistics[0])
     if not finite:
         return {
@@ -171,14 +267,16 @@ def _validate_mapped_descriptor(mapped, q, k):
 def attention(q, k, v, prefix, config, state, dense_attention=None,
               recompute_prefix_queries=True, key_bias=None, exact_k_blocks=None,
               calibration_identity=None, mapped_neighbor_intervals=None,
-              mapped_calibration_identity=None):
+              mapped_calibration_identity=None, query_start=0, kv_workspace=None):
     if (any(x.ndim != 4 for x in (q, k, v)) or k.shape != v.shape
             or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
             or q.shape[0] != 1 or q.shape[-1] != 128
             or q.shape[2] == 0 or k.shape[2] == 0):
         raise RuntimeError("SOL requires Q [1, heads, Tq, 128], KV [1, heads, Tkv, 128]")
     _sink_blocks(0, prefix, k.shape[2])
-    if recompute_prefix_queries and prefix > q.shape[2]:
+    if type(query_start) is not int or query_start < 0 or query_start % BLOCK_SIZE:
+        raise RuntimeError("SOL query_start must be a nonnegative multiple of 64")
+    if recompute_prefix_queries and not query_start and kv_workspace is None and prefix > q.shape[2]:
         raise RuntimeError("Prefix query recomputation exceeds the available Q rows")
     if any(x.dtype != torch.bfloat16 or x.device != q.device for x in (q, k, v)):
         raise RuntimeError("SOL requires BF16 QKV on the same device")
@@ -227,22 +325,61 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
     qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
     if any(x.stride(-1) != 1 for x in (qb, kb, vb)):
         raise RuntimeError("SOL BTHD bridge requires a contiguous head dimension")
+    streamed_kwargs = {}
+    from .grouped_kv import current as current_grouped_kv
+    grouped_prepared = current_grouped_kv(kb, vb)
+    if grouped_prepared is not None:
+        streamed_kwargs["prepared_kv"] = grouped_prepared
+    if kv_workspace is not None:
+        kv_workspace.check(q, k, v)
+        if kv_workspace.prepared_kv is None:
+            kv_workspace.prepared_kv = state.kernel.prepare_kv(kb, vb)
+        streamed_kwargs["prepared_kv"] = kv_workspace.prepared_kv
+    if query_start:
+        streamed_kwargs["query_start"] = query_start
 
     layout_key = _bthd_layout_key(qb, kb, vb)
     # Descriptor values are intentionally absent: every map with this layout reuses
     # one compiled mapped ABI. The runtime tensor remains a kernel argument.
     mapped_identity = (MAPPED_ABI_VERSION, True) if mapped_enabled else (MAPPED_ABI_VERSION, False)
-    key = (q.device, q.dtype, layout_key, calibration_identity, mapped_identity)
+    # Qualify every query origin once per request, even when all streamed
+    # chunks share one layout. Reusing a compile shape must not sample only
+    # the first chunk of the original full query sequence.
+    key = (q.device, q.dtype, layout_key, calibration_identity, mapped_identity, query_start)
     calibrating = key not in state.sparse_verified
     gate_started = time.perf_counter() if calibrating else None
     if calibrating:
-        got = state.kernel(
-            qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
-            sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
-            mapped_neighbor_intervals=mapped_neighbor_intervals,
-        )
-        want = _dense_reference(q, k, v, None, key_bias=key_bias)
-        metrics = error_metrics(got, want)
+        from .memory_profile import mark, storage_bytes
+        mark("arithmetic_gate_enter", q_rows=q.shape[2], kv_rows=k.shape[2])
+        # Qualification still covers EVERY Q row against EVERY original K/V.
+        # Bound both candidate/reference outputs; retain no all-selected full
+        # output beside the inputs. A weighted SDPA fallback can allocate scores,
+        # so restrict its query side to one M64 tile independently of producer size.
+        gate_rows = GATE_QUERY_CHUNK_SIZE if key_bias is None else BLOCK_SIZE
+        if (q.shape[2] > gate_rows and "prepared_kv" not in streamed_kwargs
+                and callable(getattr(state.kernel, "prepare_kv", None))):
+            streamed_kwargs["prepared_kv"] = state.kernel.prepare_kv(kb, vb)
+        accumulator = ErrorAccumulator(q.device) if q.shape[2] > gate_rows else None
+        for start in range(0, q.shape[2], gate_rows):
+            stop = min(start + gate_rows, q.shape[2])
+            gate_kw = dict(streamed_kwargs)
+            if query_start + start:
+                gate_kw["query_start"] = query_start + start
+            mapping = None if mapped_neighbor_intervals is None else mapped_neighbor_intervals[start // 64:(stop + 63) // 64]
+            got = state.kernel(
+                qb[:, start:stop], kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
+                sink_start=0, sink_tokens=kb.shape[1], key_bias=key_bias,
+                mapped_neighbor_intervals=mapping, **gate_kw,
+            )
+            want = _dense_reference(q[:, :, start:stop], k, v, None, key_bias=key_bias)
+            if accumulator is None:
+                metrics = error_metrics(got, want)
+            else:
+                accumulator.add(got, want)
+            del got, want
+        if accumulator is not None:
+            metrics = _metrics_from_statistics(accumulator.statistics())
+        mark("arithmetic_gate_statistics_done", q_rows=q.shape[2], kv_rows=k.shape[2])
         gate_wall_s = time.perf_counter() - gate_started
         if not arithmetic_gate_passes(metrics):
             raise RuntimeError(f"SOL all-selected arithmetic gate failed: {metrics}")
@@ -257,10 +394,12 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
             "gate_wall_s": gate_wall_s,
             "materialized_qkv_bytes": 0,
             "bthd_qkv_bytes": sum(x.numel() * x.element_size() for x in (qb, kb, vb)),
+            "qkv_storage_bytes": storage_bytes(qb, kb, vb),
             "bthd_strides": [list(x.stride()) for x in (qb, kb, vb)],
+            "gate_query_chunk_size": gate_rows,
+            "query_start": query_start,
             **metrics,
         })
-        del got, want
 
     if exact_k_blocks is None:
         sink_start, sink_tokens = 0, prefix
@@ -272,10 +411,12 @@ def attention(q, k, v, prefix, config, state, dense_attention=None,
         qb, kb, vb, tau=config.tau, thresh_type="diag", kv_splits=1,
         sink_start=sink_start, sink_tokens=sink_tokens, key_bias=key_bias,
         mapped_neighbor_intervals=mapped_neighbor_intervals,
+        **streamed_kwargs,
     )
-    if prefix and recompute_prefix_queries:
-        out[:, :prefix] = _dense_reference(
-            q[:, :, :prefix], k, v, dense_attention, key_bias=key_bias
+    prefix_queries = min(q.shape[2], max(0, prefix - query_start))
+    if prefix_queries and recompute_prefix_queries:
+        out[:, :prefix_queries] = _dense_reference(
+            q[:, :, :prefix_queries], k, v, dense_attention, key_bias=key_bias
         )
     state.sparse_calls += 1
     return out.reshape(1, q.shape[2], -1)

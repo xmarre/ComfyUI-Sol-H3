@@ -343,6 +343,7 @@ def _debug_mapped_launch(q, k, v, mapped, *, tau: float, sink_rows: int):
         float(scale),
         sink_start_block,
         sink_end_block,
+        0,
         stream=stream,
         options="--enable-tvm-ffi",
     )
@@ -351,6 +352,7 @@ def _debug_mapped_launch(q, k, v, mapped, *, tau: float, sink_rows: int):
         float(scale),
         sink_start_block,
         sink_end_block,
+        0,
         stream=stream,
     )
     return output, trace, kc, vc

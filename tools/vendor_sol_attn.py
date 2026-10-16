@@ -10,11 +10,13 @@ import tempfile
 REVISION = '2936c47637380842aaa4a4488fac5006cc542b70'
 SUBTREE = 'models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn'
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-mapped-neighbor-v4'
+CONTRACT = 'sana-sol-engine-sol-attn-64-rect-sm120-query-origin-v5'
 PATCHES = (
     ('rectangular-sm120-v3', ROOT / 'tools/rectangular_sm120.patch'),
     ('mapped-neighbor-sm120-v4', ROOT / 'tools/mapped_neighbor_sm120.patch'),
     ('sm121-cute-sm120', ROOT / 'tools/sm121_cute_sm120.patch'),
+    ('streamed-query-sm120-v5', ROOT / 'tools/streamed_sm120.patch'),
+    ('grouped-kv-summary-v1', ROOT / 'tools/grouped_kv_sm120.patch'),
 )
 
 
@@ -110,7 +112,9 @@ def main():
         'transformation': (
             'relative-imports-v1; rectangular-sm120-v3 (tools/rectangular_sm120.patch); '
             'mapped-neighbor-sm120-v4 (tools/mapped_neighbor_sm120.patch); '
-            'sm121-cute-sm120 (tools/sm121_cute_sm120.patch)'
+            'sm121-cute-sm120 (tools/sm121_cute_sm120.patch); '
+            'streamed-query-sm120-v5 (tools/streamed_sm120.patch); '
+            'grouped-kv-summary-v1 (tools/grouped_kv_sm120.patch)'
         ),
         # Legacy audit field remains the rectangular-v3 patch hash.
         'packaged_patch_sha256': patch_records[0]['sha256'],
