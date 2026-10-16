@@ -378,7 +378,7 @@ def _sm120_union(
             args = interface._to_cute_tensors(tensors)
             if state is not None:
                 state.partitioned_kernel_compile_cache_hits += 1
-        compiled(*args, float(scale), sink_start_block, sink_end_block, stream=stream)
+        compiled(*args, float(scale), sink_start_block, sink_end_block, 0, stream=stream)
     return output[0]
 
 
@@ -737,6 +737,12 @@ def partitioned_request_attention(
         fields=fields,
     )
     return result
+
+
+# VDN can use a zero-copy Q view for this trusted provider: every route
+# uses Q as read-only input, including dense/reference and mapped Sol fallbacks.
+# Arbitrary externally injected partitioned providers are not given this marker.
+partitioned_request_attention._vdn_readonly_query_contract_v1 = True
 
 
 __all__ = [
