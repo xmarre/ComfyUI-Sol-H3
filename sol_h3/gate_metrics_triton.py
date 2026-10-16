@@ -45,7 +45,11 @@ if triton is not None:
         # BF16 has no representable value at the FP32 maximum; this detects
         # BF16 nonfinites and FP32 overflow in the difference without relying
         # on optional libdevice predicates.
-        finite = (\n            (tl.abs(g) < 3.4028234663852886e38)\n            & (tl.abs(w) < 3.4028234663852886e38)\n            & (tl.abs(delta) < 3.4028234663852886e38)\n        )
+        finite = (
+            (tl.abs(g) < 3.4028234663852886e38)
+            & (tl.abs(w) < 3.4028234663852886e38)
+            & (tl.abs(delta) < 3.4028234663852886e38)
+        )
         # Masked lanes represent zeros, so neither maxima nor norms change.
         all_finite = tl.min(tl.where(valid, finite.to(tl.int32), 1), 0)
         reference_max = tl.max(tl.abs(w), 0)
