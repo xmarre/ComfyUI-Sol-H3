@@ -42,7 +42,7 @@ EXPECTED_SOL_BLOBS = {
     # historical captures do not qualify new SM120 compilation or throughput.
     "sol_h3/sparse.py": "37421128440f45c519ae0421b708d8e932f1f48b",
     "sol_h3/grouped_kv.py": "65f32dc05352e7abdd43376c60000ee4846209c8",
-    "sol_h3/grouped_kv_triton.py": "0d11504175449cfed19acb45309bb95533d58db7",
+    "sol_h3/grouped_kv_triton.py": "08dc68fe6a23d0438fc9f40dadc5fab918086ca8",
     "sol_h3/gate_metrics_triton.py": "89638535ce21a90c0074a557148762285c328d3b",
     "sol_h3/provenance.py": "abc5d384c79fe16b463abe4556494d34333ecf40",
     "sol_h3/sol_manifest.json": "77dc89d51b794430ccfae4a8d410942c90be0c64",
