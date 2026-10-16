@@ -2,6 +2,11 @@
 
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
+**Unreleased memory architecture:** this branch adds bounded BF16 QKV production,
+bounded arithmetic qualification and deterministic temporary-callback cleanup.
+GPU memory, sampler timing and decoded-quality acceptance remain open. See
+[BF16 memory architecture and acceptance procedure](docs/MEMORY.md).
+
 Sol-H3 packages the real Sol-Attn implementation from [`xmarre/Sana`, branch `sol-engine`](https://github.com/xmarre/Sana/tree/2936c47637380842aaa4a4488fac5006cc542b70/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn), pinned at revision `2936c47637380842aaa4a4488fac5006cc542b70`. On supported **SM120 and SM121** Linux/WSL2 systems it executes Sana's CuTe `cute_sm120` backend; `comfy_kitchen.sol_attn` is not substituted for it.
 
 The package has three parts:
@@ -76,6 +81,20 @@ The real packaged kernel, VDN API-v3 rectangular route, Flow mixed-grid route, S
 Apply MODEL patches and then apply **Sol-H3 SOL Attention (Experimental)** before sampling. `exact_fusion=true` also requests Exact Runtime. A later **Sol-H3 Exact Runtime** node merges with the same lifecycle rather than installing a second one.
 
 The SOL node defaults to `tau=1.0`, `dense_evaluations=1`, and `dense_layers=2`. `dense_evaluations` is a trajectory-level dense warmup; `dense_layers` is a per-evaluation leading-layer dense policy. They are not interchangeable. Set `dense_evaluations=0` only when explicitly choosing the faster SOL-first trajectory and accepting the documented startup-continuity risk.
+
+The optional `qkv_chunk_size` defaults to `4096`; `0` selects full native QKV
+production. Eligible native BF16 H3 calls above 32,768 rows retain full BF16 K/V
+and recompute Q in bounded projection chunks. With the compatible
+[VDN-H3-Plus PR #42](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/42)
+overlay, eligible VDN native forwards instead project Q/K/V in bounded chunks
+into three independent full-length BF16 carriers, preserving VDN's learned
+linear branch and grouped softmax while avoiding its redundant full-V clone.
+The VDN path does not recompute Q. With the paired VDN partitioned wrapper
+(API 2), Flow's physical low/probe/high domains can use this bounded projection
+without changing any Flow attention or temporal/linear ownership. Unqualified
+runtime projection hooks retain their established owners. Native
+two-pass projection adds compute; sampler memory/time and GPU output parity
+remain unmeasured. [Memory details](docs/MEMORY.md).
 
 On native Windows, the node can remain in the workflow but both custom-kernel paths fail closed: SOL delegates to inherited dense attention because CuTe is unavailable, and Exact Runtime records `exact:native_windows_unvalidated` then executes the untouched native H3 block. Linux/WSL2 supports the SM120 and SM121 targets described above.
 
@@ -203,7 +222,7 @@ The bridge preserves BF16 and native H3 scaling. `sink_start=0` keeps the leadin
 Kernel contract identity:
 
 ```text
-sana-sol-engine-sol-attn-64-rect-sm120-v2
+sana-sol-engine-sol-attn-64-rect-sm120-query-origin-v5
 ```
 
 ### Zero-copy BTHD bridge
@@ -341,7 +360,17 @@ bthd_strides
 dense_provider_failures
 numerical_backend_transitions
 compatibility_fallbacks
+streamed_blocks
+streamed_q_rows
+streamed_vdn_projection_calls
+streamed_vdn_projection_rows
+streamed_skips
+qkv_storage_bytes
 ```
+
+Set `SOL_H3_MEMORY_PROFILE=1` when launching ComfyUI for opt-in allocated/reserved
+memory attribution on real sampler requests. [The memory procedure](docs/MEMORY.md)
+explains baseline matching, first-use/warmed measurements and remaining acceptance.
 
 The legacy `dense_warmup` telemetry value counts attention calls kept dense by either `dense_evaluations` or `dense_layers`; it is not a count of full dense denoiser evaluations. Diagnose trajectory warmup with the configured `dense_evaluations`, backend-history `phase`, `numerical_backend_transitions`, and actual/forecast topology.
 
@@ -387,3 +416,32 @@ not included in this release set.
 `sol_h3/sol_manifest.json` records original upstream hashes and packaged hashes. `tools/rectangular_sm120.patch` records the functional rectangular changes after import adaptation.
 
 GPL-3.0-or-later; see `LICENSE` and `NOTICE`.
+
+### Arithmetic-gate reduction acceleration (experimental)
+
+On CUDA with Triton available, Sol now computes its **full-query, full-key**
+arithmetic-qualification statistics with a fused, tiled reduction and a small
+FP64 partial buffer. This does **not** skip kernel numerical qualification,
+change Sol's sparse attention output or change VDN/Flow projection arithmetic.
+It replaces thousands of individual PyTorch metric-reduction launches when an
+eligible BF16 3-D/4-D result is checked; other inputs keep the reference
+implementation. Only metric aggregation order may differ at floating-point
+roundoff levels. First-use kernel compilation and actual GPU throughput must be
+measured on SM120; no speedup has been established by CPU CI alone.
+A standalone, model-free GPU acceptance benchmark is available via
+`python tools/benchmark_gate_metrics.py`; it compares exact statistics
+and time against the preserved PyTorch reference at production-like
+query/head shapes without starting a video generation.
+ComfyUI Patcher installation needs no additional environment variables or node setting.
+
+
+### VDN zero-copy grouped Q ownership (draft)
+
+Sol's native v4 and physical partitioned attention providers advertise a
+read-only-Q marker to VDN. VDN may therefore pass slices for grouped contiguous
+query intervals instead of materializing extra `index_select` copies and
+indexed output scatters. Provider behavior, Q/K/V numerical values, query
+position maps, key/value gather, and dense fallback remain unchanged. Unknown
+third-party providers are not trusted and retain the old isolated Q-gather
+behavior. CPU CI checks the marker, while real RTX PRO 6000 peak-memory and
+sampling latency acceptance remains required before release.
