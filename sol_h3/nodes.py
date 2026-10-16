@@ -23,16 +23,18 @@ class SolH3Experimental:
                 "exact_fusion": ("BOOLEAN", {"default": True}),
                 "tau": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1}),
                 "dense_evaluations": ("INT", {"default": 1, "min": 0, "max": 100}),
-                "dense_layers": ("INT", {"default": 2, "min": 0, "max": 100})}}
+                "dense_layers": ("INT", {"default": 2, "min": 0, "max": 100})},
+                "optional": {"qkv_chunk_size": ("INT", {"default": 4096, "min": 0, "max": 65536, "step": 64,
+                    "tooltip": "Bound native H3 QKV projection rows; retain BF16 K/V and recompute Q. 0 uses the full native projection. Foreign attention owners retain their execution path."})}}
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
     CATEGORY = "model/optimizations/Sol-H3/experimental"
     DESCRIPTION = "Approximate Sol-Attn through the packaged Sana CuTe kernel on eligible SM120 H3/VDN calls. The default keeps the first full denoiser evaluation dense for conservative startup trajectory stability. dense_evaluations=0 is an aggressive speed opt-in: with Spectrum it can avoid one actual NFE, but it may cause visible startup temporal discontinuities. SOL kernel execution requires Linux/WSL2; unsupported calls fall back locally."
 
-    def apply(self, model, exact_fusion=True, tau=1.0, dense_evaluations=1, dense_layers=2):
+    def apply(self, model, exact_fusion=True, tau=1.0, dense_evaluations=1, dense_layers=2, qkv_chunk_size=4096):
         from .runtime import install
-        return (install(model, Config(exact_fusion, "sol", tau, dense_evaluations, dense_layers)),)
+        return (install(model, Config(exact_fusion, "sol", tau, dense_evaluations, dense_layers, qkv_chunk_size)),)
 
 
 NODE_CLASS_MAPPINGS = {"SolH3Exact": SolH3Exact, "SolH3Experimental": SolH3Experimental}

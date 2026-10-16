@@ -88,6 +88,7 @@ def test_v4_success_records_only_completed_request_owned_mapped_receipt(monkeypa
     try:
         def block(args):
             provider = args["transformer_options"][VDN_KEY_V4]
+            assert provider._vdn_readonly_query_contract_v1 is True
             got = provider(
                 lambda: (_ for _ in ()).throw(AssertionError("mapped success used native")),
                 q,
@@ -228,3 +229,8 @@ def test_mapped_calibration_is_structural_not_descriptor_value_keyed():
     assert len(state.gates) == 1
     assert state.gates[0]["mapped_neighbor_abi"] is True
     assert state.sparse_calls == 2
+
+
+def test_partitioned_sol_provider_declares_readonly_query_contract():
+    from sol_h3.partitioned_request import partitioned_request_attention
+    assert partitioned_request_attention._vdn_readonly_query_contract_v1 is True

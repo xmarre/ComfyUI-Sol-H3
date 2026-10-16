@@ -1,4 +1,5 @@
 import copy
+import gc
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -8,6 +9,42 @@ import torch
 from sol_h3 import runtime
 from sol_h3.contracts import KEY, Config
 from sol_h3.runtime import BlockPatch, DiffusionWrapper, Request, SamplingWrapper, _FORWARD, _REQUEST, install
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_block_providers_release_hidden_storage_without_cyclic_gc(fails):
+    from torch.multiprocessing.reductions import StorageWeakRef
+    cfg = Config(exact=False, backend="sol")
+    state = Request(cfg)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=SimpleNamespace(forward=lambda: None))])
+    token = _FORWARD.set((model, state, 0, set(), []))
+    inherited = {"optimized_attention_override": object(), "vdn_softmax_provider_v4": object()}
+    observed = []
+
+    def block(args):
+        observed.append(args["transformer_options"])
+        if fails:
+            raise ValueError("cancelled")
+        return {}
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        x = torch.empty(193, 128, dtype=torch.bfloat16)
+        storage = StorageWeakRef(x.untyped_storage())
+        arguments = {"img": x, "transformer_options": dict(inherited)}
+        if fails:
+            with pytest.raises(ValueError, match="cancelled"):
+                BlockPatch(0, cfg)(arguments, {"original_block": block})
+        else:
+            assert BlockPatch(0, cfg)(arguments, {"original_block": block}) == {}
+        assert observed[0] == inherited
+        del x, arguments
+        assert storage.expired(), "block callbacks retained hidden storage until cyclic GC"
+    finally:
+        if enabled:
+            gc.enable()
+        _FORWARD.reset(token)
 
 
 @pytest.fixture
@@ -211,3 +248,38 @@ def test_dense_provider_compute_errors_are_not_swallowed(monkeypatch):
 
     assert not state.disabled_dense_providers
     assert not state.dense_provider_failures
+
+
+def test_vdn_qkv_provider_restores_inherited_options_on_exception(monkeypatch):
+    from sol_h3 import streamed
+
+    cfg = Config(exact=False, backend="sol", qkv_chunk_size=64)
+    state = Request(cfg)
+    owner = object()
+    seen = []
+    def forward(*_args):
+        return None
+
+    forward._vdn_forward = True
+    attn = SimpleNamespace(forward=forward, qkv_proj=owner)
+    model = SimpleNamespace(blocks=[SimpleNamespace(attn=attn)])
+    token = _FORWARD.set((model, state, 0, set(), []))
+    x = torch.zeros(513, 384, dtype=torch.bfloat16)
+    options = {"sol_h3_vdn_qkv_projection_v1": "inherited"}
+    args = {"img": x, "transformer_options": options}
+    monkeypatch.setattr(streamed, "ineligible_reason", lambda *_args, **_kw: None)
+
+    def fail(call_args):
+        bridge = call_args["transformer_options"]
+        producer = bridge["sol_h3_vdn_qkv_projection_v1"]
+        assert callable(producer)
+        seen.append(bridge)
+        raise ValueError("injected failure")
+
+    try:
+        with pytest.raises(ValueError, match="injected failure"):
+            BlockPatch(0, cfg)(args, {"original_block": fail})
+    finally:
+        _FORWARD.reset(token)
+    assert seen[0]["sol_h3_vdn_qkv_projection_v1"] == "inherited"
+    assert options == {"sol_h3_vdn_qkv_projection_v1": "inherited"}
