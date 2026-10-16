@@ -325,7 +325,7 @@ def test_real_modelpatcher_vdn_v4_object_patch_reaches_sol(monkeypatch):
             )
             bounded = run(True)
             for produced, expected in zip(bounded, baseline, strict=True):
-                # BF16 GEMM can select different block shapes for full versus
+            # BF16 GEMM can select different block shapes for full versus
             # bounded input rows; require close output, not identical bits.
             torch.testing.assert_close(produced, expected, atol=2e-2, rtol=2e-2)
         assert preprocess_calls
