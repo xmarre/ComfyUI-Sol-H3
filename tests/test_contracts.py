@@ -58,8 +58,17 @@ def test_adaln_format():
 
 
 def test_node_schema():
-    assert set(NODE_CLASS_MAPPINGS) == {"SolH3Exact", "SolH3Experimental"}
-    for cls in NODE_CLASS_MAPPINGS.values():
+    assert set(NODE_CLASS_MAPPINGS) == {
+        "SolH3Exact",
+        "SolH3Experimental",
+        "SolH3KeylessRealH3Replay",
+    }
+    for name in ("SolH3Exact", "SolH3Experimental"):
+        cls = NODE_CLASS_MAPPINGS[name]
         assert cls.RETURN_TYPES == ("MODEL",)
         assert cls.INPUT_TYPES()["required"]["model"] == ("MODEL",)
+    replay = NODE_CLASS_MAPPINGS["SolH3KeylessRealH3Replay"]
+    assert replay.RETURN_TYPES == ("STRING", "STRING")
+    assert replay.OUTPUT_NODE is True
+    assert "capture_path" in replay.INPUT_TYPES()["required"]
     assert NODE_CLASS_MAPPINGS["SolH3Experimental"].INPUT_TYPES()["required"]["tau"][1]["default"] == 1.0
