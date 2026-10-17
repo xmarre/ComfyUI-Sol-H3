@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.11 — 2026-10-17
+
+- Sol #41: fuse grouped VDN K/V summary preparation, preserve full learned-linear VDN work and bound attention activation lifetimes. Maintain support for Flow's selected-provider forwarding contract from Flow #107.
+- Document SM120 6/6 grouped-producer component parity and approximately 24% isolated producer acceleration; full sampling comparison remains non-equivalent against Core MSA/BSA readout suppression.
+- Release Comfy Registry publication only after a validated GitHub release, rather than immediately on the version-bump push. Keyless is excluded.
+
+
 ## v0.1.10 — 2026-10-08
 
 - Spectrum backend history recognizes Flow's domain-uniform target-band block

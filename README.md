@@ -1,5 +1,10 @@
 # ComfyUI-Sol-H3
 
+## v0.1.11 — coordinated release (17 October 2026)
+
+Sol #41 fuses grouped VDN K/V preparation, preserves BF16 short-gather numerical semantics and bounds activation lifetimes. Pair it with **VDN-H3-Plus v1.5.10**, **Flow-Aligned Regenerate v0.3.14**, and **H3 Continuum-Plus v3.4.9**. The selected Sol path keeps the trained VDN linear complement active (550/550 in owner two-chunk traces) and logged 8,800 grouped K/V fusions. Owner SM120 producer-only medians improved ~24%; no matching overall-generation speedup or Sol-versus-Core same-work claim is implied. Windows native lacks these custom kernels. See [grouped attention](docs/GROUPED_ATTENTION.md), [memory policy](docs/MEMORY.md) and [release notes](RELEASE_NOTES.md).
+
+
 Native MiniMax-H3 exact-runtime optimization and composable Sana Sol-Attn integration for ComfyUI.
 
 **Unreleased memory architecture:** this branch adds bounded BF16 QKV production,

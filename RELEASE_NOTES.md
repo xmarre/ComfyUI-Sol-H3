@@ -1,3 +1,27 @@
+# ComfyUI-Sol-H3 v0.1.11
+
+## Production Sol/VDN/Flow interop
+
+This is the coordinated release of Sol #41, VDN-H3-Plus v1.5.10, Flow-Aligned Regenerate v0.3.14 and Continuum-Plus v3.4.9. It preserves all **550/550** trained VDN linear evaluations in the two-chunk Sol workload while using the selected SM120 Sol sparse/dense attention operator. It does not suppress VDN to replicate Core MSA/BSA performance.
+
+- Grouped fused K/V production for the VDN softmax provider, reusing the unchanged BF16 summary contract and avoiding duplicate K/V gathers.
+- Bounded/streamed attention activation ownership and reduced redundant materialization, with exact Q lifetime checks and retained producer capabilities through the updated Flow continuation wrapper.
+- Owner SM120 grouped-producer acceptance: 6/6 bitwise component parity cases; isolated producer medians improved about 24%. This is **not** an end-to-end 24% sampling speedup claim.
+- Owner Sol runs 02177 and 02181 both performed all 550 learned VDN calls and logged 8,800 grouped K/V fused invocations. Their sampler walls differ, but references and geometry differ too, so do not attribute the entire wall change to this patch.
+
+## Coordinated release versions
+
+| Component | Release | Included PRs |
+| --- | --- | --- |
+| Sol-H3 | v0.1.11 | Sol #41 |
+| VDN-H3-Plus | v1.5.10 | VDN #41–#44 |
+| Flow-Aligned Regenerate | v0.3.14 | Flow #102/#103/#105/#107/#108 |
+| H3 Continuum-Plus | v3.4.9 | Continuum #44/#46/#47 |
+
+Keyless changes are explicitly excluded. Native Windows still uses fallback paths, not the Linux/WSL2 SM120 custom kernels.
+
+---
+
 # Unreleased: bounded BF16 attention memory
 
 - Restore invocation-scoped attention provider entries in `finally`, breaking
