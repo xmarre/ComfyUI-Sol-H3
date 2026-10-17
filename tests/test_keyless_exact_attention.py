@@ -107,7 +107,7 @@ def test_exact_attention_rejects_incompatible_head_geometry():
 
 
 def test_k2_contract_is_explicit_and_separate_from_k1():
-    assert exact.CONTRACT == "sol-h3-keyless-exact-allselected-v2"
+    assert exact.CONTRACT == "sol-h3-keyless-exact-allselected-v3-k1-route-identity"
     assert summary.CONTRACT == "sol-h3-keyless-route-summary-v2"
     assert exact.CONTRACT != summary.CONTRACT
     assert exact.BLOCK_M == 64
@@ -123,3 +123,20 @@ def test_k2_source_uses_fp32_rope_compute_after_bf16_norm():
     assert "partner_math = partner_norm.to(tl.float32)" in source
     assert "cos_values = tl.load(" in source
     assert ").to(tl.float32)" in source
+
+
+def test_k2_v3_uses_k1_comfy_lane_fma_rms_ordering():
+    from pathlib import Path
+
+    source = Path(exact.__file__).read_text(encoding="utf-8")
+    kernel = source[
+        source.index("def _keyless_exact_allselected_kernel"):
+        source.index("else:\n    _keyless_exact_allselected_kernel = None")
+    ]
+    assert "lane_offsets = tl.arange(0, 32)" in kernel
+    assert "lane_sum = tl.fma(lane0, lane0, lane_sum)" in kernel
+    assert "lane_sum = tl.fma(lane1, lane1, lane_sum)" in kernel
+    assert "lane_sum = tl.fma(lane2, lane2, lane_sum)" in kernel
+    assert "lane_sum = tl.fma(lane3, lane3, lane_sum)" in kernel
+    assert "mean_square = tl.sum(lane_sum, axis=1) / head_dim" in kernel
+    assert "mean_square = tl.sum(raw * raw, axis=1) / head_dim" not in kernel

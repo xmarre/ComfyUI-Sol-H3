@@ -63,6 +63,33 @@ V2_ENVELOPE = ReplayEnvelopeV2()
 
 
 @dataclass(frozen=True)
+class K2V3ReplayEnvelope:
+    """Frozen from K2-v3 threshold-free calibration before holdout replay.
+
+    Aggregate limits are exactly 2x the observed 36-case calibration maxima.
+    The local arithmetic invariant remains <=1 BF16 ULP because every primary
+    candidate-vs-dense-K1-route calibration case satisfied that bound.
+    """
+
+    contract: str = "sol-h3-keyless-k2-v3-replay-envelope-v1"
+    calibration_contract: str = "sol-h3-keyless-k2-exact-route-calibration-v1"
+    calibration_sha256: str = (
+        "65ff8ccd679a7f5c2e1c82d59d98068167b94922ab0bc3f75e6f636363ebc306"
+    )
+    calibration_case_count: int = 36
+    aggregate_margin_multiplier: float = 2.0
+    k2_output: ScaleAwareArithmeticLimit = ScaleAwareArithmeticLimit(
+        rel_l2=0.002870015799999237,
+        max_abs_over_want_abs_max=0.012121212121212121,
+        mean_abs_over_want_mean_abs=0.0009517458902061093,
+        worst_bf16_ulps=1.0,
+    )
+
+
+K2_V3_ENVELOPE = K2V3ReplayEnvelope()
+
+
+@dataclass(frozen=True)
 class ReplayEnvelopeV1:
     """Frozen before any real-H3 replay result is observed."""
 
@@ -319,6 +346,10 @@ def v2_envelope_dict() -> dict[str, object]:
     return asdict(V2_ENVELOPE)
 
 
+def k2_v3_envelope_dict() -> dict[str, object]:
+    return asdict(K2_V3_ENVELOPE)
+
+
 def value_sum_within_limit(metrics: dict[str, float | bool], max_abs: float) -> bool:
     return bool(metrics.get("finite")) and float(metrics["max_abs"]) <= float(max_abs)
 
@@ -420,13 +451,16 @@ __all__ = [
     "ArithmeticLimit",
     "ScaleAwareArithmeticLimit",
     "ENVELOPE",
+    "K2_V3_ENVELOPE",
     "V2_ENVELOPE",
+    "K2V3ReplayEnvelope",
     "ReplayEnvelopeV1",
     "ReplayEnvelopeV2",
     "block_summary_oracle",
     "checkpoint_tensor_names",
     "envelope_dict",
     "identity_split_half_rope_like",
+    "k2_v3_envelope_dict",
     "public_rms_norm",
     "apply_split_half_rope_from_normalized",
     "apply_split_half_rope_fp32_from_normalized",
