@@ -1,3 +1,24 @@
+# Unreleased: bounded BF16 attention memory
+
+- Restore invocation-scoped attention provider entries in `finally`, breaking
+  callback cycles that retained block arguments and Requests until cyclic GC.
+- Qualify every ordinary/VDN Sol query in bounded chunks. Bound metric scratch,
+  retain the existing numerical limits and reuse invocation-owned K/V summaries.
+- Add an optional native H3 two-pass producer (`qkv_chunk_size=4096`, `0` for
+  full native production). Retain BF16 K/V and recompute bounded Q chunks through
+  the original projection module. Preserve inherited dense ownership and delegate
+  VDN, Flow domain owners, transforms and dynamic projection hooks.
+- Extend the verified SM120/SM121 ABI with a runtime global query-block origin;
+  preserve exact-neighbor routing when Q is sliced. Update partitioned callers,
+  the reproducible vendor patch and source/probe provenance together.
+- Distinguish producer configuration and streamed receipts in Spectrum history.
+- Add CPU lifetime/ownership tests, offline SM120/SM121 compilation, real-device
+  parity tests, a native projection benchmark and opt-in sampler memory reporting.
+
+No GPU memory/performance or decoded-quality result is claimed. This candidate
+must pass [the CUDA and real-sampler acceptance procedure](docs/MEMORY.md) before
+merge or release. Published v0.1.10 evidence below predates this architecture.
+
 # ComfyUI-Sol-H3 v0.1.10
 
 Companion release for Flow-Aligned Regenerate v0.3.11 and VDN-H3-Plus v1.5.9.

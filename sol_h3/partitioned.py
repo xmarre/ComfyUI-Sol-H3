@@ -178,6 +178,7 @@ def sm120_attention_with_lse(
             scale,
             sink_start_block,
             sink_end_block,
+            0,
             stream=stream,
         )
     return output, lse

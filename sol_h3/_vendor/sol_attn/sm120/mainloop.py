@@ -1,4 +1,4 @@
-# Modified by ComfyUI-Sol-H3: rectangular SM120 Q/KV geometry plus runtime mapped-neighbor metadata; see tools/rectangular_sm120.patch and tools/mapped_neighbor_sm120.patch.
+# Modified by ComfyUI-Sol-H3: rectangular/mapped SM120 geometry and streamed query origin; see the recorded tools/*sm120.patch stack.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 """Fused Sol-Attn forward kernel for GeForce Blackwell SM120.
@@ -89,6 +89,7 @@ class SolAttnForwardSm120:
         scale_softmax_log2e: cutlass.Float32,
         sink_start_block: cutlass.Int32,
         sink_end_block: cutlass.Int32,
+        query_start_block: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         lane = cute.arch.lane_idx()
@@ -460,7 +461,7 @@ class SolAttnForwardSm120:
                         )
                         kv_block = group_start + off
                         exact = sol_attn_route_is_exact(
-                            q_tile_idx,
+                            q_tile_idx + query_start_block,
                             kv_block,
                             col_mean,
                             threshold,
@@ -732,6 +733,7 @@ class SolAttnForwardSm120:
         softmax_scale: cutlass.Float32,
         sink_start_block: cutlass.Int32,
         sink_end_block: cutlass.Int32,
+        query_start_block: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         q_mkl, k_nkl, kc_nkl = [
@@ -920,6 +922,7 @@ class SolAttnForwardSm120:
             softmax_scale * 1.4426950408889634,
             sink_start_block,
             sink_end_block,
+            query_start_block,
         ).launch(
             grid=(cute.ceil_div(q_mkl.shape[0], M), q_mkl.shape[2], q_mkl.shape[3]),
             block=(self.num_threads, 1, 1),
