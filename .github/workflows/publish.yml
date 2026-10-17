@@ -2,38 +2,95 @@ name: Publish to Comfy registry
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - "pyproject.toml"
+    inputs:
+      tag:
+        description: Published release tag to publish
+        required: true
+        type: string
+  workflow_run:
+    workflows: [release]
+    types: [completed]
 
 permissions:
   contents: read
   issues: write
 
+concurrency:
+  group: registry-${{ github.repository }}-${{ inputs.tag || github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
 jobs:
   publish-node:
     name: Publish Custom Node to registry
+    if: >-
+      github.repository_owner == 'xmarre' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'xmarre' }}
-    env:
-      REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
     steps:
-      - name: Check out code
+      - name: Check out current branch for metadata
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
-      - name: Publish Custom Node
-        if: ${{ env.REGISTRY_ACCESS_TOKEN != '' }}
+      - name: Resolve published release and current-main identity
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED_TAG}" ]]; then
+            tag="${REQUESTED_TAG}"
+          else
+            version="$(python -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+            tag="v${version}"
+          fi
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: ${tag}" >&2
+            exit 1
+          fi
+          is_draft="$(gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft')"
+          if [[ "${is_draft}" != "false" ]]; then
+            echo "Release ${tag} is not published" >&2
+            exit 1
+          fi
+          release_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq '.sha')"
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          if [[ "${release_sha}" != "${main_sha}" ]]; then
+            echo "Published tag ${tag} is stale (${release_sha} vs main ${main_sha}); skip."
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "publish=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out released source
+        if: steps.release.outputs.publish == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Validate Comfy registry identity
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          python - "${TAG}" <<'PY'
+          from pathlib import Path
+          import sys, tomllib
+          p = tomllib.loads(Path("pyproject.toml").read_text())
+          assert p["project"]["name"] == "comfyui-sol-h3"
+          assert p["tool"]["comfy"]["PublisherId"] == "xmarre"
+          assert "v" + p["project"]["version"] == sys.argv[1]
+          PY
+
+      - name: Publish released node
+        if: steps.release.outputs.publish == 'true'
         uses: Comfy-Org/publish-node-action@0eb6cd742945443bee7f79eeddd4f732780029a1 # v1
         with:
-          personal_access_token: ${{ env.REGISTRY_ACCESS_TOKEN }}
-
-      - name: Registry token unavailable
-        if: ${{ env.REGISTRY_ACCESS_TOKEN == '' }}
-        shell: bash
-        run: |
-          echo "::warning::REGISTRY_ACCESS_TOKEN is not configured for this repository; skipping Comfy Registry publication."
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
