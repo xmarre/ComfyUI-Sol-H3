@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Calibrate Keyless K3 routing decisions against materialized-route Sol on real H3.
+"""Recalibrate K3 against the proven K1-v6 route identity on real H3.
 
-K1 supplies routed centroids/value sums directly from raw V.  This probe feeds
-those summaries into the released SM120 Sol threshold/selector while keeping the
-exact-block K tensor materialized from the Comfy route.  That isolates K3
-selection and approximate-summary behavior from the later K4 CuTe mainloop
-change that will derive selected routed tiles from raw V.
+K1-v6 supplies routed centroids/value sums from raw V through its bounded-b8
+spill/reload primitive. The reference materializes the exact K1 row route only
+on the diagnostic side and feeds it through the released Sol reducer. Candidate
+and reference then use the same materialized exact K1 route for selected exact
+blocks, so this run isolates only K3 threshold/selector/approximate-summary
+semantics after the upstream K1 mismatch was corrected.
 
-The run is threshold-free calibration evidence only.
+The run is threshold-free calibration evidence only. No K3 gate is frozen by it.
 """
 from __future__ import annotations
 
@@ -32,10 +33,11 @@ from sol_h3.keyless_real_h3_replay import (  # noqa: E402
     tensor_scale_diagnostics,
 )
 from sol_h3.keyless_route_summary import (  # noqa: E402
-    CONTRACT as K1_CONTRACT,
     HEAD_DIM,
     NORM_EPS,
-    route_summary,
+    SOL_REDUCTION_CONTRACT as K1_CONTRACT,
+    materialized_sol_reduction_v4_route_diagnostic,
+    route_summary_sol_reduction,
 )
 from sol_h3.keyless_selector import (  # noqa: E402
     CONTRACT as K3_CONTRACT,
@@ -46,9 +48,19 @@ from sol_h3.keyless_selector import (  # noqa: E402
 )
 
 
-PROBE_CONTRACT = "sol-h3-keyless-k3-selector-calibration-probe-v1"
-EVIDENCE_CONTRACT = "sol-h3-keyless-k3-selector-calibration-v1"
-REQUIRED_K1_CONTRACT = "sol-h3-keyless-route-summary-v2"
+PROBE_CONTRACT = "sol-h3-keyless-k3-selector-probe-v2"
+EVIDENCE_CONTRACT = "sol-h3-keyless-k3-selector-calibration-v2"
+REQUIRED_K1_CONTRACT = "sol-h3-keyless-route-summary-sol-reduction-v6-bounded-b8"
+REQUIRED_K3_CONTRACT = "sol-h3-keyless-selector-k3-v2-k1-route-identity"
+K1_V9_EVIDENCE_SHA256 = (
+    "d824f51b86e3dea96296606cf27c8c46514f49c8b920cda640e9ed77f92732ba"
+)
+K2_V3_HOLDOUT_SHA256 = (
+    "61267ae96c3a557f02fee2dd5e7747e7a2ba296506d7a17f11dd0300e59db18e"
+)
+HISTORICAL_K3_V1_SHA256 = (
+    "8017876a937fe8a25287a231ccf8a331422514f36241a80675d52ef39a96d71b"
+)
 HEADS = 56
 HIDDEN = 5376
 SCALE = HEAD_DIM ** -0.5
@@ -174,8 +186,20 @@ def _case_extrema(blocks: list[dict[str, object]]) -> dict[str, object]:
     )
     return {
         "case_count": len(flat),
+        "all_route_centroids_exact": all(
+            float(item["route_centroid"]["max_abs"]) == 0.0 for item in flat
+        ),
+        "all_raw_value_sums_exact": all(
+            float(item["raw_value_sum"]["max_abs"]) == 0.0 for item in flat
+        ),
+        "all_thresholds_exact": all(
+            float(item["threshold"]["max_abs"]) == 0.0 for item in flat
+        ),
         "all_route_traces_equal": all(
             bool(item["route_trace"]["equal"]) for item in flat
+        ),
+        "all_outputs_exact": all(
+            float(item["output"]["max_abs"]) == 0.0 for item in flat
         ),
         "maximum_route_trace_differing_bits": {
             "value": int(trace_diff["route_trace"]["differing_bits"]),
@@ -217,6 +241,10 @@ def _case_extrema(blocks: list[dict[str, object]]) -> dict[str, object]:
             "worst_bf16_ulps": maximum_ulp("output_scale"),
         },
         "raw_value_sum_max_abs": maximum("raw_value_sum", "max_abs"),
+        "k1_route_vs_comfy_route": {
+            "rel_l2": maximum("k1_route_vs_comfy_route", "rel_l2"),
+            "max_abs": maximum("k1_route_vs_comfy_route", "max_abs"),
+        },
     }
 
 
@@ -278,13 +306,19 @@ def _run_block(
             device=device,
         )
         q = replay_fixture._comfy_position(q_raw, q_norm, q_rope)
-        route = replay_fixture._comfy_position(v_raw, route_norm, v_rope)
+        comfy_route = replay_fixture._comfy_position(v_raw, route_norm, v_rope)
+        k1_route = materialized_sol_reduction_v4_route_diagnostic(
+            v_raw,
+            route_norm.to(device=device, dtype=torch.bfloat16),
+            NORM_EPS,
+            v_rope,
+        )
 
         qb = q.unsqueeze(0).contiguous()
-        rb = route.unsqueeze(0).contiguous()
+        kb = k1_route.unsqueeze(0).contiguous()
         vb = v_raw.unsqueeze(0).contiguous()
 
-        candidate_rc, candidate_vc = route_summary(
+        candidate_rc, candidate_vc = route_summary_sol_reduction(
             v_raw,
             route_norm.to(device=device, dtype=torch.bfloat16),
             NORM_EPS,
@@ -302,7 +336,7 @@ def _run_block(
 
         reference_rc, reference_vc, reference_threshold = prepare(
             qb,
-            rb,
+            kb,
             vb,
             tau=tau,
             scale=SCALE,
@@ -315,7 +349,7 @@ def _run_block(
         candidate_started = time.perf_counter()
         candidate_output, candidate_trace = run_materialized_exact_selector_isolation(
             qb,
-            rb,
+            kb,
             vb,
             candidate_rc,
             candidate_vc,
@@ -330,7 +364,7 @@ def _run_block(
         reference_started = time.perf_counter()
         reference_output, reference_trace = run_materialized_exact_selector_isolation(
             qb,
-            rb,
+            kb,
             vb,
             reference_rc,
             reference_vc,
@@ -368,6 +402,11 @@ def _run_block(
                     candidate_rc, reference_rc
                 ),
                 "raw_value_sum": tensor_metrics(candidate_vc, reference_vc),
+                "k1_route_vs_comfy_route": tensor_metrics(k1_route, comfy_route),
+                "k1_route_vs_comfy_route_scale": tensor_scale_diagnostics(
+                    k1_route,
+                    comfy_route,
+                ),
                 "threshold": tensor_metrics(
                     candidate_threshold, reference_threshold
                 ),
@@ -393,9 +432,10 @@ def _run_block(
             q_rope,
             v_rope,
             q,
-            route,
+            comfy_route,
+            k1_route,
             qb,
-            rb,
+            kb,
             vb,
             candidate_rc,
             candidate_vc,
@@ -455,22 +495,31 @@ def main() -> None:
 
     probe_source = replay_fixture._probe_source_identity(_REPO_ROOT)
     probe_source["probe_contract"] = PROBE_CONTRACT
+    probe_source["critical_source_sha256"] = {
+        rel: replay_fixture._sha256_file(_REPO_ROOT / rel)
+        for rel in (
+            "tools/keyless_k3_selector_probe.py",
+            "tools/keyless_real_h3_replay_probe.py",
+            "sol_h3/keyless_selector.py",
+            "sol_h3/keyless_route_summary.py",
+        )
+    }
     if args.expected_probe_contract:
         expected = args.expected_probe_contract.strip()
         if expected != PROBE_CONTRACT:
             parser.error(
                 "stale Sol-H3 K3 probe: expected "
                 f"{expected!r}, local probe implements {PROBE_CONTRACT!r}; "
-                "refresh the Sol #22 Patcher overlay"
+                "refresh the complete Patcher stack through the K3-v2 PR"
             )
     if probe_source["tracked_worktree_dirty"]:
         parser.error("K3 calibration requires a clean tracked Sol-H3 worktree")
     if K1_CONTRACT != REQUIRED_K1_CONTRACT:
         parser.error(
-            f"K3 calibration requires K1 v2, got {K1_CONTRACT!r}; "
-            "refresh the complete Sol #17/#20/#21/#22 Patcher stack"
+            f"K3-v2 calibration requires proven K1-v6, got {K1_CONTRACT!r}; "
+            "refresh the complete Patcher stack through the K3-v2 PR"
         )
-    if K3_CONTRACT != "sol-h3-keyless-selector-k3-calibration-v1":
+    if K3_CONTRACT != REQUIRED_K3_CONTRACT:
         parser.error(f"unexpected K3 selector contract {K3_CONTRACT!r}")
     if not 0.0 <= args.tau <= 3.0:
         parser.error("--tau must be in [0,3]")
@@ -553,6 +602,11 @@ def main() -> None:
             "k1": K1_CONTRACT,
             "k3": K3_CONTRACT,
         },
+        "evidence_lineage": {
+            "k1_v9_sha256": K1_V9_EVIDENCE_SHA256,
+            "k2_v3_holdout_sha256": K2_V3_HOLDOUT_SHA256,
+            "historical_k3_v1_sha256": HISTORICAL_K3_V1_SHA256,
+        },
         "tau": float(args.tau),
         "attention_scale": SCALE,
         "selector_provenance": selector_provenance,
@@ -595,8 +649,12 @@ def main() -> None:
         },
         "limitations": [
             "threshold-free K3 calibration only; no K3 acceptance threshold is frozen",
-            "exact-block K remains the globally materialized Comfy route to isolate selector behavior",
-            "candidate K1 RC/VC come from raw V without a global candidate route tensor",
+            (
+                "exact-block K remains the globally materialized exact K1 row route "
+                "to isolate selector behavior"
+            ),
+            "candidate K1-v6 RC/VC come from raw V through bounded-b8 route scratch",
+            "the full exact K1 route exists only on the diagnostic/reference side",
             "the released SM120 selector/approximate mainloop is reused unchanged",
             "one sigma-1 real-H3 capture and blocks 0/25/49 only",
             "no production provider promotion, fused selected-route CuTe transform, decoded-media, sampler, or end-to-end performance evidence",
