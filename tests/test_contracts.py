@@ -58,7 +58,7 @@ def test_adaln_format():
 
 
 def test_node_schema():
-    assert set(NODE_CLASS_MAPPINGS) == {"SolH3Exact", "SolH3Experimental"}
+    assert set(NODE_CLASS_MAPPINGS) == {"SolH3Exact", "SolH3Experimental", "SolKrea2Experimental"}
     for cls in NODE_CLASS_MAPPINGS.values():
         assert cls.RETURN_TYPES == ("MODEL",)
         assert cls.INPUT_TYPES()["required"]["model"] == ("MODEL",)
