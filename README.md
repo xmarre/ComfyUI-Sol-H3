@@ -109,6 +109,95 @@ SOL wraps existing block replacements. Every attention call either executes SOL 
 
 Generic `optimized_attention_override` providers such as KJ Sage remain the dense owner for dense-evaluation warmup, dense leading layers and other dense-required rows when usable. Loader-level `ImportError`/`OSError` failures are request-locally demoted to original Comfy attention with telemetry; arbitrary CUDA/runtime compute failures are not swallowed.
 
+## Experimental Krea 2 sparse attention (unreleased)
+
+**Sol-Krea2 Sparse Attention (Experimental)** is an opt-in MODEL patch for the
+native ComfyUI Krea 2 (SingleStreamDiT). BF16 uses Sol-H3's packaged Sana CuTe
+SM120/SM121 implementation; native FP16 uses the installed ComfyUI Kitchen
+FP16 Sol kernel. Each route has its own sampling lifecycle. No MiniMax-H3,
+VDN, Flow, Spectrum or block-replacement contracts are changed.
+
+Place the patch **after** your model loader, LoRA loaders, Diff-Aid, and any
+inherited attention provider, and **before** the guider/sampler. For a KJ
+diffusion loader using SageAttention auto, the new node captures KJ Sage
+as the dense fallback:
+
+    KJ Diffusion Model Loader (Krea 2, Sage auto)
+      -> Krea 2 Diff-Aid (if used)
+      -> Sol-Krea2 Sparse Attention (Experimental)
+      -> guider / sampler
+
+Defaults: tau 1.0, min_tokens 4096, dense_evaluations 1, dense_layers 2,
+extra_tokens 256 (FP16 only; supported values 0/64/128/192/256).
+By default, the first complete diffusion evaluation and first two
+main transformer blocks of subsequent evaluations use inherited dense
+attention. Enable verbose for per-request counters. **Zero sparse calls
+means no Sol acceleration.**
+
+### Startup alignment with Spectrum Krea 2
+
+When composing this node with Spectrum Krea 2 at `warmup=2`,
+`bootstrap=false`, and `degree=1`, the default
+`dense_evaluations=1` changes the attention backend between Spectrum's
+first and second native actual evaluations. Spectrum correctly discards
+the old dense feature anchor rather than forecasting across two
+different operators; this can cost early forecasts.
+
+For a *single attention backend across both required actual anchors*,
+set **Sol `dense_evaluations=0`** while keeping Spectrum
+`warmup=2`, `bootstrap=false`, Sol `dense_layers=2` and FP16
+`extra_tokens=256`. This does **not** reduce Spectrum's actual
+denoiser warmup or use one-point feature hold; it allows the Sol sparse
+backend starting with the first native DiT evaluation. The initial
+two main blocks remain dense, text key blocks remain protected, and
+text-query rows are recomputed with dense SDPA, but the remaining
+attention is approximate from the first evaluation. That is a
+quality/performance tradeoff, not an equivalent dense first step.
+If the sparse-from-start image exhibits structural artifacts, return
+to `dense_evaluations=1`; do not mix dense and sparse feature histories
+or weaken Spectrum's extrapolation gates to recover nominal forecast
+counts. The count recovered depends on the actual sigma schedule and
+history validity, not just the warmup setting.
+
+Eligibility is deliberately narrow: unmasked full-sequence Krea main-block
+self-attention, FP16 or BF16 Q/K/V in [1, heads, tokens, 128] after native
+GQA K/V expansion, CUDA SM120/SM121 and ordinary non-compiled,
+non-graph-captured inference. BF16 requires Linux/WSL2 CuTe; FP16 requires
+ComfyUI Kitchen's available CUDA Sol backend. Unsupported calls (text fusion,
+masked, batched, short-sequence, or reference-guided) preserve the inherited
+dense provider. Krea's main-block img_slice identifies the leading text K/V
+sink. BF16 preserves the exact text K/V and recomputes text-query rows via
+dense SDPA. FP16 protects the first ceil(text_tokens/64) blocks as both
+exact-route key sinks and full-attention query blocks, then recomputes all
+authored text-query rows against the original FP16 K/V with dense SDPA.
+It additionally routes
+256 individual high-scoring tokens per query block by default; text-row
+protection remains quantized by the Kitchen attention kernel. Krea reference
+images are appended after target-image tokens, so **reference-guided calls
+remain dense** instead of sparsifying their unprotected K/V tails.
+
+Inherited attention providers that declare additional Q/K/V preprocessing are kept on their original dense path rather than silently bypassing that transform. If a Krea checkpoint configures per-block attention without any inherited override, installation refuses to shadow it.
+
+BF16 retains the existing full-domain, all-selected Sana arithmetic gate.
+FP16 uses a 512-token (or shorter) native-FP16 all-selected arithmetic pilot
+against dense FP16 SDPA before the first sparse call of a new layout. Its
+relative-L2 acceptance bound (2%) is separate from Sana CuTe's stricter
+full-domain gate, following ComfyUI Kitchen's published fully routed tests. That
+pilot checks arithmetic compatibility, **not sparse image fidelity**. A failed
+FP16 pilot disables the optional kernel for the request and delegates to the
+inherited dense owner. Unexpected kernel execution errors propagate.
+Unavailable kernels also delegate to inherited dense attention. Existing H3
+nodes still reject non-H3 models.
+
+**Validation status:** CPU contract tests cover patch installation, inherited
+fallback, sampling warmup, FP16 protected text routing, arithmetic-pilot
+failure handling, and request isolation. Real Krea 2 GPU quality and throughput
+validation has **not** been performed.
+Krea 2 can already use a fast SageAttention dense backend; Sol may be slower
+near 1 MP, and approximate image attention can change output fidelity.
+Compare matched seeds, sparse-call receipts, peak memory, sampler wall time
+and decoded images before production deployment.
+
 ## Interoperability companions
 
 The companion contracts are opt-in and are not automatically installed:

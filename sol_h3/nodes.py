@@ -37,6 +37,58 @@ class SolH3Experimental:
         return (install(model, Config(exact_fusion, "sol", tau, dense_evaluations, dense_layers, qkv_chunk_size)),)
 
 
-NODE_CLASS_MAPPINGS = {"SolH3Exact": SolH3Exact, "SolH3Experimental": SolH3Experimental}
+
+
+class SolKrea2Experimental:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "enabled": ("BOOLEAN", {"default": True}),
+            "tau": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1}),
+            "min_tokens": ("INT", {"default": 4096, "min": 0, "max": 1048576, "step": 256}),
+            "dense_evaluations": ("INT", {"default": 1, "min": 0, "max": 100,
+                                          "tooltip": "First N native DiT evaluations use dense attention. With Spectrum Krea 2 warmup=2 and bootstrap=false, 0 aligns both initial actual feature anchors on sparse attention and avoids a reset. The first evaluation then becomes approximate; compare image quality."}),
+            "dense_layers": ("INT", {"default": 2, "min": 0, "max": 28}),
+        }, "optional": {
+            "verbose": ("BOOLEAN", {"default": False}),
+            "extra_tokens": ("INT", {"default": 256, "min": 0, "max": 256, "step": 64}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "model/optimizations/Sol-H3/experimental"
+    DESCRIPTION = (
+        "Experimental Sol-Attn for native Krea 2: Sana CuTe BF16 or ComfyUI Kitchen native FP16. "
+        "Protects Krea 2 text prefix K/V and text query blocks; FP16 extra_tokens defaults to 256. "
+        "Keeps image-reference calls dense until noncontiguous exact-KV routing is supported; "
+        "other unsupported calls inherit the previous attention backend."
+    )
+
+    def apply(self, model, enabled=True, tau=1.0, min_tokens=4096,
+              dense_evaluations=1, dense_layers=2, verbose=False, extra_tokens=256):
+        if not enabled:
+            return (model,)
+        # Old workflows stored 'verbose' in widget position 6. The first
+        # FP16 overlay accidentally inserted 'extra_tokens' at that position.
+        # Append-only schema above restores the previous layout. Also accept
+        # workflows saved with that intermediate, swapped seven-widget layout.
+        if type(extra_tokens) is bool:
+            if type(verbose) is int and verbose in (0, 64, 128, 192, 256):
+                extra_tokens, verbose = verbose, extra_tokens
+            else:
+                extra_tokens = 256
+        from .krea2 import Settings, install
+        return (install(
+            model,
+            Settings(tau=tau, min_tokens=min_tokens,
+                     dense_evaluations=dense_evaluations, dense_layers=dense_layers,
+                     extra_tokens=extra_tokens),
+            verbose=verbose,
+        ),)
+
+NODE_CLASS_MAPPINGS = {"SolH3Exact": SolH3Exact, "SolH3Experimental": SolH3Experimental,
+                       "SolKrea2Experimental": SolKrea2Experimental}
 NODE_DISPLAY_NAME_MAPPINGS = {"SolH3Exact": "Sol-H3 Exact Runtime",
-                              "SolH3Experimental": "Sol-H3 SOL Attention (Experimental)"}
+                              "SolH3Experimental": "Sol-H3 SOL Attention (Experimental)",
+                              "SolKrea2Experimental": "Sol-Krea2 Sparse Attention (Experimental)"}
