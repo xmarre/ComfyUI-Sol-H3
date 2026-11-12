@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.12 — 2026-11-12
+
+- PR #44: add an opt-in experimental native Krea 2 Sol-Attn MODEL patch. FP16 routes through ComfyUI Kitchen without BF16 conversion; BF16 retains Sana CuTe. Preserve text-prefix protection, inherited dense owner, reference-image fallback and backend-scoped safety gates.
+- Add FP16 token routing (default 256), a bounded all-selected numerical pilot, per-run receipts and compatible saved-widget migration. Document optional aligned Spectrum startup without changing conservative defaults.
+- Hosted CPU contracts, Windows provenance and real ComfyUI CPU interop passed. Owner-reported Blackwell FP16 runtime evidence confirms 416 actual sparse attention calls in a two-stage run; matched-seed image quality, isolated speedup, BF16 quality and peak-VRAM gains are not established. The Krea 2 path is experimental, not a performance guarantee.
+
 ## v0.1.11 — 2026-10-17
 
 - Sol #41: fuse grouped VDN K/V summary preparation, preserve full learned-linear VDN work and bound attention activation lifetimes. Maintain support for Flow's selected-provider forwarding contract from Flow #107.
