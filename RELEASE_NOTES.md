@@ -1,3 +1,26 @@
+# ComfyUI-Sol-H3 v0.1.12
+
+## Experimental native Krea 2 sparse attention — PR #44
+
+Adds **Sol-Krea2 Sparse Attention (Experimental)** as an opt-in MODEL patch for ComfyUI's native Krea 2 SingleStreamDiT. Existing MiniMax-H3, VDN, Flow and Spectrum attention contracts and default paths are unchanged.
+
+- **FP16** uses the installed ComfyUI Kitchen Sol CUDA backend on SM120/SM121 without converting Q/K/V to BF16. **BF16** retains the packaged Sana CuTe backend.
+- Preserves inherited dense attention on unsupported calls, including masked, text-fusion, reference-guided, short-sequence, and incompatible attention-preprocessing paths. Unexpected native kernel execution errors remain visible rather than being silently swallowed.
+- Protects Krea 2's text-key prefix and recomputes authored text-query rows using dense attention. FP16 defaults to 256 additional routed exact tokens per query block.
+- Runs a bounded all-selected FP16 numerical pilot on each new layout before enabling the optional Kitchen route. The arithmetic check does **not** establish sparse-image fidelity.
+- Keeps the conservative `dense_evaluations=1` default; `dense_evaluations=0` is an explicit approximation-from-start option for homogeneous Spectrum Krea 2 feature-history alignment. It does not reduce Spectrum's actual warmup evaluations.
+- Preserves saved-workflow widget order (`verbose` precedes optional `extra_tokens`) and normalizes the intermediate swapped-layout form without accepting invalid budgets.
+
+## Validation, scope and remaining uncertainty
+
+The PR's hosted CPU-contract, Windows-provenance and real ComfyUI CPU interop jobs passed. Owner-reported RTX PRO 6000 Blackwell FP16 Krea 2 runs on November 6, 2026 confirmed the native sparse route executed: one two-stage run recorded **260 + 156 = 416 sparse attention calls**, with **6 + 2 Spectrum forecasts** and a reported 76.21-second total execution. The result is a functional GPU smoke test, **not** a controlled speedup benchmark. A separate earlier run used different generation settings and is not a matched comparison.
+
+No controlled same-seed dense-versus-Sol decoded-image comparison, end-to-end performance/VRAM acceptance series, or general BF16 Krea 2 image-fidelity result is established. The user's qualitative impression of the aligned FP16 run was favorable, but that alone does not establish equivalence. Krea 2 can already use SageAttention dense attention; depending on resolution and settings, Sol may be slower or affect image details. This release does not claim lossless output or a guaranteed speedup. The Krea node remains **experimental and opt-in**.
+
+For optional Spectrum Krea 2 interoperability, use the separately reviewed [Spectrum Krea 2 PR #2](https://github.com/xmarre/ComfyUI-Spectrum-Krea2/pull/2) overlay through ComfyUI Patcher. That PR is not included in this Sol-H3 release. Reference-image attention remains dense.
+
+---
+
 # ComfyUI-Sol-H3 v0.1.11
 
 ## Production Sol/VDN/Flow interop
