@@ -109,7 +109,7 @@ SOL wraps existing block replacements. Every attention call either executes SOL 
 
 Generic `optimized_attention_override` providers such as KJ Sage remain the dense owner for dense-evaluation warmup, dense leading layers and other dense-required rows when usable. Loader-level `ImportError`/`OSError` failures are request-locally demoted to original Comfy attention with telemetry; arbitrary CUDA/runtime compute failures are not swallowed.
 
-## Experimental Krea 2 sparse attention (unreleased)
+## Experimental Krea 2 sparse attention (opt-in, v0.1.12)
 
 **Sol-Krea2 Sparse Attention (Experimental)** is an opt-in MODEL patch for the
 native ComfyUI Krea 2 (SingleStreamDiT). BF16 uses Sol-H3's packaged Sana CuTe
@@ -189,10 +189,12 @@ inherited dense owner. Unexpected kernel execution errors propagate.
 Unavailable kernels also delegate to inherited dense attention. Existing H3
 nodes still reject non-H3 models.
 
-**Validation status:** CPU contract tests cover patch installation, inherited
-fallback, sampling warmup, FP16 protected text routing, arithmetic-pilot
-failure handling, and request isolation. Real Krea 2 GPU quality and throughput
-validation has **not** been performed.
+**Validation status:** CPU contracts and real ComfyUI CPU interop passed.
+Owner-reported SM120 FP16 Krea 2 generation confirmed nonzero native sparse
+execution (416 sparse calls across two stages). Its qualitative output was
+reported as good, but matched-seed image fidelity, controlled throughput,
+peak VRAM and Krea BF16 quality have **not** been established. This remains
+an opt-in experimental feature, not a lossless or speedup guarantee.
 Krea 2 can already use a fast SageAttention dense backend; Sol may be slower
 near 1 MP, and approximate image attention can change output fidelity.
 Compare matched seeds, sparse-call receipts, peak memory, sampler wall time
